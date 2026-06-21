@@ -183,6 +183,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/role
 [ "$code" = "204" ] && ok "DELETE /v1/roles/{role} -> 204" || bad "delete role" "got $code"
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
 
+# ---- hardening ----
+echo "[hardening]"
+# scoped CORS (configured origin, never *)
+hdr=$(curl -s -D - -o /dev/null -X OPTIONS -H 'Origin: https://app.example.com' "$BASE/v1/whoami")
+grep -qi 'access-control-allow-origin: https://app.example.com' <<<"$hdr" && ok "CORS scoped origin header" || bad "CORS header" "$(grep -i access-control <<<"$hdr" | head -1)"
+! grep -qi 'access-control-allow-origin: \*' <<<"$hdr" && ok "CORS is not wildcard" || bad "CORS wildcard"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/v1/whoami")
+[ "$code" = "204" ] && ok "OPTIONS preflight -> 204" || bad "preflight" "got $code"
+# body-size cap (config'd to 4 MiB for the test run)
+head -c 5242880 /dev/zero > /tmp/hb_toobig
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$ROOT/content" --data-binary @/tmp/hb_toobig)
+[ "$code" = "413" ] && ok "oversized body -> 413" || bad "body cap" "got $code"
+rm -f /tmp/hb_toobig
+
 echo "=========================================================="
 echo " RESULTS:  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -gt 0 ] && { echo " Failed:"; printf '   - %s\n' "${FAILED[@]}"; }

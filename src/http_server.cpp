@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <istream>
 #include <map>
@@ -184,15 +185,51 @@ public:
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
+        auto start = std::chrono::steady_clock::now();
+        const std::string method = req.getMethod();
         const std::string& uri = req.getURI();
-        std::string path = uri.substr(0, uri.find('?'));
-        if (path == "/healthz") return healthz(resp);
-        if (path == "/readyz") return readyz(resp);
-        if (path.rfind("/v1/", 0) == 0) return handleV1(req, resp, path);
-        sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        std::string path = uri.substr(0, uri.find('?'));  // query stripped from logs
+
+        // CORS scoped to a configured origin (never "*"); answer preflight here.
+        if (!cfg_.cors_origin.empty()) {
+            resp.set("Access-Control-Allow-Origin", cfg_.cors_origin);
+            resp.set("Vary", "Origin");
+            resp.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Tenant");
+            resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            if (method == "OPTIONS") {
+                sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+                return accessLog(method, path, resp, start);
+            }
+        }
+
+        // Reject over-large declared bodies up front (413).
+        std::streamsize clen = req.getContentLength();
+        if (clen != Poco::Net::HTTPMessage::UNKNOWN_CONTENT_LENGTH &&
+            static_cast<long>(clen) > cfg_.max_body_bytes) {
+            sendJson(resp, HTTPResponse::HTTP_REQUEST_ENTITY_TOO_LARGE, R"({"error":"request body too large"})");
+            return accessLog(method, path, resp, start);
+        }
+
+        if (path == "/healthz") healthz(resp);
+        else if (path == "/readyz") readyz(resp);
+        else if (path.rfind("/v1/", 0) == 0) handleV1(req, resp, path);
+        else sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+
+        accessLog(method, path, resp, start);
     }
 
 private:
+    // Structured access log. Never logs the Authorization header, credentials,
+    // tokens, or the query string.
+    void accessLog(const std::string& method, const std::string& path,
+                   HTTPServerResponse& resp, std::chrono::steady_clock::time_point start) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start).count();
+        webdav::infoLog(method + " " + path + " -> " +
+                        std::to_string(static_cast<int>(resp.getStatus())) +
+                        " (" + std::to_string(ms) + "ms)");
+    }
+
     // Identity resolved for a request: who (LDAP), which tenant, and roles.
     struct AuthIdentity {
         std::string user;
