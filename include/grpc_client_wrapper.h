@@ -2,6 +2,7 @@
 #define GRPC_CLIENT_WRAPPER_H
 
 #include <grpcpp/grpcpp.h>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -78,6 +79,19 @@ public:
     // Administrative operations
     fileengine_rpc::StorageUsageResponse getStorageUsage(const fileengine_rpc::StorageUsageRequest& request);
     fileengine_rpc::TriggerSyncResponse triggerSync(const fileengine_rpc::TriggerSyncRequest& request);
+
+    // Streaming operations (memory-efficient for large files).
+    struct DownloadResult { bool success; std::string error; };
+    // Server-streaming download: invokes onChunk(data) for each chunk; onChunk
+    // returns false to abort early (e.g. client disconnect / range satisfied).
+    DownloadResult streamFileDownload(const fileengine_rpc::GetFileRequest& request,
+                                      const std::function<bool(const std::string&)>& onChunk);
+    // Client-streaming upload: nextChunk(out) fills the next body chunk and
+    // returns false when the body is exhausted. uid/auth are sent on the first
+    // message (server reads them only from there).
+    fileengine_rpc::PutFileResponse streamFileUpload(const std::string& uid,
+                                      const fileengine_rpc::AuthenticationContext& auth,
+                                      const std::function<bool(std::string&)>& nextChunk);
 
 private:
     std::unique_ptr<fileengine_rpc::FileService::Stub> stub_;

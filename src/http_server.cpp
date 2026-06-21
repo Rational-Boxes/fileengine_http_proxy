@@ -14,6 +14,7 @@
 #include <Poco/Dynamic/Var.h>
 #include <Poco/URI.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <istream>
@@ -135,6 +136,22 @@ const char* fileTypeName(int t) {
     }
 }
 
+// Parse "bytes=START-END" / "bytes=START-" Range header. end = -1 means open.
+bool parseRange(const std::string& h, long& start, long& end) {
+    if (h.compare(0, 6, "bytes=") != 0) return false;
+    std::string r = h.substr(6);
+    auto dash = r.find('-');
+    if (dash == std::string::npos) return false;
+    try {
+        start = std::stol(r.substr(0, dash));
+        std::string e = r.substr(dash + 1);
+        end = e.empty() ? -1 : std::stol(e);
+    } catch (...) {
+        return false;
+    }
+    return start >= 0;
+}
+
 std::vector<std::string> pathSegments(const std::string& path) {
     std::vector<std::string> out;
     for (auto& s : webdav::splitString(path, '/')) {
@@ -236,7 +253,7 @@ private:
                     if (method == "DELETE") return removeFile(resp, id, uid);
                 } else if (segs.size() == 4) {
                     if (sub == "content" && method == "PUT")    return putContent(req, resp, id, uid);
-                    if (sub == "content" && method == "GET")    return getContent(resp, id, uid);
+                    if (sub == "content" && method == "GET")    return getContent(req, resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
                     if (sub == "restore" && method == "POST")   return restoreVersion(req, resp, id, uid);
@@ -312,28 +329,76 @@ private:
         else mapError(resp, r.error());
     }
 
+    // PUT content via client-streaming upload — reads the HTTP body in chunks
+    // and streams to gRPC, so memory does not scale with file size.
     void putContent(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
-        std::string data = readBody(req);
-        fileengine_rpc::PutFileRequest rq;
-        rq.set_uid(uid);
-        rq.set_data(data);
-        fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->putFile(rq);
+        fileengine_rpc::AuthenticationContext auth;
+        fillAuth(&auth, id);
+        std::istream& body = req.stream();
+        std::vector<char> buf(256 * 1024);
+        auto r = grpc_->streamFileUpload(uid, auth, [&](std::string& out) -> bool {
+            body.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            std::streamsize n = body.gcount();
+            if (n <= 0) return false;
+            out.assign(buf.data(), static_cast<size_t>(n));
+            return true;
+        });
         if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
         else mapError(resp, r.error());
     }
 
-    void getContent(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+    // GET content via server-streaming download — writes chunks straight to the
+    // socket (chunked transfer). Honors a single Range request (206 + windowing).
+    void getContent(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        long rs = -1, re = -1;
+        bool hasRange = parseRange(req.get("Range", ""), rs, re);
+
         fileengine_rpc::GetFileRequest rq;
         rq.set_uid(uid);
         fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->getFile(rq);
-        if (!r.success()) return mapError(resp, r.error());
-        resp.setStatus(HTTPResponse::HTTP_OK);
-        resp.setContentType("application/octet-stream");
-        const std::string& data = r.data();
-        resp.setContentLength(static_cast<std::streamsize>(data.size()));
-        resp.send().write(data.data(), static_cast<std::streamsize>(data.size()));
+
+        std::ostream* os = nullptr;
+        long offset = 0;
+        bool headerSent = false;
+        auto sendHeader = [&]() {
+            resp.setStatus(hasRange ? HTTPResponse::HTTP_PARTIAL_CONTENT : HTTPResponse::HTTP_OK);
+            resp.setContentType("application/octet-stream");
+            resp.set("Accept-Ranges", "bytes");
+            if (hasRange) {
+                resp.set("Content-Range", "bytes " + std::to_string(rs) + "-" +
+                                              (re >= 0 ? std::to_string(re) : std::string()) + "/*");
+            }
+            os = &resp.send();
+            headerSent = true;
+        };
+
+        auto result = grpc_->streamFileDownload(rq, [&](const std::string& chunk) -> bool {
+            long cstart = offset;
+            long cend = offset + static_cast<long>(chunk.size()) - 1;
+            offset += static_cast<long>(chunk.size());
+            if (!hasRange) {
+                if (!headerSent) sendHeader();
+                os->write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+                return true;
+            }
+            long ws = std::max(cstart, rs);
+            long we = (re >= 0) ? std::min(cend, re) : cend;
+            if (ws <= we) {
+                if (!headerSent) sendHeader();
+                os->write(chunk.data() + (ws - cstart), static_cast<std::streamsize>(we - ws + 1));
+            }
+            return !(re >= 0 && offset > re);  // stop once past the requested end
+        });
+
+        if (!result.success) {
+            if (!headerSent) return mapError(resp, result.error);
+            return;  // already streaming; can't change status mid-body
+        }
+        if (!headerSent) {  // empty content
+            resp.setStatus(hasRange ? HTTPResponse::HTTP_PARTIAL_CONTENT : HTTPResponse::HTTP_OK);
+            resp.setContentLength(0);
+            resp.send();
+        }
     }
 
     void statNode(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {

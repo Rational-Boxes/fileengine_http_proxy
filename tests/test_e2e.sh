@@ -80,6 +80,24 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/file
 
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$DIR"   # cleanup
 
+# ---- streaming (large file) + Range ----
+echo "[streaming + range]"
+SD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_stream\"}" | uidof)
+BF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$SD/files" -d '{"name":"big.bin"}' | uidof)
+# 2 MiB of deterministic data
+head -c 2097152 /dev/zero | tr '\0' 'A' > /tmp/hb_big.bin
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$BF/content" --data-binary @/tmp/hb_big.bin)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "PUT 2MiB (streaming upload) -> 2xx" || bad "stream upload" "got $code"
+curl -s "${A[@]}" "$BASE/v1/files/$BF/content" -o /tmp/hb_big_dl.bin
+[ "$(wc -c </tmp/hb_big_dl.bin)" = "2097152" ] && ok "GET 2MiB (streaming download) full size" || bad "stream download size" "$(wc -c </tmp/hb_big_dl.bin)"
+cmp -s /tmp/hb_big.bin /tmp/hb_big_dl.bin && ok "streamed content matches" || bad "stream content mismatch"
+# Range request: bytes 0-9 (10 bytes)
+code=$(curl -s -o /tmp/hb_range -w '%{http_code}' "${A[@]}" -H 'Range: bytes=0-9' "$BASE/v1/files/$BF/content")
+[ "$code" = "206" ] && ok "Range request -> 206" || bad "range status" "got $code"
+[ "$(wc -c </tmp/hb_range)" = "10" ] && ok "Range returns requested 10 bytes" || bad "range size" "$(wc -c </tmp/hb_range)"
+curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$SD"   # cleanup
+rm -f /tmp/hb_big.bin /tmp/hb_big_dl.bin /tmp/hb_range
+
 # ---- versioning + metadata + manipulation ----
 echo "[versioning + metadata + manipulation]"
 WS=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_ext\"}" | uidof)

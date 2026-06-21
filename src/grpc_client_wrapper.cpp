@@ -210,4 +210,68 @@ fileengine_rpc::TriggerSyncResponse GRPCClientWrapper::triggerSync(const fileeng
         [&](grpc::ClientContext& c, fileengine_rpc::TriggerSyncResponse& r) { return stub_->TriggerSync(&c, request, &r); });
 }
 
+// Streaming operations
+GRPCClientWrapper::DownloadResult GRPCClientWrapper::streamFileDownload(
+    const fileengine_rpc::GetFileRequest& request,
+    const std::function<bool(const std::string&)>& onChunk) {
+    grpc::ClientContext ctx;
+    auto reader = stub_->StreamFileDownload(&ctx, request);
+    fileengine_rpc::GetFileResponse resp;
+    std::string err;
+    bool failed = false;
+    while (reader->Read(&resp)) {
+        if (!resp.success()) {  // an error chunk (success=false carries the error)
+            failed = true;
+            err = resp.error();
+            break;
+        }
+        if (!resp.data().empty() && !onChunk(resp.data())) {
+            ctx.TryCancel();  // caller asked to stop (disconnect / range satisfied)
+            break;
+        }
+    }
+    grpc::Status status = reader->Finish();
+    if (failed) return {false, err};
+    if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED) {
+        return {false, status.error_message()};
+    }
+    return {true, ""};
+}
+
+fileengine_rpc::PutFileResponse GRPCClientWrapper::streamFileUpload(
+    const std::string& uid,
+    const fileengine_rpc::AuthenticationContext& auth,
+    const std::function<bool(std::string&)>& nextChunk) {
+    grpc::ClientContext ctx;
+    fileengine_rpc::PutFileResponse response;
+    auto writer = stub_->StreamFileUpload(&ctx, &response);
+    bool first = true;
+    std::string chunk;
+    while (true) {
+        chunk.clear();
+        if (!nextChunk(chunk)) break;
+        fileengine_rpc::PutFileRequest req;
+        if (first) {
+            req.set_uid(uid);
+            *req.mutable_auth() = auth;
+            first = false;
+        }
+        req.set_data(chunk);
+        if (!writer->Write(req)) break;
+    }
+    if (first) {  // empty body: still send uid+auth so the server has the target
+        fileengine_rpc::PutFileRequest req;
+        req.set_uid(uid);
+        *req.mutable_auth() = auth;
+        writer->Write(req);
+    }
+    writer->WritesDone();
+    grpc::Status status = writer->Finish();
+    if (!status.ok()) {
+        response.set_success(false);
+        response.set_error(status.error_message());
+    }
+    return response;
+}
+
 } // namespace webdav
