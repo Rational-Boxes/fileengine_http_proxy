@@ -12,9 +12,12 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/Dynamic/Var.h>
+#include <Poco/URI.h>
 
+#include <cctype>
 #include <cstdio>
 #include <istream>
+#include <map>
 #include <ostream>
 #include <sstream>
 #include <vector>
@@ -103,6 +106,27 @@ int jsonFieldInt(const std::string& body, const std::string& key, int def) {
     return def;
 }
 
+// Accept a single-letter alias (r/w/x/d/...) or an enum name (READ/WRITE/...).
+fileengine_rpc::Permission coercePermission(const std::string& s) {
+    static const std::map<std::string, fileengine_rpc::Permission> letters = {
+        {"r", fileengine_rpc::READ}, {"w", fileengine_rpc::WRITE}, {"x", fileengine_rpc::EXECUTE},
+        {"d", fileengine_rpc::DELETE}, {"l", fileengine_rpc::LIST_DELETED}, {"u", fileengine_rpc::UNDELETE},
+        {"v", fileengine_rpc::VIEW_VERSIONS}, {"b", fileengine_rpc::RETRIEVE_BACK_VERSION},
+        {"s", fileengine_rpc::RESTORE_TO_VERSION}, {"m", fileengine_rpc::MANAGE_ACL}, {"i", fileengine_rpc::ACL_INHERIT},
+    };
+    auto it = letters.find(s);
+    if (it != letters.end()) return it->second;
+    std::string upper = s;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    fileengine_rpc::Permission p;
+    if (fileengine_rpc::Permission_Parse(upper, &p)) return p;
+    return fileengine_rpc::READ;
+}
+
+fileengine_rpc::AclEffect coerceEffect(const std::string& s) {
+    return (s == "deny" || s == "DENY") ? fileengine_rpc::DENY : fileengine_rpc::ALLOW;
+}
+
 const char* fileTypeName(int t) {
     switch (t) {
         case fileengine_rpc::DIRECTORY: return "directory";
@@ -167,6 +191,22 @@ private:
 
         if (segs.size() == 2 && segs[1] == "whoami") return whoami(resp, id);
 
+        // Top-level admin / role resources (no uid in the path).
+        const std::string res0 = segs.size() >= 2 ? segs[1] : "";
+        if (res0 == "storage" && segs.size() == 2 && method == "GET")  return storageUsage(resp, id);
+        if (res0 == "sync" && segs.size() == 2 && method == "POST")    return triggerSync(resp, id);
+        if (res0 == "roles") {
+            if (segs.size() == 2 && method == "GET")    return getAllRoles(resp, id);
+            if (segs.size() == 2 && method == "POST")   return createRole(req, resp, id);
+            if (segs.size() == 3 && method == "DELETE") return deleteRole(resp, id, segs[2]);
+            if (segs.size() == 4 && segs[3] == "users" && method == "GET") return getUsersForRole(resp, id, segs[2]);
+            if (segs.size() == 5 && segs[3] == "users" && method == "PUT")    return assignUserToRole(resp, id, segs[2], segs[4]);
+            if (segs.size() == 5 && segs[3] == "users" && method == "DELETE") return removeUserFromRole(resp, id, segs[2], segs[4]);
+        }
+        if (res0 == "users" && segs.size() == 4 && segs[3] == "roles" && method == "GET") {
+            return getRolesForUser(resp, id, segs[2]);
+        }
+
         if (segs.size() >= 3) {
             const std::string& resource = segs[1];
             std::string uid = (segs[2] == "root") ? "" : segs[2];  // "root" alias; all-zeros handled by core
@@ -202,6 +242,9 @@ private:
                     if (sub == "move" && method == "POST")      return moveNode(req, resp, id, uid);
                     if (sub == "copy" && method == "POST")      return copyNode(req, resp, id, uid);
                     if (sub == "metadata" && method == "GET")   return getAllMeta(resp, id, uid);
+                    if (sub == "permissions" && method == "GET")    return checkPerm(req, resp, id, uid);
+                    if (sub == "permissions" && method == "POST")   return grantPerm(req, resp, id, uid);
+                    if (sub == "permissions" && method == "DELETE") return revokePerm(req, resp, id, uid);
                 } else if (segs.size() == 5 && sub == "metadata") {
                     const std::string& key = segs[4];
                     if (method == "GET")    return getMeta(resp, id, uid, key);
@@ -479,6 +522,151 @@ private:
         rq.set_key(key);
         fillAuth(rq.mutable_auth(), id);
         auto r = grpc_->deleteMetadata(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    // --- ACL ---
+    // ?user=&permission=&roles=  — evaluates the named principal (impersonated
+    // for the check), defaulting to the requesting identity.
+    void checkPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string qUser, qPerm, qRoles;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "user") qUser = kv.second;
+            else if (kv.first == "permission") qPerm = kv.second;
+            else if (kv.first == "roles") qRoles = kv.second;
+        }
+        fileengine_rpc::CheckPermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_required_permission(coercePermission(qPerm));
+        auto* a = rq.mutable_auth();
+        a->set_user(qUser.empty() ? id.user : qUser);
+        a->set_tenant(id.tenant);
+        for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+        auto r = grpc_->checkPermission(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        sendJson(resp, HTTPResponse::HTTP_OK, std::string("{\"has_permission\":") + (r.has_permission() ? "true" : "false") + "}");
+    }
+
+    void grantPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string body = readBody(req);
+        std::string principal = jsonField(body, "principal");
+        if (principal.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'principal'"})");
+        fileengine_rpc::GrantPermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_principal(principal);
+        rq.set_permission(coercePermission(jsonField(body, "permission")));
+        rq.set_effect(coerceEffect(jsonField(body, "effect")));
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->grantPermission(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void revokePerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string body = readBody(req);
+        std::string principal = jsonField(body, "principal");
+        if (principal.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'principal'"})");
+        fileengine_rpc::RevokePermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_principal(principal);
+        rq.set_permission(coercePermission(jsonField(body, "permission")));
+        rq.set_effect(coerceEffect(jsonField(body, "effect")));
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->revokePermission(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    // --- roles ---
+    void createRole(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string role = jsonField(readBody(req), "role");
+        if (role.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'role'"})");
+        fileengine_rpc::CreateRoleRequest rq;
+        rq.set_role(role);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->createRole(rq);
+        if (r.success()) sendJson(resp, HTTPResponse::HTTP_CREATED, "{\"role\":\"" + jsonEscape(role) + "\"}");
+        else mapError(resp, r.error());
+    }
+
+    void deleteRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role) {
+        fileengine_rpc::DeleteRoleRequest rq;
+        rq.set_role(role);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->deleteRole(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void getAllRoles(HTTPServerResponse& resp, const AuthIdentity& id) {
+        fileengine_rpc::GetAllRolesRequest rq;
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getAllRoles(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::vector<std::string> v(r.roles().begin(), r.roles().end());
+        sendJson(resp, HTTPResponse::HTTP_OK, "{\"roles\":" + jsonArray(v) + "}");
+    }
+
+    void assignUserToRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
+        fileengine_rpc::AssignUserToRoleRequest rq;
+        rq.set_user(user);
+        rq.set_role(role);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->assignUserToRole(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void removeUserFromRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
+        fileengine_rpc::RemoveUserFromRoleRequest rq;
+        rq.set_user(user);
+        rq.set_role(role);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->removeUserFromRole(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void getUsersForRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role) {
+        fileengine_rpc::GetUsersForRoleRequest rq;
+        rq.set_role(role);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getUsersForRole(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::vector<std::string> v(r.users().begin(), r.users().end());
+        sendJson(resp, HTTPResponse::HTTP_OK, "{\"users\":" + jsonArray(v) + "}");
+    }
+
+    void getRolesForUser(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& user) {
+        fileengine_rpc::GetRolesForUserRequest rq;
+        rq.set_user(user);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getRolesForUser(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::vector<std::string> v(r.roles().begin(), r.roles().end());
+        sendJson(resp, HTTPResponse::HTTP_OK, "{\"roles\":" + jsonArray(v) + "}");
+    }
+
+    // --- admin ---
+    void storageUsage(HTTPServerResponse& resp, const AuthIdentity& id) {
+        fileengine_rpc::StorageUsageRequest rq;
+        rq.set_tenant(id.tenant);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getStorageUsage(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::string body = "{\"total_space\":" + std::to_string(r.total_space()) +
+                           ",\"used_space\":" + std::to_string(r.used_space()) +
+                           ",\"available_space\":" + std::to_string(r.available_space()) +
+                           ",\"usage_percentage\":" + std::to_string(r.usage_percentage()) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
+    void triggerSync(HTTPServerResponse& resp, const AuthIdentity& id) {
+        fileengine_rpc::TriggerSyncRequest rq;
+        rq.set_tenant(id.tenant);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->triggerSync(rq);
         if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
         else mapError(resp, r.error());
     }

@@ -153,4 +153,61 @@ fileengine_rpc::CheckPermissionResponse GRPCClientWrapper::checkPermission(const
         [&](grpc::ClientContext& c, fileengine_rpc::CheckPermissionResponse& r) { return stub_->CheckPermission(&c, request, &r); });
 }
 
+fileengine_rpc::GrantPermissionResponse GRPCClientWrapper::grantPermission(const fileengine_rpc::GrantPermissionRequest& request) {
+    return invoke<fileengine_rpc::GrantPermissionResponse>("GrantPermission",
+        [&](grpc::ClientContext& c, fileengine_rpc::GrantPermissionResponse& r) { return stub_->GrantPermission(&c, request, &r); });
+}
+
+fileengine_rpc::RevokePermissionResponse GRPCClientWrapper::revokePermission(const fileengine_rpc::RevokePermissionRequest& request) {
+    return invoke<fileengine_rpc::RevokePermissionResponse>("RevokePermission",
+        [&](grpc::ClientContext& c, fileengine_rpc::RevokePermissionResponse& r) { return stub_->RevokePermission(&c, request, &r); });
+}
+
+// Role management operations
+fileengine_rpc::CreateRoleResponse GRPCClientWrapper::createRole(const fileengine_rpc::CreateRoleRequest& request) {
+    return invoke<fileengine_rpc::CreateRoleResponse>("CreateRole",
+        [&](grpc::ClientContext& c, fileengine_rpc::CreateRoleResponse& r) { return stub_->CreateRole(&c, request, &r); });
+}
+
+fileengine_rpc::DeleteRoleResponse GRPCClientWrapper::deleteRole(const fileengine_rpc::DeleteRoleRequest& request) {
+    return invoke<fileengine_rpc::DeleteRoleResponse>("DeleteRole",
+        [&](grpc::ClientContext& c, fileengine_rpc::DeleteRoleResponse& r) { return stub_->DeleteRole(&c, request, &r); });
+}
+
+fileengine_rpc::AssignUserToRoleResponse GRPCClientWrapper::assignUserToRole(const fileengine_rpc::AssignUserToRoleRequest& request) {
+    return invoke<fileengine_rpc::AssignUserToRoleResponse>("AssignUserToRole",
+        [&](grpc::ClientContext& c, fileengine_rpc::AssignUserToRoleResponse& r) { return stub_->AssignUserToRole(&c, request, &r); });
+}
+
+fileengine_rpc::RemoveUserFromRoleResponse GRPCClientWrapper::removeUserFromRole(const fileengine_rpc::RemoveUserFromRoleRequest& request) {
+    return invoke<fileengine_rpc::RemoveUserFromRoleResponse>("RemoveUserFromRole",
+        [&](grpc::ClientContext& c, fileengine_rpc::RemoveUserFromRoleResponse& r) { return stub_->RemoveUserFromRole(&c, request, &r); });
+}
+
+fileengine_rpc::GetRolesForUserResponse GRPCClientWrapper::getRolesForUser(const fileengine_rpc::GetRolesForUserRequest& request) {
+    return invoke<fileengine_rpc::GetRolesForUserResponse>("GetRolesForUser",
+        [&](grpc::ClientContext& c, fileengine_rpc::GetRolesForUserResponse& r) { return stub_->GetRolesForUser(&c, request, &r); });
+}
+
+fileengine_rpc::GetUsersForRoleResponse GRPCClientWrapper::getUsersForRole(const fileengine_rpc::GetUsersForRoleRequest& request) {
+    return invoke<fileengine_rpc::GetUsersForRoleResponse>("GetUsersForRole",
+        [&](grpc::ClientContext& c, fileengine_rpc::GetUsersForRoleResponse& r) { return stub_->GetUsersForRole(&c, request, &r); });
+}
+
+fileengine_rpc::GetAllRolesResponse GRPCClientWrapper::getAllRoles(const fileengine_rpc::GetAllRolesRequest& request) {
+    return invoke<fileengine_rpc::GetAllRolesResponse>("GetAllRoles",
+        [&](grpc::ClientContext& c, fileengine_rpc::GetAllRolesResponse& r) { return stub_->GetAllRoles(&c, request, &r); });
+}
+
+// Administrative operations
+fileengine_rpc::StorageUsageResponse GRPCClientWrapper::getStorageUsage(const fileengine_rpc::StorageUsageRequest& request) {
+    return invoke<fileengine_rpc::StorageUsageResponse>("GetStorageUsage",
+        [&](grpc::ClientContext& c, fileengine_rpc::StorageUsageResponse& r) { return stub_->GetStorageUsage(&c, request, &r); });
+}
+
+fileengine_rpc::TriggerSyncResponse GRPCClientWrapper::triggerSync(const fileengine_rpc::TriggerSyncRequest& request) {
+    return invoke<fileengine_rpc::TriggerSyncResponse>("TriggerSync",
+        [&](grpc::ClientContext& c, fileengine_rpc::TriggerSyncResponse& r) { return stub_->TriggerSync(&c, request, &r); });
+}
+
 } // namespace webdav

@@ -115,6 +115,42 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/bogus/resource
 
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$WS"   # cleanup
 
+# ---- admin + roles + ACL ----
+echo "[admin + roles + ACL]"
+grep -q 'total_space' <<<"$(curl -s "${A[@]}" "$BASE/v1/storage")" && ok "GET /v1/storage" || bad "storage"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/sync")
+[ "$code" = "204" ] && ok "POST /v1/sync -> 204" || bad "sync" "got $code"
+
+ROLE="hbrole_$(date +%s)"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/roles" -d "{\"role\":\"$ROLE\"}")
+[ "$code" = "201" ] && ok "POST /v1/roles -> 201" || bad "create role" "got $code"
+grep -q "$ROLE" <<<"$(curl -s "${A[@]}" "$BASE/v1/roles")" && ok "GET /v1/roles lists new role" || bad "list roles"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/roles/$ROLE/users/carol")
+[ "$code" = "204" ] && ok "PUT assign user to role -> 204" || bad "assign role" "got $code"
+grep -q 'carol' <<<"$(curl -s "${A[@]}" "$BASE/v1/roles/$ROLE/users")" && ok "GET /v1/roles/{role}/users" || bad "role users"
+grep -q "$ROLE" <<<"$(curl -s "${A[@]}" "$BASE/v1/users/carol/roles")" && ok "GET /v1/users/{user}/roles" || bad "user roles"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/roles/$ROLE/users/carol")
+[ "$code" = "204" ] && ok "DELETE remove user from role -> 204" || bad "remove role member" "got $code"
+
+GD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"acl_$(date +%s)\"}" | uidof)
+GF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$GD/files" -d '{"name":"acl.txt"}' | uidof)
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"dave","permission":"r"}')
+[ "$code" = "204" ] && ok "POST grant READ to dave -> 204" || bad "grant" "got $code"
+grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=dave&permission=r")" && ok "GET check: dave has READ" || bad "check perm true"
+# role-based grant + role check
+curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d "{\"principal\":\"role:$ROLE\",\"permission\":\"r\"}"
+grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=carol&permission=r&roles=$ROLE")" && ok "GET check: carol(role) has READ" || bad "role check"
+# deny precedence
+curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r"}'
+curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r","effect":"deny"}'
+grep -q '"has_permission":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=erin&permission=r")" && ok "DENY overrides ALLOW" || bad "deny precedence"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"dave","permission":"r"}')
+[ "$code" = "204" ] && ok "DELETE revoke permission -> 204" || bad "revoke" "got $code"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/roles/$ROLE")
+[ "$code" = "204" ] && ok "DELETE /v1/roles/{role} -> 204" || bad "delete role" "got $code"
+curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
+
 echo "=========================================================="
 echo " RESULTS:  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -gt 0 ] && { echo " Failed:"; printf '   - %s\n' "${FAILED[@]}"; }

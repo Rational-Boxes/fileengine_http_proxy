@@ -63,6 +63,21 @@ public:
 
     // ACL operations
     fileengine_rpc::CheckPermissionResponse checkPermission(const fileengine_rpc::CheckPermissionRequest& request);
+    fileengine_rpc::GrantPermissionResponse grantPermission(const fileengine_rpc::GrantPermissionRequest& request);
+    fileengine_rpc::RevokePermissionResponse revokePermission(const fileengine_rpc::RevokePermissionRequest& request);
+
+    // Role management operations
+    fileengine_rpc::CreateRoleResponse createRole(const fileengine_rpc::CreateRoleRequest& request);
+    fileengine_rpc::DeleteRoleResponse deleteRole(const fileengine_rpc::DeleteRoleRequest& request);
+    fileengine_rpc::AssignUserToRoleResponse assignUserToRole(const fileengine_rpc::AssignUserToRoleRequest& request);
+    fileengine_rpc::RemoveUserFromRoleResponse removeUserFromRole(const fileengine_rpc::RemoveUserFromRoleRequest& request);
+    fileengine_rpc::GetRolesForUserResponse getRolesForUser(const fileengine_rpc::GetRolesForUserRequest& request);
+    fileengine_rpc::GetUsersForRoleResponse getUsersForRole(const fileengine_rpc::GetUsersForRoleRequest& request);
+    fileengine_rpc::GetAllRolesResponse getAllRoles(const fileengine_rpc::GetAllRolesRequest& request);
+
+    // Administrative operations
+    fileengine_rpc::StorageUsageResponse getStorageUsage(const fileengine_rpc::StorageUsageRequest& request);
+    fileengine_rpc::TriggerSyncResponse triggerSync(const fileengine_rpc::TriggerSyncRequest& request);
 
 private:
     std::unique_ptr<fileengine_rpc::FileService::Stub> stub_;
