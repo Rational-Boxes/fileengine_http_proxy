@@ -1,0 +1,6 @@
+build/
+build*/
+.idea/
+*.log
+log/
+.env

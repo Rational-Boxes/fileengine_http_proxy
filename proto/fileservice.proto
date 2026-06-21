@@ -1,0 +1,544 @@
+syntax = "proto3";
+
+package fileengine_rpc;
+
+// Service definition for the FileEngine virtual filesystem
+service FileService {
+    // Directory operations
+    rpc MakeDirectory(MakeDirectoryRequest) returns (MakeDirectoryResponse);
+    rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
+    rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+    rpc ListDirectoryWithDeleted(ListDirectoryWithDeletedRequest) returns (ListDirectoryWithDeletedResponse);
+
+    // File operations
+    rpc Touch(TouchRequest) returns (TouchResponse);
+    rpc RemoveFile(RemoveFileRequest) returns (RemoveFileResponse);
+    rpc UndeleteFile(UndeleteFileRequest) returns (UndeleteFileResponse);
+    rpc PutFile(PutFileRequest) returns (PutFileResponse);
+    rpc GetFile(GetFileRequest) returns (GetFileResponse);
+
+    // File information
+    rpc Stat(StatRequest) returns (StatResponse);
+    rpc Exists(ExistsRequest) returns (ExistsResponse);
+    
+    // File manipulation operations
+    rpc Rename(RenameRequest) returns (RenameResponse);
+    rpc Move(MoveRequest) returns (MoveResponse);
+    rpc Copy(CopyRequest) returns (CopyResponse);
+
+    // Version operations
+    rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+    rpc RestoreToVersion(RestoreToVersionRequest) returns (RestoreToVersionResponse);
+
+    // Metadata operations
+    rpc SetMetadata(SetMetadataRequest) returns (SetMetadataResponse);
+    rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+    rpc GetAllMetadata(GetAllMetadataRequest) returns (GetAllMetadataResponse);
+    rpc DeleteMetadata(DeleteMetadataRequest) returns (DeleteMetadataResponse);
+    rpc GetMetadataForVersion(GetMetadataForVersionRequest) returns (GetMetadataForVersionResponse);
+    rpc GetAllMetadataForVersion(GetAllMetadataForVersionRequest) returns (GetAllMetadataForVersionResponse);
+
+    // ACL operations
+    rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
+    rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
+    rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+    // Role management operations
+    rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+    rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+    rpc AssignUserToRole(AssignUserToRoleRequest) returns (AssignUserToRoleResponse);
+    rpc RemoveUserFromRole(RemoveUserFromRoleRequest) returns (RemoveUserFromRoleResponse);
+    rpc GetRolesForUser(GetRolesForUserRequest) returns (GetRolesForUserResponse);
+    rpc GetUsersForRole(GetUsersForRoleRequest) returns (GetUsersForRoleResponse);
+    rpc GetAllRoles(GetAllRolesRequest) returns (GetAllRolesResponse);
+
+    // Streaming operations for large files
+    rpc StreamFileUpload(stream PutFileRequest) returns (PutFileResponse);
+    rpc StreamFileDownload(GetFileRequest) returns (stream GetFileResponse);
+
+    // Administrative operations
+    rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsageResponse);
+    rpc PurgeOldVersions(PurgeOldVersionsRequest) returns (PurgeOldVersionsResponse);
+    rpc TriggerSync(TriggerSyncRequest) returns (TriggerSyncResponse);
+}
+
+// Authentication context message - to be included in all requests
+message AuthenticationContext {
+    string user = 1;
+    repeated string roles = 2;  // User roles for permissions
+    string tenant = 3;          // Tenant identifier for multitenancy
+    map<string, string> claims = 4; // Additional user claims for permissions
+}
+
+// Directory entry response
+message DirectoryEntry {
+    string uid = 1;               // UUID of the file/directory
+    string name = 2;              // Name of the file/directory
+    FileType type = 3;            // Type of the entry (file/directory/symlink)
+    int64 size = 4;               // Size in bytes
+    int64 created_at = 5;         // Creation timestamp (UNIX epoch seconds)
+    int64 modified_at = 6;        // Modification timestamp (UNIX epoch seconds)
+    int32 version_count = 7;      // Number of versions for this file
+}
+
+enum FileType {
+    REGULAR_FILE = 0;
+    DIRECTORY = 1;
+    SYMLINK = 2;
+}
+
+enum Permission {
+    READ = 0;              // Read permission
+    WRITE = 1;             // Write permission
+    DELETE = 2;            // Delete permission
+    LIST_DELETED = 3;      // List deleted items permission
+    UNDELETE = 4;          // Undelete permission
+    VIEW_VERSIONS = 5;     // View versions permission
+    RETRIEVE_BACK_VERSION = 6;  // Retrieve back version permission
+    RESTORE_TO_VERSION = 7;     // Restore to version permission
+    EXECUTE = 8;           // Execute permission
+    MANAGE_ACL = 9;        // Grant/revoke permissions on this resource (Phase 5)
+    ACL_INHERIT = 10;      // Marks a rule for parent->child propagation (Phase 5)
+}
+
+// Directory operations
+message MakeDirectoryRequest {
+    string parent_uid = 1;              // Parent directory UUID (empty for root)
+    string name = 2;                    // Name of the new directory
+    AuthenticationContext auth = 3;     // Authentication information
+    int32 permissions = 4;              // Filesystem permissions (e.g. 0755)
+}
+
+message MakeDirectoryResponse {
+    bool success = 1;
+    string error = 2;
+    string uid = 3;                     // UID of the created directory
+}
+
+message RemoveDirectoryRequest {
+    string uid = 1;                     // Directory UUID to remove
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message RemoveDirectoryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListDirectoryRequest {
+    string uid = 1;                     // Directory UUID to list contents of
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message ListDirectoryResponse {
+    bool success = 1;
+    string error = 2;
+    repeated DirectoryEntry entries = 3;
+}
+
+message ListDirectoryWithDeletedRequest {
+    string uid = 1;                     // Directory UUID to list contents of
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message ListDirectoryWithDeletedResponse {
+    bool success = 1;
+    string error = 2;
+    repeated DirectoryEntry entries = 3;
+}
+
+// File operations
+message TouchRequest {
+    string parent_uid = 1;              // Parent directory UUID
+    string name = 2;                    // Name of the new file
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message TouchResponse {
+    bool success = 1;
+    string error = 2;
+    string uid = 3;                     // UID of the created file
+}
+
+message RemoveFileRequest {
+    string uid = 1;                     // File UUID to remove
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message RemoveFileResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message UndeleteFileRequest {
+    string uid = 1;                     // File UUID to undelete
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message UndeleteFileResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message PutFileRequest {
+    string uid = 1;                     // File UUID
+    AuthenticationContext auth = 2;     // Authentication information
+    bytes data = 3;                     // File content (for streaming, send chunks)
+    int64 chunk_index = 4;              // For streaming - chunk index
+    int64 total_chunks = 5;             // For streaming - total number of chunks
+}
+
+message PutFileResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetFileRequest {
+    string uid = 1;                     // File UUID
+    string version_timestamp = 2;       // Optional version timestamp (if empty, get latest)
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message GetFileResponse {
+    bool success = 1;
+    string error = 2;
+    bytes data = 3;                     // File content
+}
+
+// File information
+message StatRequest {
+    string uid = 1;                     // File UUID
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message StatResponse {
+    bool success = 1;
+    string error = 2;
+    FileInfo info = 3;                  // File information
+}
+
+message FileInfo {
+    string uid = 1;                     // UUID of the file/directory
+    string name = 2;                    // Name of the file/directory
+    string parent_uid = 3;              // UUID of parent directory (empty for root)
+    FileType type = 4;                  // Type of file
+    int64 size = 5;                     // Size in bytes
+    string owner = 6;                   // Owner of the file
+    int32 permissions = 7;              // File permissions
+    int64 created_at = 8;               // Creation timestamp
+    int64 modified_at = 9;              // Modification timestamp
+    string version = 10;                 // Current version timestamp
+}
+
+message ExistsRequest {
+    string uid = 1;                     // File UUID to check
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message ExistsResponse {
+    bool success = 1;
+    string error = 2;
+    bool exists = 3;
+}
+
+// File manipulation operations
+message RenameRequest {
+    string uid = 1;                     // UUID of the file/directory to rename
+    string new_name = 2;                // New name for the file/directory
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message RenameResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message MoveRequest {
+    string source_uid = 1;              // Source file/directory UUID
+    string destination_parent_uid = 2;  // Destination parent directory UUID
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message MoveResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message CopyRequest {
+    string source_uid = 1;              // Source file/directory UUID
+    string destination_parent_uid = 2;  // Destination parent directory UUID
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message CopyResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Version operations
+message ListVersionsRequest {
+    string uid = 1;                     // File UUID
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message ListVersionsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string versions = 3;       // List of version timestamps
+}
+
+message GetVersionRequest {
+    string uid = 1;                     // File UUID
+    string version_timestamp = 2;       // Version timestamp to retrieve
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message GetVersionResponse {
+    bool success = 1;
+    string error = 2;
+    bytes data = 3;                     // File content at this version
+}
+
+message RestoreToVersionRequest {
+    string uid = 1;                     // File UUID to restore
+    string version_timestamp = 2;       // Version timestamp to restore to
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message RestoreToVersionResponse {
+    bool success = 1;
+    string error = 2;
+    string restored_version = 3;        // Timestamp of the version restored to
+}
+
+// Metadata operations
+message SetMetadataRequest {
+    string uid = 1;                     // File UUID
+    string key = 2;                     // Metadata key
+    string value = 3;                   // Metadata value
+    AuthenticationContext auth = 4;     // Authentication information
+}
+
+message SetMetadataResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetMetadataRequest {
+    string uid = 1;                     // File UUID
+    string key = 2;                     // Metadata key
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message GetMetadataResponse {
+    bool success = 1;
+    string error = 2;
+    string value = 3;                   // Metadata value
+}
+
+message GetAllMetadataRequest {
+    string uid = 1;                     // File UUID
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message GetAllMetadataResponse {
+    bool success = 1;
+    string error = 2;
+    map<string, string> metadata = 3;   // All metadata key-value pairs
+}
+
+message DeleteMetadataRequest {
+    string uid = 1;                     // File UUID
+    string key = 2;                     // Metadata key to delete
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message DeleteMetadataResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetMetadataForVersionRequest {
+    string uid = 1;                     // File UUID
+    string version_timestamp = 2;       // Version timestamp
+    string key = 3;                     // Metadata key
+    AuthenticationContext auth = 4;     // Authentication information
+}
+
+message GetMetadataForVersionResponse {
+    bool success = 1;
+    string error = 2;
+    string value = 3;                   // Metadata value
+}
+
+message GetAllMetadataForVersionRequest {
+    string uid = 1;                     // File UUID
+    string version_timestamp = 2;       // Version timestamp
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message GetAllMetadataForVersionResponse {
+    bool success = 1;
+    string error = 2;
+    map<string, string> metadata = 3;   // All metadata key-value pairs for this version
+}
+
+// ACL operations
+// Effect of an ACL rule. ALLOW (default) adds bits to the user's effective
+// permission set; DENY subtracts them after the allow set is computed, so a
+// matching deny always wins over an allow. Useful for "everyone in role X
+// except user Y" patterns. See plan §6.1.
+enum AclEffect {
+    ALLOW = 0;
+    DENY = 1;
+}
+
+message GrantPermissionRequest {
+    string resource_uid = 1;            // Resource UUID to grant permission on
+    string principal = 2;               // User or group name
+    Permission permission = 3;          // Permission to grant
+    AuthenticationContext auth = 4;     // Authentication information
+    AclEffect effect = 5;               // ALLOW (default) or DENY
+}
+
+message GrantPermissionResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RevokePermissionRequest {
+    string resource_uid = 1;            // Resource UUID to revoke permission from
+    string principal = 2;               // User or group name
+    Permission permission = 3;          // Permission to revoke
+    AuthenticationContext auth = 4;     // Authentication information
+    AclEffect effect = 5;               // Which row to revoke from: ALLOW (default) or DENY
+}
+
+message RevokePermissionResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message CheckPermissionRequest {
+    string resource_uid = 1;            // Resource UUID to check permission on
+    Permission required_permission = 2; // Required permission
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message CheckPermissionResponse {
+    bool success = 1;
+    string error = 2;
+    bool has_permission = 3;            // Whether the user has the required permission
+}
+
+// Role management operations
+message CreateRoleRequest {
+    string role = 1;                    // Role name to create
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message CreateRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message DeleteRoleRequest {
+    string role = 1;                    // Role name to delete
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message DeleteRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message AssignUserToRoleRequest {
+    string user = 1;                    // User name to assign
+    string role = 2;                    // Role name to assign to
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message AssignUserToRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RemoveUserFromRoleRequest {
+    string user = 1;                    // User name to remove
+    string role = 2;                    // Role name to remove from
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message RemoveUserFromRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetRolesForUserRequest {
+    string user = 1;                    // User name to get roles for
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message GetRolesForUserResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string roles = 3;          // List of roles for the user
+}
+
+message GetUsersForRoleRequest {
+    string role = 1;                    // Role name to get users for
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message GetUsersForRoleResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string users = 3;          // List of users in the role
+}
+
+message GetAllRolesRequest {
+    AuthenticationContext auth = 1;     // Authentication information
+}
+
+message GetAllRolesResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string roles = 3;          // List of all roles
+}
+
+// Administrative operations
+message StorageUsageRequest {
+    AuthenticationContext auth = 1;     // Authentication information
+    string tenant = 2;                  // Optional tenant-specific usage
+}
+
+message StorageUsageResponse {
+    bool success = 1;
+    string error = 2;
+    int64 total_space = 3;              // Total space in bytes
+    int64 used_space = 4;               // Used space in bytes
+    int64 available_space = 5;          // Available space in bytes
+    double usage_percentage = 6;        // Usage percentage
+}
+
+message PurgeOldVersionsRequest {
+    string uid = 1;                     // File UUID to purge old versions for
+    int32 keep_count = 2;               // Number of versions to keep
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message PurgeOldVersionsResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message TriggerSyncRequest {
+    string tenant = 1;                  // Optional tenant to sync (if empty, sync all)
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message TriggerSyncResponse {
+    bool success = 1;
+    string error = 2;
+}
