@@ -66,6 +66,55 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/file
 
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$DIR"   # cleanup
 
+# ---- versioning + metadata + manipulation ----
+echo "[versioning + metadata + manipulation]"
+WS=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_ext\"}" | uidof)
+F2=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$WS/files" -d '{"name":"v.txt"}' | uidof)
+curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$F2/content" --data-binary 'v1'
+sleep 1; curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$F2/content" --data-binary 'v2'
+sleep 1; curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$F2/content" --data-binary 'v3'
+
+out=$(curl -s "${A[@]}" "$BASE/v1/files/$F2/versions")
+vc=$(grep -oE '[0-9]{8}_[0-9]{6}' <<<"$out" | wc -l)
+[ "$vc" -ge 3 ] && ok "GET /v1/files/{uid}/versions ($vc)" || bad "versions list" "$out"
+TS=$(grep -oE '[0-9]{8}_[0-9]{6}(\.[0-9]+)?' <<<"$out" | head -1)
+out=$(curl -s "${A[@]}" "$BASE/v1/files/$F2/versions/$TS")
+[ -n "$out" ] && ok "GET specific version" || bad "get version" "$out"
+out=$(curl -s "${A[@]}" -X POST "$BASE/v1/files/$F2/restore" -d "{\"version_timestamp\":\"$TS\"}")
+grep -q 'restored_version' <<<"$out" && ok "POST restore version" || bad "restore" "$out"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/files/$F2/purge" -d '{"keep_count":1}')
+[ "$code" = "204" ] && ok "POST purge -> 204" || bad "purge" "got $code"
+
+curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/nodes/$F2/metadata/color" -d '{"value":"blue"}'
+out=$(curl -s "${A[@]}" "$BASE/v1/nodes/$F2/metadata/color")
+grep -q '"value":"blue"' <<<"$out" && ok "metadata PUT+GET key" || bad "metadata get" "$out"
+out=$(curl -s "${A[@]}" "$BASE/v1/nodes/$F2/metadata")
+grep -q '"color":"blue"' <<<"$out" && ok "metadata GET all" || bad "metadata getall" "$out"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/nodes/$F2/metadata/color")
+[ "$code" = "204" ] && ok "metadata DELETE -> 204" || bad "metadata delete" "got $code"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/nodes/$F2/rename" -d '{"new_name":"renamed_v.txt"}')
+[ "$code" = "204" ] && ok "POST rename -> 204" || bad "rename" "got $code"
+grep -q '"exists":true'  <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$F2/exists")" && ok "exists true" || bad "exists true"
+grep -q '"exists":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/deadbeef-0000-0000-0000-000000000000/exists")" && ok "exists false (bogus uid)" || bad "exists false"
+curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/files/$F2"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/files/$F2/undelete")
+[ "$code" = "204" ] && ok "soft-delete + POST undelete -> 204" || bad "undelete" "got $code"
+SUB=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$WS" -d '{"name":"sub"}' | uidof)
+CF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$WS/files" -d '{"name":"copyme.txt"}' | uidof)
+curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$CF/content" --data-binary 'copy me'
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/nodes/$CF/copy" -d "{\"destination_parent_uid\":\"$SUB\"}")
+[ "$code" = "204" ] && ok "POST copy -> 204" || bad "copy" "got $code"
+grep -q 'copyme.txt' <<<"$(curl -s "${A[@]}" "$BASE/v1/dirs/$SUB")" && ok "copied file appears in dest" || bad "copy result"
+
+# error mapping
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/nodes/deadbeef-0000-0000-0000-000000000000")
+{ [ "$code" = "404" ] || [ "$code" = "500" ]; } && ok "stat bogus uid -> error status ($code)" || bad "stat bogus" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/bogus/resource")
+[ "$code" = "404" ] && ok "unknown route -> 404" || bad "unknown route" "got $code"
+
+curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$WS"   # cleanup
+
 echo "=========================================================="
 echo " RESULTS:  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -gt 0 ] && { echo " Failed:"; printf '   - %s\n' "${FAILED[@]}"; }

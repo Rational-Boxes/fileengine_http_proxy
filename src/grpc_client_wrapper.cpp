@@ -121,6 +121,11 @@ fileengine_rpc::RestoreToVersionResponse GRPCClientWrapper::restoreToVersion(con
         [&](grpc::ClientContext& c, fileengine_rpc::RestoreToVersionResponse& r) { return stub_->RestoreToVersion(&c, request, &r); });
 }
 
+fileengine_rpc::PurgeOldVersionsResponse GRPCClientWrapper::purgeOldVersions(const fileengine_rpc::PurgeOldVersionsRequest& request) {
+    return invoke<fileengine_rpc::PurgeOldVersionsResponse>("PurgeOldVersions",
+        [&](grpc::ClientContext& c, fileengine_rpc::PurgeOldVersionsResponse& r) { return stub_->PurgeOldVersions(&c, request, &r); });
+}
+
 // Metadata operations
 fileengine_rpc::SetMetadataResponse GRPCClientWrapper::setMetadata(const fileengine_rpc::SetMetadataRequest& request) {
     return invoke<fileengine_rpc::SetMetadataResponse>("SetMetadata",

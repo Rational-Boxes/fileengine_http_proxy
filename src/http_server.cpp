@@ -93,6 +93,16 @@ std::string jsonField(const std::string& body, const std::string& key) {
     return "";
 }
 
+int jsonFieldInt(const std::string& body, const std::string& key, int def) {
+    try {
+        Poco::JSON::Parser p;
+        auto obj = p.parse(body).extract<Poco::JSON::Object::Ptr>();
+        if (obj && obj->has(key)) return obj->getValue<int>(key);
+    } catch (...) {
+    }
+    return def;
+}
+
 const char* fileTypeName(int t) {
     switch (t) {
         case fileengine_rpc::DIRECTORY: return "directory";
@@ -160,24 +170,44 @@ private:
         if (segs.size() >= 3) {
             const std::string& resource = segs[1];
             std::string uid = (segs[2] == "root") ? "" : segs[2];  // "root" alias; all-zeros handled by core
+            const std::string sub = segs.size() >= 4 ? segs[3] : "";
 
             if (resource == "dirs") {
                 if (segs.size() == 3) {
                     if (method == "POST")   return makeDir(req, resp, id, uid);
                     if (method == "GET")    return listDir(req, resp, id, uid);
                     if (method == "DELETE") return removeDir(resp, id, uid);
-                } else if (segs.size() == 4 && segs[3] == "files" && method == "POST") {
+                } else if (segs.size() == 4 && sub == "files" && method == "POST") {
                     return touchFile(req, resp, id, uid);
                 }
             } else if (resource == "files") {
-                if (segs.size() == 4 && segs[3] == "content") {
-                    if (method == "PUT") return putContent(req, resp, id, uid);
-                    if (method == "GET") return getContent(resp, id, uid);
-                } else if (segs.size() == 3 && method == "DELETE") {
-                    return removeFile(resp, id, uid);
+                if (segs.size() == 3) {
+                    if (method == "DELETE") return removeFile(resp, id, uid);
+                } else if (segs.size() == 4) {
+                    if (sub == "content" && method == "PUT")    return putContent(req, resp, id, uid);
+                    if (sub == "content" && method == "GET")    return getContent(resp, id, uid);
+                    if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
+                    if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
+                    if (sub == "restore" && method == "POST")   return restoreVersion(req, resp, id, uid);
+                    if (sub == "purge" && method == "POST")     return purgeVersions(req, resp, id, uid);
+                } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
+                    return getVersion(resp, id, uid, segs[4]);
                 }
             } else if (resource == "nodes") {
-                if (segs.size() == 3 && method == "GET") return statNode(resp, id, uid);
+                if (segs.size() == 3) {
+                    if (method == "GET") return statNode(resp, id, uid);
+                } else if (segs.size() == 4) {
+                    if (sub == "exists" && method == "GET")     return existsNode(resp, id, uid);
+                    if (sub == "rename" && method == "POST")    return renameNode(req, resp, id, uid);
+                    if (sub == "move" && method == "POST")      return moveNode(req, resp, id, uid);
+                    if (sub == "copy" && method == "POST")      return copyNode(req, resp, id, uid);
+                    if (sub == "metadata" && method == "GET")   return getAllMeta(resp, id, uid);
+                } else if (segs.size() == 5 && sub == "metadata") {
+                    const std::string& key = segs[4];
+                    if (method == "GET")    return getMeta(resp, id, uid, key);
+                    if (method == "PUT")    return setMeta(req, resp, id, uid, key);
+                    if (method == "DELETE") return deleteMeta(resp, id, uid, key);
+                }
             }
         }
         sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
@@ -299,6 +329,156 @@ private:
         rq.set_uid(uid);
         fillAuth(rq.mutable_auth(), id);
         auto r = grpc_->removeDirectory(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    // --- manipulation ---
+    void renameNode(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string nn = jsonField(readBody(req), "new_name");
+        if (nn.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'new_name'"})");
+        fileengine_rpc::RenameRequest rq;
+        rq.set_uid(uid);
+        rq.set_new_name(nn);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->rename(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void moveNode(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string dest = jsonField(readBody(req), "destination_parent_uid");
+        fileengine_rpc::MoveRequest rq;
+        rq.set_source_uid(uid);
+        rq.set_destination_parent_uid(dest);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->move(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void copyNode(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string dest = jsonField(readBody(req), "destination_parent_uid");
+        fileengine_rpc::CopyRequest rq;
+        rq.set_source_uid(uid);
+        rq.set_destination_parent_uid(dest);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->copy(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void existsNode(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::ExistsRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->exists(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        sendJson(resp, HTTPResponse::HTTP_OK, std::string("{\"exists\":") + (r.exists() ? "true" : "false") + "}");
+    }
+
+    void undelete(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::UndeleteFileRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->undeleteFile(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    // --- versioning ---
+    void listVersions(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::ListVersionsRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->listVersions(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::vector<std::string> v(r.versions().begin(), r.versions().end());
+        sendJson(resp, HTTPResponse::HTTP_OK, "{\"versions\":" + jsonArray(v) + "}");
+    }
+
+    void getVersion(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& ts) {
+        fileengine_rpc::GetVersionRequest rq;
+        rq.set_uid(uid);
+        rq.set_version_timestamp(ts);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getVersion(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        resp.setStatus(HTTPResponse::HTTP_OK);
+        resp.setContentType("application/octet-stream");
+        const std::string& data = r.data();
+        resp.setContentLength(static_cast<std::streamsize>(data.size()));
+        resp.send().write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+
+    void restoreVersion(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        std::string ts = jsonField(readBody(req), "version_timestamp");
+        fileengine_rpc::RestoreToVersionRequest rq;
+        rq.set_uid(uid);
+        rq.set_version_timestamp(ts);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->restoreToVersion(rq);
+        if (r.success()) sendJson(resp, HTTPResponse::HTTP_OK, "{\"restored_version\":\"" + jsonEscape(r.restored_version()) + "\"}");
+        else mapError(resp, r.error());
+    }
+
+    void purgeVersions(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        int keep = jsonFieldInt(readBody(req), "keep_count", 1);
+        fileengine_rpc::PurgeOldVersionsRequest rq;
+        rq.set_uid(uid);
+        rq.set_keep_count(keep);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->purgeOldVersions(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    // --- metadata ---
+    void getAllMeta(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::GetAllMetadataRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getAllMetadata(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::string body = "{\"metadata\":{";
+        bool first = true;
+        for (const auto& kv : r.metadata()) {
+            if (!first) body += ",";
+            first = false;
+            body += "\"" + jsonEscape(kv.first) + "\":\"" + jsonEscape(kv.second) + "\"";
+        }
+        body += "}}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
+    void getMeta(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& key) {
+        fileengine_rpc::GetMetadataRequest rq;
+        rq.set_uid(uid);
+        rq.set_key(key);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getMetadata(rq);
+        if (r.success()) sendJson(resp, HTTPResponse::HTTP_OK, "{\"value\":\"" + jsonEscape(r.value()) + "\"}");
+        else mapError(resp, r.error());
+    }
+
+    void setMeta(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& key) {
+        std::string value = jsonField(readBody(req), "value");
+        fileengine_rpc::SetMetadataRequest rq;
+        rq.set_uid(uid);
+        rq.set_key(key);
+        rq.set_value(value);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->setMetadata(rq);
+        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+        else mapError(resp, r.error());
+    }
+
+    void deleteMeta(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& key) {
+        fileengine_rpc::DeleteMetadataRequest rq;
+        rq.set_uid(uid);
+        rq.set_key(key);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->deleteMetadata(rq);
         if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
         else mapError(resp, r.error());
     }

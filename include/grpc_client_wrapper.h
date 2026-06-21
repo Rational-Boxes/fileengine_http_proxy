@@ -53,6 +53,7 @@ public:
     fileengine_rpc::ListVersionsResponse listVersions(const fileengine_rpc::ListVersionsRequest& request);
     fileengine_rpc::GetVersionResponse getVersion(const fileengine_rpc::GetVersionRequest& request);
     fileengine_rpc::RestoreToVersionResponse restoreToVersion(const fileengine_rpc::RestoreToVersionRequest& request);
+    fileengine_rpc::PurgeOldVersionsResponse purgeOldVersions(const fileengine_rpc::PurgeOldVersionsRequest& request);
 
     // Metadata operations
     fileengine_rpc::SetMetadataResponse setMetadata(const fileengine_rpc::SetMetadataRequest& request);
