@@ -37,6 +37,9 @@ int main() {
     cfg.http_host = webdav::getEnvOrDefault("HTTP_HOST", "0.0.0.0");
     cfg.http_port = std::stoi(webdav::getEnvOrDefault("HTTP_PORT", "8090"));
     cfg.thread_pool = std::stoi(webdav::getEnvOrDefault("HTTP_THREAD_POOL", "16"));
+    cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "3600"));
+    cfg.max_body_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_BODY_BYTES", "104857600"));
+    cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
     cfg.grpc_address = webdav::getEnvOrDefault("FILEENGINE_GRPC_HOST", "localhost") + ":" +
                        webdav::getEnvOrDefault("FILEENGINE_GRPC_PORT", "50051");
 

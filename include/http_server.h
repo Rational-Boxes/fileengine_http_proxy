@@ -8,6 +8,7 @@
 
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
+#include "token_store.h"
 
 namespace httpbridge {
 
@@ -15,6 +16,9 @@ struct Config {
     std::string http_host = "0.0.0.0";
     int http_port = 8090;
     int thread_pool = 16;
+    int token_ttl = 3600;
+    long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
+    std::string cors_origin;                   // empty => no CORS header
     std::string grpc_address = "localhost:50051";
 };
 
@@ -35,6 +39,7 @@ private:
     Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
+    std::shared_ptr<TokenStore> tokens_;
     std::unique_ptr<Poco::Net::HTTPServer> server_;
 };
 

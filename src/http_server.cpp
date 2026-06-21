@@ -160,9 +160,11 @@ void mapError(HTTPServerResponse& resp, const std::string& err) {
 // dependencies by pointer.
 class RequestHandler : public HTTPRequestHandler {
 public:
-    RequestHandler(std::shared_ptr<webdav::GRPCClientWrapper> grpc,
-                   std::shared_ptr<webdav::LDAPAuthenticator> ldap)
-        : grpc_(std::move(grpc)), ldap_(std::move(ldap)) {}
+    RequestHandler(Config cfg,
+                   std::shared_ptr<webdav::GRPCClientWrapper> grpc,
+                   std::shared_ptr<webdav::LDAPAuthenticator> ldap,
+                   std::shared_ptr<TokenStore> tokens)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         const std::string& uri = req.getURI();
@@ -183,11 +185,20 @@ private:
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
     void handleV1(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& path) {
+        std::string method = req.getMethod();
+
+        // Token endpoint: issue via Basic, revoke via Bearer. Handled before the
+        // general authenticate() so issuing a token needs no existing token.
+        if (path == "/v1/auth/token") {
+            if (method == "POST")   return issueToken(req, resp);
+            if (method == "DELETE") return revokeToken(req, resp);
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
         AuthIdentity id;
         if (!authenticate(req, id)) return unauthorized(resp);
 
         auto segs = pathSegments(path);            // [v1, <resource>, <uid>, <sub>?]
-        std::string method = req.getMethod();
 
         if (segs.size() == 2 && segs[1] == "whoami") return whoami(resp, id);
 
@@ -671,9 +682,23 @@ private:
         else mapError(resp, r.error());
     }
 
+    // Authenticate via a cached Bearer token (no LDAP) or HTTP Basic (LDAP).
+    bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
+        std::string h = req.get("Authorization", "");
+        if (h.compare(0, 7, "Bearer ") == 0) {
+            Session s;
+            if (!tokens_->lookup(webdav::trim(h.substr(7)), s)) return false;
+            out.user = s.user;
+            out.tenant = s.tenant;
+            out.roles = s.roles;
+            return true;
+        }
+        return authenticateBasic(req, out);
+    }
+
     // HTTP Basic -> LDAP bind. Tenant: X-Tenant header > host subdomain >
     // "default". Returns false on missing/invalid credentials.
-    bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
+    bool authenticateBasic(HTTPServerRequest& req, AuthIdentity& out) {
         std::string h = req.get("Authorization", "");
         if (h.size() < 6 || h.compare(0, 6, "Basic ") != 0) return false;
         std::istringstream iss(webdav::trim(h.substr(6)));
@@ -703,6 +728,20 @@ private:
     void unauthorized(HTTPServerResponse& resp) {
         resp.set("WWW-Authenticate", "Basic realm=\"FileEngine\"");
         sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":"authentication required"})");
+    }
+
+    void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        AuthIdentity id;
+        if (!authenticateBasic(req, id)) return unauthorized(resp);
+        std::string token = tokens_->issue(id.user, id.tenant, id.roles);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" + std::to_string(tokens_->ttl()) + "}");
+    }
+
+    void revokeToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        std::string h = req.get("Authorization", "");
+        if (h.compare(0, 7, "Bearer ") == 0) tokens_->revoke(webdav::trim(h.substr(7)));
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
     void whoami(HTTPServerResponse& resp, const AuthIdentity& id) {
@@ -736,23 +775,29 @@ private:
         }
     }
 
+    Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
+    std::shared_ptr<TokenStore> tokens_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {
 public:
-    HandlerFactory(std::shared_ptr<webdav::GRPCClientWrapper> grpc,
-                   std::shared_ptr<webdav::LDAPAuthenticator> ldap)
-        : grpc_(std::move(grpc)), ldap_(std::move(ldap)) {}
+    HandlerFactory(Config cfg,
+                   std::shared_ptr<webdav::GRPCClientWrapper> grpc,
+                   std::shared_ptr<webdav::LDAPAuthenticator> ldap,
+                   std::shared_ptr<TokenStore> tokens)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new RequestHandler(grpc_, ldap_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_);
     }
 
 private:
+    Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
+    std::shared_ptr<TokenStore> tokens_;
 };
 
 }  // namespace
@@ -760,7 +805,8 @@ private:
 HttpBridgeServer::HttpBridgeServer(const Config& cfg,
                                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                                    std::shared_ptr<webdav::LDAPAuthenticator> ldap)
-    : cfg_(cfg), grpc_(std::move(grpc)), ldap_(std::move(ldap)) {}
+    : cfg_(cfg), grpc_(std::move(grpc)), ldap_(std::move(ldap)),
+      tokens_(std::make_shared<TokenStore>(cfg.token_ttl)) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -774,7 +820,7 @@ void HttpBridgeServer::start() {
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(grpc_, ldap_), socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_), socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");

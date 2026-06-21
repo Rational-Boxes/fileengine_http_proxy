@@ -36,6 +36,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u testuser:wrongpass "$BASE/v1/wh
 out=$(curl -s -u testuser:password -H 'X-Tenant: acme' "$BASE/v1/whoami")
 grep -q '"tenant":"acme"' <<<"$out" && ok "X-Tenant header overrides tenant" || bad "X-Tenant override" "$out"
 
+# ---- token auth ----
+echo "[token auth]"
+out=$(curl -s -u testuser:password -X POST "$BASE/v1/auth/token")
+TOKEN=$(grep -oE '"token":"[a-f0-9]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
+[ -n "$TOKEN" ] && ok "POST /v1/auth/token issues token" || bad "issue token" "$out"
+grep -q '"token_type":"Bearer"' <<<"$out" && ok "token_type Bearer + expires_in" || bad "token_type" "$out"
+grep -q '"user":"testuser"' <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")" && ok "Bearer token authenticates (no LDAP)" || bad "bearer auth"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/whoami")
+[ "$code" = "401" ] && ok "bogus bearer -> 401" || bad "bogus bearer" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/token")
+[ "$code" = "204" ] && ok "DELETE /v1/auth/token (revoke) -> 204" || bad "revoke" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")
+[ "$code" = "401" ] && ok "revoked token -> 401" || bad "revoked token" "got $code"
+
 # ---- filesystem round-trip ----
 echo "[filesystem]"
 ROOT="00000000-0000-0000-0000-000000000000"      # all-zeros UUID = root
