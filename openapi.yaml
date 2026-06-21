@@ -1,0 +1,434 @@
+openapi: 3.0.3
+info:
+  title: FileEngine HTTP REST Bridge
+  version: "1.0.0"
+  description: |
+    A thin, LDAP-secured REST front-end over the FileEngine gRPC FileService
+    (`fileengine_rpc`). Resources are addressed by UID; the filesystem root is
+    the empty string or the all-zeros UUID (`00000000-0000-0000-0000-000000000000`),
+    also accepted as the literal `root`.
+
+    **Auth** — every `/v1` route (except `POST /v1/auth/token`) requires HTTP
+    Basic (LDAP bind) or a `Bearer` token from `/v1/auth/token`. The tenant is
+    taken from the host subdomain or the `X-Tenant` header (default `default`).
+    A member of a tenant's `administrators` LDAP group is granted the server's
+    `system_admin` role.
+
+    **Errors** — failures return `{"error": "..."}` with the mapped status
+    (`400` bad input, `401` unauthenticated, `403` permission denied, `404` not
+    found, `409` conflict, `413` body too large, `5xx` backend).
+servers:
+  - url: http://localhost:8090
+    description: Local bridge
+  - url: https://{tenant}.example.com
+    description: Tenant-mapped deployment (TLS terminated upstream)
+    variables:
+      tenant: { default: app }
+
+tags:
+  - name: health
+  - name: auth
+  - name: filesystem
+  - name: versioning
+  - name: metadata
+  - name: acl
+  - name: roles
+  - name: admin
+
+security:
+  - basicAuth: []
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is up
+          content: { application/json: { schema: { $ref: "#/components/schemas/Status" } } }
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe (gRPC core reachable)
+      security: []
+      responses:
+        "200": { description: Ready, content: { application/json: { schema: { $ref: "#/components/schemas/Status" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/auth/token:
+    post:
+      tags: [auth]
+      summary: Issue a bearer token
+      description: Authenticates via HTTP Basic (LDAP) and returns a short-lived bearer token.
+      security: [ { basicAuth: [] } ]
+      responses:
+        "200":
+          description: Token issued
+          content: { application/json: { schema: { $ref: "#/components/schemas/Token" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      tags: [auth]
+      summary: Revoke the presented bearer token
+      security: [ { bearerAuth: [] } ]
+      responses:
+        "204": { description: Revoked (idempotent) }
+  /v1/whoami:
+    get:
+      tags: [auth]
+      summary: Resolved identity for the request
+      responses:
+        "200":
+          description: Identity
+          content: { application/json: { schema: { $ref: "#/components/schemas/Identity" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/dirs/{uid}:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [filesystem]
+      summary: List directory contents
+      parameters:
+        - name: deleted
+          in: query
+          schema: { type: boolean, default: false }
+          description: Include soft-deleted entries (ListDirectoryWithDeleted).
+      responses:
+        "200": { description: Entries, content: { application/json: { schema: { $ref: "#/components/schemas/EntryList" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [filesystem]
+      summary: Create a subdirectory
+      requestBody: { $ref: "#/components/requestBodies/Name" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/UidRef" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      tags: [filesystem]
+      summary: Remove a directory (soft delete)
+      responses:
+        "204": { description: Removed }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/dirs/{uid}/files:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Create an empty file
+      requestBody: { $ref: "#/components/requestBodies/Name" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/UidRef" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/nodes/{uid}:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [filesystem]
+      summary: Stat a file or directory
+      responses:
+        "200": { description: Metadata, content: { application/json: { schema: { $ref: "#/components/schemas/FileInfo" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/nodes/{uid}/exists:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [filesystem]
+      summary: Existence check
+      responses:
+        "200": { description: Result, content: { application/json: { schema: { type: object, properties: { exists: { type: boolean } } } } } }
+  /v1/nodes/{uid}/rename:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Rename a node
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [new_name], properties: { new_name: { type: string } } } } }
+      responses: { "204": { description: Renamed }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /v1/nodes/{uid}/move:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Move a node under a new parent
+      requestBody: { $ref: "#/components/requestBodies/Destination" }
+      responses: { "204": { description: Moved }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /v1/nodes/{uid}/copy:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Copy a node under a new parent (recursive for dirs)
+      requestBody: { $ref: "#/components/requestBodies/Destination" }
+      responses: { "204": { description: Copied }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } }
+
+  /v1/files/{uid}:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    delete:
+      tags: [filesystem]
+      summary: Remove a file (soft delete)
+      responses: { "204": { description: Removed }, "403": { $ref: "#/components/responses/Forbidden" }, "404": { $ref: "#/components/responses/NotFound" } }
+  /v1/files/{uid}/undelete:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Restore a soft-deleted file
+      responses: { "204": { description: Undeleted }, "404": { $ref: "#/components/responses/NotFound" } }
+  /v1/files/{uid}/content:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [filesystem]
+      summary: Download file content (streamed; supports Range)
+      parameters:
+        - name: Range
+          in: header
+          schema: { type: string }
+          description: "e.g. bytes=0-1023"
+      responses:
+        "200": { description: Full content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        "206": { description: Partial content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [filesystem]
+      summary: Write a new version of file content (streamed)
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        "204": { description: Stored }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+
+  /v1/files/{uid}/versions:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [versioning]
+      summary: List version timestamps (newest first)
+      responses:
+        "200": { description: Versions, content: { application/json: { schema: { type: object, properties: { versions: { type: array, items: { type: string } } } } } } }
+  /v1/files/{uid}/versions/{ts}:
+    parameters:
+      - { $ref: "#/components/parameters/Uid" }
+      - { name: ts, in: path, required: true, schema: { type: string }, description: Version timestamp }
+    get:
+      tags: [versioning]
+      summary: Download a specific version
+      responses:
+        "200": { description: Content at version, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/files/{uid}/restore:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [versioning]
+      summary: Restore a file to a prior version
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [version_timestamp], properties: { version_timestamp: { type: string } } } } }
+      responses:
+        "200": { description: Restored, content: { application/json: { schema: { type: object, properties: { restored_version: { type: string } } } } } }
+  /v1/files/{uid}/purge:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [versioning]
+      summary: Purge old versions, keeping the N most recent
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { keep_count: { type: integer, default: 1 } } } } }
+      responses: { "204": { description: Purged } }
+
+  /v1/nodes/{uid}/metadata:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [metadata]
+      summary: Get all metadata
+      responses:
+        "200": { description: Metadata map, content: { application/json: { schema: { type: object, properties: { metadata: { type: object, additionalProperties: { type: string } } } } } } }
+  /v1/nodes/{uid}/metadata/{key}:
+    parameters:
+      - { $ref: "#/components/parameters/Uid" }
+      - { name: key, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [metadata]
+      summary: Get a metadata value
+      responses:
+        "200": { description: Value, content: { application/json: { schema: { type: object, properties: { value: { type: string } } } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [metadata]
+      summary: Set a metadata value
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [value], properties: { value: { type: string } } } } }
+      responses: { "204": { description: Set } }
+    delete:
+      tags: [metadata]
+      summary: Delete a metadata key
+      responses: { "204": { description: Deleted } }
+
+  /v1/nodes/{uid}/permissions:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [acl]
+      summary: Check a permission for a principal
+      parameters:
+        - { name: user, in: query, schema: { type: string }, description: Principal to evaluate (defaults to the caller) }
+        - { name: permission, in: query, required: true, schema: { type: string }, description: "Letter (r/w/x/d/l/u/v/b/s/m/i) or name (READ/WRITE/...)" }
+        - { name: roles, in: query, schema: { type: string }, description: Comma-separated roles to evaluate with }
+      responses:
+        "200": { description: Result, content: { application/json: { schema: { type: object, properties: { has_permission: { type: boolean } } } } } }
+    post:
+      tags: [acl]
+      summary: Grant a permission
+      requestBody: { $ref: "#/components/requestBodies/Acl" }
+      responses: { "204": { description: Granted }, "403": { $ref: "#/components/responses/Forbidden" } }
+    delete:
+      tags: [acl]
+      summary: Revoke a permission
+      requestBody: { $ref: "#/components/requestBodies/Acl" }
+      responses: { "204": { description: Revoked }, "403": { $ref: "#/components/responses/Forbidden" } }
+
+  /v1/roles:
+    get:
+      tags: [roles]
+      summary: List all roles
+      responses: { "200": { description: Roles, content: { application/json: { schema: { $ref: "#/components/schemas/RoleList" } } } } }
+    post:
+      tags: [roles]
+      summary: Create a role (system_admin)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [role], properties: { role: { type: string } } } } }
+      responses: { "201": { description: Created }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /v1/roles/{role}:
+    parameters: [ { name: role, in: path, required: true, schema: { type: string } } ]
+    delete:
+      tags: [roles]
+      summary: Delete a role (system_admin)
+      responses: { "204": { description: Deleted }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /v1/roles/{role}/users:
+    parameters: [ { name: role, in: path, required: true, schema: { type: string } } ]
+    get:
+      tags: [roles]
+      summary: List users in a role
+      responses: { "200": { description: Users, content: { application/json: { schema: { type: object, properties: { users: { type: array, items: { type: string } } } } } } } }
+  /v1/roles/{role}/users/{user}:
+    parameters:
+      - { name: role, in: path, required: true, schema: { type: string } }
+      - { name: user, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [roles]
+      summary: Assign a user to a role (system_admin)
+      responses: { "204": { description: Assigned } }
+    delete:
+      tags: [roles]
+      summary: Remove a user from a role (system_admin)
+      responses: { "204": { description: Removed } }
+  /v1/users/{user}/roles:
+    parameters: [ { name: user, in: path, required: true, schema: { type: string } } ]
+    get:
+      tags: [roles]
+      summary: List a user's roles
+      responses: { "200": { description: Roles, content: { application/json: { schema: { $ref: "#/components/schemas/RoleList" } } } } }
+
+  /v1/storage:
+    get:
+      tags: [admin]
+      summary: Storage usage for the tenant
+      responses: { "200": { description: Usage, content: { application/json: { schema: { $ref: "#/components/schemas/StorageUsage" } } } } }
+  /v1/sync:
+    post:
+      tags: [admin]
+      summary: Trigger object-store synchronization
+      responses: { "204": { description: Triggered } }
+
+components:
+  securitySchemes:
+    basicAuth: { type: http, scheme: basic, description: LDAP username/password }
+    bearerAuth: { type: http, scheme: bearer, description: Token from POST /v1/auth/token }
+  parameters:
+    Uid:
+      name: uid
+      in: path
+      required: true
+      schema: { type: string }
+      description: Entity UID; the empty/all-zeros UUID or "root" denotes the filesystem root.
+  requestBodies:
+    Name:
+      required: true
+      content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string } } } } }
+    Destination:
+      required: true
+      content: { application/json: { schema: { type: object, required: [destination_parent_uid], properties: { destination_parent_uid: { type: string } } } } }
+    Acl:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [principal, permission]
+            properties:
+              principal: { type: string, description: "User, or 'role:NAME' for a role" }
+              permission: { type: string, description: "Letter or enum name" }
+              effect: { type: string, enum: [allow, deny], default: allow }
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      headers: { WWW-Authenticate: { schema: { type: string } } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden: { description: Permission denied by the core, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    BadRequest: { description: Invalid input, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Conflict: { description: Conflict (e.g. copy/move into own subtree), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    TooLarge: { description: Request body exceeds the configured limit, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Unavailable: { description: Backend unavailable, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  schemas:
+    Status: { type: object, properties: { status: { type: string } } }
+    Error: { type: object, properties: { error: { type: string } } }
+    Token:
+      type: object
+      properties:
+        token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, description: Seconds }
+    Identity:
+      type: object
+      properties:
+        user: { type: string }
+        tenant: { type: string }
+        roles: { type: array, items: { type: string } }
+    UidRef: { type: object, properties: { uid: { type: string } } }
+    FileType: { type: string, enum: [file, directory, symlink] }
+    FileInfo:
+      type: object
+      properties:
+        uid: { type: string }
+        name: { type: string }
+        parent_uid: { type: string }
+        type: { $ref: "#/components/schemas/FileType" }
+        size: { type: integer }
+        owner: { type: string }
+        version: { type: string }
+    DirectoryEntry:
+      type: object
+      properties:
+        uid: { type: string }
+        name: { type: string }
+        type: { $ref: "#/components/schemas/FileType" }
+        size: { type: integer }
+        version_count: { type: integer }
+    EntryList:
+      type: object
+      properties: { entries: { type: array, items: { $ref: "#/components/schemas/DirectoryEntry" } } }
+    RoleList:
+      type: object
+      properties: { roles: { type: array, items: { type: string } } }
+    StorageUsage:
+      type: object
+      properties:
+        total_space: { type: integer }
+        used_space: { type: integer }
+        available_space: { type: integer }
+        usage_percentage: { type: number }
