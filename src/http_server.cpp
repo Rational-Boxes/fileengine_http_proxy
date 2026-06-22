@@ -311,6 +311,7 @@ private:
 
         // Top-level admin / role resources (no uid in the path).
         const std::string res0 = segs.size() >= 2 ? segs[1] : "";
+        if (res0 == "tenants" && segs.size() == 2 && method == "GET") return listTenants(resp, id);
         if (res0 == "storage" && segs.size() == 2 && method == "GET")  return storageUsage(resp, id);
         if (res0 == "sync" && segs.size() == 2 && method == "POST")    return triggerSync(resp, id);
         if (res0 == "roles") {
@@ -950,6 +951,13 @@ private:
             out.user = s.user;
             out.tenant = s.tenant;
             out.roles = s.roles;
+            // Per-request tenant selection: an X-Tenant header overrides the
+            // tenant bound to the token at issue time, letting a single session
+            // operate across the tenants it can access without re-authenticating.
+            // The core still enforces ACLs, so a tenant the user cannot reach
+            // simply yields permission errors / empty listings.
+            std::string xt = req.get("X-Tenant", "");
+            if (!xt.empty()) out.tenant = xt;
             return true;
         }
         return authenticateBasic(req, out);
@@ -1007,6 +1015,26 @@ private:
         std::string body = "{\"user\":\"" + jsonEscape(id.user) +
                            "\",\"tenant\":\"" + jsonEscape(id.tenant) +
                            "\",\"roles\":" + jsonArray(id.roles) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
+    // The tenants the authenticated user can operate in (from LDAP group
+    // membership), plus the tenant active on this request so the caller can
+    // present a selector with the current choice highlighted. Always includes at
+    // least the active tenant; falls back to "default" if nothing resolves.
+    void listTenants(HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::vector<std::string> tenants = ldap_->getTenantsForUser(id.user);
+        if (!id.tenant.empty() &&
+            std::find(tenants.begin(), tenants.end(), id.tenant) == tenants.end()) {
+            tenants.push_back(id.tenant);
+        }
+        if (tenants.empty()) tenants.push_back("default");
+        std::sort(tenants.begin(), tenants.end());
+        tenants.erase(std::unique(tenants.begin(), tenants.end()), tenants.end());
+
+        std::string current = id.tenant.empty() ? "default" : id.tenant;
+        std::string body = "{\"tenants\":" + jsonArray(tenants) +
+                           ",\"current\":\"" + jsonEscape(current) + "\"}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 

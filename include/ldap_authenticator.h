@@ -47,6 +47,12 @@ public:
     // `authenticated` is false if no single matching entry exists.
     UserInfo getUserInfoByEmail(const std::string& email);
 
+    // Enumerate the tenants a user has access to. A user has access to a tenant
+    // when they are a member of any group under that tenant's subtree
+    // (ou=<tenant>,<tenant_base>). Returns the sorted, de-duplicated tenant
+    // names; empty if the user or their memberships cannot be resolved.
+    std::vector<std::string> getTenantsForUser(const std::string& username);
+
 private:
     std::string ldap_endpoint_;
     std::string ldap_domain_;
