@@ -57,6 +57,22 @@ std::string uidFromDN(const std::string& dn) {
     return dn.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
 }
 
+// Given a group DN that sits under the tenant base, return the tenant it belongs
+// to: the ou= component immediately above the tenant base. For example, with a
+// tenant_base of "ou=tenants,dc=example,dc=com" and a group DN of
+// "cn=administrators,ou=acme,ou=tenants,dc=example,dc=com" this returns "acme".
+// Empty if the DN is not under the tenant base.
+std::string tenantFromGroupDN(const std::string& dn, const std::string& tenant_base) {
+    if (tenant_base.empty()) return "";
+    std::string suffix = "," + tenant_base;
+    size_t pos = dn.find(suffix);
+    if (pos == std::string::npos) return "";
+    std::string head = dn.substr(0, pos);  // e.g. "cn=administrators,ou=acme"
+    size_t oupos = head.rfind("ou=");
+    if (oupos == std::string::npos) return "";
+    return head.substr(oupos + 3);
+}
+
 }  // namespace
 
 UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const std::string& password) {
@@ -393,6 +409,78 @@ UserInfo LDAPAuthenticator::getUserInfoByEmail(const std::string& email) {
 
     ldap_unbind_ext_s(ld, nullptr, nullptr);
     return user_info;
+}
+
+std::vector<std::string> LDAPAuthenticator::getTenantsForUser(const std::string& username) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+    webdav::debugLog("LDAPAuthenticator::getTenantsForUser: resolving tenants for user: " + username);
+
+    std::vector<std::string> tenants;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: failed to connect to LDAP");
+        return tenants;
+    }
+
+    // 1. Resolve the user's DN (accept either uid or email as the login name).
+    std::string esc = escapeLdapFilterValue(username);
+    std::string user_filter = "(|(uid=" + esc + ")(mail=" + esc + "))";
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, user_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                           user_filter.c_str(), nullptr, false, &result);
+    if (rc != LDAP_SUCCESS || ldap_count_entries(ld, result) != 1) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: user not found or ambiguous: " + username);
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return tenants;
+    }
+
+    LDAPMessage* entry = ldap_first_entry(ld, result);
+    char* dn = entry ? ldap_get_dn(ld, entry) : nullptr;
+    std::string user_dn = dn ? std::string(dn) : "";
+    std::string uid = uidFromDN(user_dn);
+    if (dn) ldap_memfree(dn);
+    ldap_msgfree(result);
+    result = nullptr;
+
+    if (user_dn.empty()) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: could not resolve DN for user: " + username);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return tenants;
+    }
+
+    // 2. Find every group under the tenant base the user is a member of, and map
+    // each matched group DN back to its owning tenant. The DN is LDAP-sourced
+    // (not user input), so it is safe to embed directly in the filter.
+    std::string member_filter = "(|(member=" + user_dn + ")(uniqueMember=" + user_dn + ")"
+                                "(memberUid=" + (uid.empty() ? username : uid) + "))";
+    rc = ldap_search_s(ld, tenant_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                       member_filter.c_str(), nullptr, false, &result);
+    if (rc == LDAP_SUCCESS) {
+        for (LDAPMessage* e = ldap_first_entry(ld, result); e != nullptr; e = ldap_next_entry(ld, e)) {
+            char* gdn = ldap_get_dn(ld, e);
+            if (!gdn) continue;
+            std::string tenant = tenantFromGroupDN(std::string(gdn), tenant_base_);
+            ldap_memfree(gdn);
+            if (tenant.empty()) continue;
+            if (std::find(tenants.begin(), tenants.end(), tenant) == tenants.end()) {
+                tenants.push_back(tenant);
+            }
+        }
+        ldap_msgfree(result);
+    } else {
+        webdav::debugLog("LDAPAuthenticator::getTenantsForUser: tenant group search failed: " +
+                         std::string(ldap_err2string(rc)));
+        if (result) ldap_msgfree(result);
+    }
+
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    std::sort(tenants.begin(), tenants.end());
+    webdav::debugLog("LDAPAuthenticator::getTenantsForUser: found " + std::to_string(tenants.size()) +
+                     " tenant(s) for user: " + username);
+    return tenants;
 }
 
 std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_dn) {

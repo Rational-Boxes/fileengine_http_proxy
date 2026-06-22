@@ -122,6 +122,20 @@ paths:
           description: Identity
           content: { application/json: { schema: { $ref: "#/components/schemas/Identity" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/tenants:
+    get:
+      tags: [auth]
+      summary: Tenants the user can access
+      description: >
+        Lists the tenants the authenticated user has access to (from their LDAP
+        group memberships), together with the tenant active on this request.
+        Supply any of these as the `X-Tenant` header on subsequent requests to
+        operate within that tenant.
+      responses:
+        "200":
+          description: Accessible tenants
+          content: { application/json: { schema: { $ref: "#/components/schemas/Tenants" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /v1/dirs/{uid}:
     parameters: [ { $ref: "#/components/parameters/Uid" } ]
@@ -129,6 +143,7 @@ paths:
       tags: [filesystem]
       summary: List directory contents
       parameters:
+        - $ref: "#/components/parameters/XTenant"
         - name: deleted
           in: query
           schema: { type: boolean, default: false }
@@ -393,6 +408,15 @@ components:
       required: true
       schema: { type: string }
       description: Entity UID; the empty/all-zeros UUID or "root" denotes the filesystem root.
+    XTenant:
+      name: X-Tenant
+      in: header
+      required: false
+      schema: { type: string }
+      description: >
+        Selects the tenant for this request, overriding the host subdomain and,
+        for a bearer token, the tenant bound at issue time. Accepts any tenant
+        returned by GET /v1/tenants. May be sent on any authenticated request.
   requestBodies:
     Name:
       required: true
@@ -437,6 +461,11 @@ components:
         user: { type: string }
         tenant: { type: string }
         roles: { type: array, items: { type: string } }
+    Tenants:
+      type: object
+      properties:
+        tenants: { type: array, items: { type: string }, description: Tenants the user can access }
+        current: { type: string, description: Tenant active on this request }
     UidRef: { type: object, properties: { uid: { type: string } } }
     FileType: { type: string, enum: [file, directory, symlink] }
     FileInfo:
