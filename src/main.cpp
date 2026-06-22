@@ -1,6 +1,11 @@
 #include "http_server.h"
 #include "utils.h"
 
+#include <Poco/Net/SSLManager.h>
+#include <Poco/Net/Context.h>
+#include <Poco/Net/RejectCertificateHandler.h>
+#include <Poco/Net/HTTPSStreamFactory.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
@@ -30,8 +35,26 @@ void loadDotEnv(const std::string& path) {
 
 }  // namespace
 
+// Register a process-wide TLS client context for outbound IdP calls. Certificate
+// validation is ON (VERIFY_RELAXED against the system CA store): the OAuth design
+// trusts the IdP's userinfo/token responses on the strength of validated TLS in
+// place of verifying id_token JWKS signatures, so this must never be VERIFY_NONE.
+void initOutboundTLS() {
+    Poco::Net::initializeSSL();
+    Poco::Net::HTTPSStreamFactory::registerFactory();
+    Poco::SharedPtr<Poco::Net::InvalidCertificateHandler> certHandler =
+        new Poco::Net::RejectCertificateHandler(false);  // false => client side
+    // The 7th argument (loadDefaultCAs=true) trusts the system CA bundle.
+    Poco::Net::Context::Ptr ctx = new Poco::Net::Context(
+        Poco::Net::Context::TLS_CLIENT_USE, "", "", "",
+        Poco::Net::Context::VERIFY_RELAXED, 9, true,
+        "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
+    Poco::Net::SSLManager::instance().initializeClient(nullptr, certHandler, ctx);
+}
+
 int main() {
     loadDotEnv(".env");
+    initOutboundTLS();
 
     httpbridge::Config cfg;
     cfg.http_host = webdav::getEnvOrDefault("HTTP_HOST", "0.0.0.0");
@@ -42,6 +65,9 @@ int main() {
     cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
     cfg.grpc_address = webdav::getEnvOrDefault("FILEENGINE_GRPC_HOST", "localhost") + ":" +
                        webdav::getEnvOrDefault("FILEENGINE_GRPC_PORT", "50051");
+    cfg.oauth_redirect_base = webdav::getEnvOrDefault("OAUTH_REDIRECT_BASE", "");
+    cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
+    cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
 
     auto grpc = std::make_shared<webdav::GRPCClientWrapper>(cfg.grpc_address);
     auto ldap = std::make_shared<webdav::LDAPAuthenticator>(
@@ -64,5 +90,6 @@ int main() {
 
     webdav::infoLog("Shutting down HTTP bridge");
     server.stop();
+    Poco::Net::uninitializeSSL();
     return 0;
 }

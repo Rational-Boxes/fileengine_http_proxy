@@ -11,7 +11,7 @@ find_package(gRPC CONFIG REQUIRED)
 # Module mode: Fedora ships no ProtobufConfig.cmake; the module still provides
 # the protobuf::libprotobuf target.
 find_package(Protobuf REQUIRED)
-find_package(Poco COMPONENTS Foundation Util Net JSON REQUIRED)
+find_package(Poco COMPONENTS Foundation Util Net NetSSL Crypto JSON REQUIRED)
 
 # OpenLDAP. Fedora's openldap-devel ships no pkg-config (.pc) file, so locate
 # the headers and the ldap/lber libraries directly.
@@ -50,6 +50,8 @@ set(PROTO_SRCS
 add_executable(http_bridge
     src/main.cpp
     src/http_server.cpp
+    src/http_client.cpp
+    src/oauth_provider.cpp
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
     src/utils.cpp
@@ -61,6 +63,8 @@ target_link_libraries(http_bridge
     gRPC::grpc
     protobuf::libprotobuf
     Poco::Net
+    Poco::NetSSL
+    Poco::Crypto
     Poco::Util
     Poco::JSON
     Poco::Foundation

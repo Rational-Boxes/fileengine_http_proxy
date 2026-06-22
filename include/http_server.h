@@ -8,6 +8,8 @@
 
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
+#include "oauth_provider.h"
+#include "oauth_state_store.h"
 #include "token_store.h"
 
 namespace httpbridge {
@@ -20,6 +22,11 @@ struct Config {
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
     std::string cors_origin;                   // empty => no CORS header
     std::string grpc_address = "localhost:50051";
+
+    // OAuth2 / OIDC login (BFF). Empty oauth_redirect_base disables OAuth routes.
+    std::string oauth_redirect_base;        // public base URL of the bridge
+    std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
+    int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -40,6 +47,8 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
     std::unique_ptr<Poco::Net::HTTPServer> server_;
 };
 

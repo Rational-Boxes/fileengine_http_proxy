@@ -17,6 +17,10 @@ thin pass-through to the gRPC core — no local database, no path cache.
   versioning, metadata, ACLs, role management, and admin (storage/sync).
 - **LDAP auth** (HTTP Basic) plus **bearer tokens** with an in-process TTL cache
   so chatty clients authenticate once and skip the per-request LDAP bind.
+- **OAuth2 / OIDC login** (server-side BFF flow) for Google, GitHub, Microsoft,
+  LinkedIn, Atlassian, and any OIDC provider — the IdP-verified email is mapped to
+  the user's LDAP roles and a bridge bearer token is issued. See
+  [`OAUTH_SETUP.md`](./OAUTH_SETUP.md).
 - **Multi-tenant**: tenant resolved from the host subdomain or an `X-Tenant`
   header (default `default`); a tenant's `administrators` LDAP group maps to the
   core's `system_admin` role.
@@ -78,7 +82,7 @@ for full schemas.
 
 | Area | Endpoints |
 |---|---|
-| Auth | `POST/DELETE /v1/auth/token`, `GET /v1/whoami` |
+| Auth | `POST/DELETE /v1/auth/token`, `GET /v1/auth/oauth/{provider}[/callback]`, `GET /v1/whoami` |
 | Directories | `POST/GET/DELETE /v1/dirs/{uid}`, `POST /v1/dirs/{uid}/files` |
 | Nodes | `GET /v1/nodes/{uid}` (stat), `/exists`, `/rename`, `/move`, `/copy` |
 | Content | `GET/PUT /v1/files/{uid}/content` (stream + `Range`), `DELETE /v1/files/{uid}`, `/undelete` |

@@ -13,11 +13,13 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/Dynamic/Var.h>
 #include <Poco/URI.h>
+#include <Poco/SHA2Engine.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <istream>
 #include <map>
 #include <ostream>
@@ -65,6 +67,40 @@ std::string jsonArray(const std::vector<std::string>& v) {
     }
     o += "]";
     return o;
+}
+
+// base64url without padding (RFC 4648 §5) — the encoding PKCE and JWT use.
+std::string base64UrlEncode(const unsigned char* data, size_t len) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve((len + 2) / 3 * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned v = data[i] << 16;
+        int n = 1;
+        if (i + 1 < len) { v |= data[i + 1] << 8; n = 2; }
+        if (i + 2 < len) { v |= data[i + 2]; n = 3; }
+        out += tbl[(v >> 18) & 0x3f];
+        out += tbl[(v >> 12) & 0x3f];
+        if (n >= 2) out += tbl[(v >> 6) & 0x3f];
+        if (n >= 3) out += tbl[v & 0x3f];
+    }
+    return out;
+}
+
+// A PKCE code verifier: 32 random bytes -> 43 base64url chars (all unreserved).
+std::string randomCodeVerifier() {
+    unsigned char buf[32] = {0};
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
+    return base64UrlEncode(buf, sizeof(buf));
+}
+
+// PKCE S256 challenge = base64url(SHA-256(verifier)).
+std::string pkceChallengeS256(const std::string& verifier) {
+    Poco::SHA2Engine engine(Poco::SHA2Engine::SHA_256);
+    engine.update(verifier);
+    const Poco::DigestEngine::Digest& d = engine.digest();
+    return base64UrlEncode(d.data(), d.size());
 }
 
 void sendJson(HTTPServerResponse& resp, HTTPResponse::HTTPStatus status, const std::string& body) {
@@ -181,8 +217,11 @@ public:
     RequestHandler(Config cfg,
                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
-                   std::shared_ptr<TokenStore> tokens)
-        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
+                   std::shared_ptr<TokenStore> tokens,
+                   std::shared_ptr<OAuthProvider> oauth,
+                   std::shared_ptr<OAuthStateStore> oauth_states)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -247,6 +286,20 @@ private:
             if (method == "POST")   return issueToken(req, resp);
             if (method == "DELETE") return revokeToken(req, resp);
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
+        // OAuth2 login (BFF). Pre-auth: the browser has no bearer token yet.
+        //   GET /v1/auth/oauth/{provider}            -> redirect to the IdP
+        //   GET /v1/auth/oauth/{provider}/callback   -> exchange + issue token
+        {
+            auto s = pathSegments(path);
+            if (s.size() >= 4 && s[1] == "auth" && s[2] == "oauth") {
+                if (s.size() == 4 && method == "GET")
+                    return oauthStart(req, resp, s[3]);
+                if (s.size() == 5 && s[4] == "callback" && method == "GET")
+                    return oauthCallback(req, resp, s[3]);
+                return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+            }
         }
 
         AuthIdentity id;
@@ -784,6 +837,110 @@ private:
         else mapError(resp, r.error());
     }
 
+    // --- OAuth2 login (BFF) ---
+
+    // Tenant resolution shared with Basic auth: X-Tenant > host subdomain > default.
+    std::string resolveTenant(HTTPServerRequest& req) {
+        std::string xt = req.get("X-Tenant", "");
+        if (!xt.empty()) return xt;
+        std::string t = webdav::extractTenantFromHostname(req.getHost());
+        return t.empty() ? "default" : t;
+    }
+
+    // A return URL is allowed only if it begins with a configured prefix. Without
+    // this, the callback would hand a valid bridge token to any attacker URL.
+    bool returnAllowed(const std::string& url) {
+        for (auto& p : webdav::splitString(cfg_.oauth_return_allowlist, ',')) {
+            std::string pre = webdav::trim(p);
+            if (!pre.empty() && url.rfind(pre, 0) == 0) return true;
+        }
+        return false;
+    }
+
+    void oauthStart(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
+        const OAuthProviderConfig* cfg = oauth_ ? oauth_->get(provider) : nullptr;
+        if (!cfg) return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"unknown provider"})");
+
+        std::string return_to;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "return_to") return_to = kv.second;
+        }
+        if (return_to.empty()) {  // default to the first configured prefix
+            auto prefixes = webdav::splitString(cfg_.oauth_return_allowlist, ',');
+            if (!prefixes.empty()) return_to = webdav::trim(prefixes[0]);
+        }
+        if (return_to.empty() || !returnAllowed(return_to)) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"return_to not allowed"})");
+        }
+
+        std::string verifier = randomCodeVerifier();
+        std::string challenge = pkceChallengeS256(verifier);
+
+        OAuthState st;
+        st.provider = provider;
+        st.code_verifier = verifier;
+        st.tenant = resolveTenant(req);
+        st.return_to = return_to;
+        std::string state = oauth_states_->create(std::move(st));
+
+        resp.redirect(oauth_->buildAuthorizeUrl(*cfg, state, challenge), HTTPResponse::HTTP_FOUND);
+    }
+
+    void oauthCallback(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
+        std::string code, state, idp_error;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "code") code = kv.second;
+            else if (kv.first == "state") state = kv.second;
+            else if (kv.first == "error") idp_error = kv.second;
+        }
+
+        // state is the CSRF + replay + binding token; consume it exactly once.
+        OAuthState st;
+        if (state.empty() || !oauth_states_->consume(state, st)) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"invalid or expired state"})");
+        }
+        if (st.provider != provider) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"provider mismatch"})");
+        }
+        if (!idp_error.empty() || code.empty()) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"authorization denied"})");
+        }
+
+        const OAuthProviderConfig* cfg = oauth_->get(provider);
+        if (!cfg) return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"unknown provider"})");
+
+        std::string access_token, err;
+        if (!oauth_->exchangeCode(*cfg, code, st.code_verifier, access_token, err)) {
+            webdav::warnLog("oauth: code exchange failed for '" + provider + "': " + err);
+            return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"token exchange failed"})");
+        }
+
+        VerifiedIdentity vid;
+        if (!oauth_->fetchIdentity(*cfg, access_token, vid, err)) {
+            webdav::warnLog("oauth: identity fetch failed for '" + provider + "': " + err);
+            return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"identity lookup failed"})");
+        }
+        if (!vid.email_verified) {
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"email not verified by provider"})");
+        }
+
+        // Map the verified email to the LDAP identity so OAuth and Basic logins
+        // resolve to the same uid/roles for gRPC ACL purposes.
+        webdav::UserInfo info = ldap_->getUserInfoByEmail(vid.email);
+        if (!info.authenticated || info.user_id.empty()) {
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"no matching user"})");
+        }
+
+        std::string token = tokens_->issue(info.user_id, st.tenant, info.roles);
+
+        // Token returned in the URL fragment (not the query) so it is not sent to
+        // the SPA's server or leaked via Referer. The SPA scrubs it from history.
+        std::string sep = st.return_to.find('#') == std::string::npos ? "#" : "&";
+        std::string location = st.return_to + sep + "token=" + webdav::urlEncode(token) +
+                               "&token_type=Bearer&expires_in=" + std::to_string(tokens_->ttl());
+        resp.redirect(location, HTTPResponse::HTTP_FOUND);
+    }
+
     // Authenticate via a cached Bearer token (no LDAP) or HTTP Basic (LDAP).
     bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
         std::string h = req.get("Authorization", "");
@@ -881,6 +1038,8 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {
@@ -888,11 +1047,14 @@ public:
     HandlerFactory(Config cfg,
                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
-                   std::shared_ptr<TokenStore> tokens)
-        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
+                   std::shared_ptr<TokenStore> tokens,
+                   std::shared_ptr<OAuthProvider> oauth,
+                   std::shared_ptr<OAuthStateStore> oauth_states)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new RequestHandler(cfg_, grpc_, ldap_, tokens_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_);
     }
 
 private:
@@ -900,6 +1062,8 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
 };
 
 }  // namespace
@@ -908,7 +1072,9 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
                                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                                    std::shared_ptr<webdav::LDAPAuthenticator> ldap)
     : cfg_(cfg), grpc_(std::move(grpc)), ldap_(std::move(ldap)),
-      tokens_(std::make_shared<TokenStore>(cfg.token_ttl)) {}
+      tokens_(std::make_shared<TokenStore>(cfg.token_ttl)),
+      oauth_(std::make_shared<OAuthProvider>(OAuthProvider::fromEnv(cfg.oauth_redirect_base))),
+      oauth_states_(std::make_shared<OAuthStateStore>(cfg.oauth_state_ttl)) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -922,7 +1088,7 @@ void HttpBridgeServer::start() {
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_), socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_), socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");

@@ -40,7 +40,13 @@ public:
     
     // Get user information without authenticating (for already authenticated users)
     UserInfo getUserInfo(const std::string& username);
-    
+
+    // Resolve a user already authenticated by an external IdP (OAuth/OIDC) from
+    // their email address. Returns the LDAP-resolved identity (real uid + roles)
+    // so an OAuth login maps to exactly the same gRPC identity as a Basic login.
+    // `authenticated` is false if no single matching entry exists.
+    UserInfo getUserInfoByEmail(const std::string& email);
+
 private:
     std::string ldap_endpoint_;
     std::string ldap_domain_;
@@ -54,7 +60,11 @@ private:
     // Helper function to connect to LDAP server
     LDAP* connectToLDAP();
     
-    // Helper function to search for a user
+    // Helper function to search for a user by an arbitrary filter. `display_id`
+    // is used only for logging; the real uid is read from the matched entry.
+    UserInfo searchUserByFilter(LDAP* ld, const std::string& filter, const std::string& display_id);
+
+    // Helper function to search for a user by uid.
     UserInfo searchUser(LDAP* ld, const std::string& username);
     
     // Helper function to extract tenant from user's DN

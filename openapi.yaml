@@ -8,8 +8,11 @@ info:
     the empty string or the all-zeros UUID (`00000000-0000-0000-0000-000000000000`),
     also accepted as the literal `root`.
 
-    **Auth** — every `/v1` route (except `POST /v1/auth/token`) requires HTTP
-    Basic (LDAP bind) or a `Bearer` token from `/v1/auth/token`. The tenant is
+    **Auth** — every `/v1` route (except `POST /v1/auth/token` and the
+    `/v1/auth/oauth/*` login routes) requires HTTP Basic (LDAP bind) or a
+    `Bearer` token. A token comes from `POST /v1/auth/token` (Basic) or from the
+    OAuth2/OIDC login flow (`GET /v1/auth/oauth/{provider}`; see OAUTH_SETUP.md),
+    which maps the IdP-verified email to the same LDAP identity. The tenant is
     taken from the host subdomain or the `X-Tenant` header (default `default`).
     A member of a tenant's `administrators` LDAP group is granted the server's
     `system_admin` role.
@@ -75,6 +78,41 @@ paths:
       security: [ { bearerAuth: [] } ]
       responses:
         "204": { description: Revoked (idempotent) }
+  /v1/auth/oauth/{provider}:
+    get:
+      tags: [auth]
+      summary: Begin OAuth2/OIDC login (BFF)
+      description: >
+        Starts a server-side authorization-code + PKCE flow and redirects (302) to
+        the provider. No authentication required. See OAUTH_SETUP.md.
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string }, description: configured provider name (e.g. google, github) }
+        - { name: return_to, in: query, required: false, schema: { type: string }, description: SPA URL to return to; must match OAUTH_RETURN_ALLOWLIST }
+      responses:
+        "302": { description: Redirect to the identity provider }
+        "400": { description: return_to not allowed }
+        "404": { description: Unknown provider }
+  /v1/auth/oauth/{provider}/callback:
+    get:
+      tags: [auth]
+      summary: OAuth2/OIDC redirect callback
+      description: >
+        Provider redirect target. Validates state, exchanges the code server-side,
+        maps the verified email to an LDAP user, issues a bearer token, and
+        redirects to return_to with the token in the URL fragment
+        (#token=...&token_type=Bearer&expires_in=...).
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+        - { name: code, in: query, required: false, schema: { type: string } }
+        - { name: state, in: query, required: false, schema: { type: string } }
+      responses:
+        "302": { description: Redirect to return_to with the bearer token in the fragment }
+        "400": { description: Invalid/expired/replayed state or provider mismatch }
+        "403": { description: Email not verified, or no matching LDAP user }
+        "404": { description: Unknown provider }
+        "502": { description: Token exchange or identity lookup failed at the provider }
   /v1/whoami:
     get:
       tags: [auth]
