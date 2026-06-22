@@ -28,6 +28,37 @@ LDAPAuthenticator::LDAPAuthenticator(
 LDAPAuthenticator::~LDAPAuthenticator() {
 }
 
+namespace {
+
+// RFC 4515 filter-value escaping. Login names (uid or email) are user-supplied,
+// so they must never be concatenated raw into a search filter (LDAP injection).
+std::string escapeLdapFilterValue(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        switch (c) {
+            case '*':  out += "\\2a"; break;
+            case '(':  out += "\\28"; break;
+            case ')':  out += "\\29"; break;
+            case '\\': out += "\\5c"; break;
+            case '\0': out += "\\00"; break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+// Pull the uid out of a DN like "uid=alice,ou=users,...". Empty if absent.
+std::string uidFromDN(const std::string& dn) {
+    size_t pos = dn.find("uid=");
+    if (pos == std::string::npos) return "";
+    pos += 4;
+    size_t end = dn.find(',', pos);
+    return dn.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+}  // namespace
+
 UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const std::string& password) {
     std::lock_guard<std::mutex> lock(ldap_mutex_);
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Starting authentication for user: " + username);
@@ -42,8 +73,10 @@ UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const 
     std::string user_dn;
     LDAPMessage* result = nullptr;
 
-    // Search for the user's DN
-    std::string search_filter = "(uid=" + username + ")";
+    // Search for the user's DN by EITHER their uid or their email address, so
+    // the login form accepts either form of identifier.
+    std::string esc = escapeLdapFilterValue(username);
+    std::string search_filter = "(|(uid=" + esc + ")(mail=" + esc + "))";
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Searching for user with base: " + user_base_ + " and filter: " + search_filter);
 
     int ldap_result = ldap_search_s(
@@ -118,7 +151,17 @@ UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const 
     // We need to search for the user again to get their roles
     UserInfo user_info;
     user_info.dn = user_dn;
-    user_info.user_id = username;
+    // The login name may have been an email; resolve the canonical uid from the
+    // matched entry so the gRPC identity is the uid regardless of login form.
+    std::string resolved_uid;
+    berval** uid_vals = ldap_get_values_len(ld, entry, "uid");
+    if (uid_vals) {
+        if (uid_vals[0]) resolved_uid.assign(uid_vals[0]->bv_val, uid_vals[0]->bv_len);
+        ldap_value_free_len(uid_vals);
+    }
+    if (resolved_uid.empty()) resolved_uid = uidFromDN(user_dn);
+    if (resolved_uid.empty()) resolved_uid = username;
+    user_info.user_id = resolved_uid;
     user_info.tenant = extractTenantFromUserDN(user_dn);
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Extracting roles for user from groups...");
 
@@ -259,38 +302,6 @@ LDAP* LDAPAuthenticator::connectToLDAP() {
 
     return ld;
 }
-
-namespace {
-
-// RFC 4515 filter-value escaping. The email comes from an external IdP and a
-// GitHub login is user-chosen, so it must never be concatenated raw into a
-// filter (LDAP injection).
-std::string escapeLdapFilterValue(const std::string& in) {
-    std::string out;
-    out.reserve(in.size());
-    for (char c : in) {
-        switch (c) {
-            case '*':  out += "\\2a"; break;
-            case '(':  out += "\\28"; break;
-            case ')':  out += "\\29"; break;
-            case '\\': out += "\\5c"; break;
-            case '\0': out += "\\00"; break;
-            default:   out += c;
-        }
-    }
-    return out;
-}
-
-// Pull the uid out of a DN like "uid=alice,ou=users,...". Empty if absent.
-std::string uidFromDN(const std::string& dn) {
-    size_t pos = dn.find("uid=");
-    if (pos == std::string::npos) return "";
-    pos += 4;
-    size_t end = dn.find(',', pos);
-    return dn.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-}
-
-}  // namespace
 
 UserInfo LDAPAuthenticator::searchUser(LDAP* ld, const std::string& username) {
     return searchUserByFilter(ld, "(uid=" + escapeLdapFilterValue(username) + ")", username);
