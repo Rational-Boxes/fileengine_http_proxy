@@ -1,0 +1,6 @@
+.git
+build
+cmake-build-*
+*.log
+.idea
+log
