@@ -80,6 +80,7 @@ message DirectoryEntry {
     int64 created_at = 5;         // Creation timestamp (UNIX epoch seconds)
     int64 modified_at = 6;        // Modification timestamp (UNIX epoch seconds)
     int32 version_count = 7;      // Number of versions for this file
+    int32 rendition_count = 8;    // Hidden child renditions (files only; 0 for dirs)
 }
 
 enum FileType {
@@ -229,6 +230,7 @@ message FileInfo {
     int64 created_at = 8;               // Creation timestamp
     int64 modified_at = 9;              // Modification timestamp
     string version = 10;                 // Current version timestamp
+    int32 rendition_count = 11;          // Hidden child renditions (files only; 0 for dirs)
 }
 
 message ExistsRequest {
