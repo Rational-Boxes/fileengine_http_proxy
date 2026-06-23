@@ -347,6 +347,7 @@ private:
                     if (sub == "content" && method == "GET")    return getContent(req, resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
+                    if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
                     if (sub == "restore" && method == "POST")   return restoreVersion(req, resp, id, uid);
                     if (sub == "purge" && method == "POST")     return purgeVersions(req, resp, id, uid);
                 } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
@@ -390,7 +391,9 @@ private:
             first = false;
             body += "{\"uid\":\"" + jsonEscape(e.uid()) + "\",\"name\":\"" + jsonEscape(e.name()) +
                     "\",\"type\":\"" + fileTypeName(e.type()) + "\",\"size\":" + std::to_string(e.size()) +
-                    ",\"version_count\":" + std::to_string(e.version_count()) + "}";
+                    ",\"version_count\":" + std::to_string(e.version_count()) +
+                    ",\"rendition_count\":" + std::to_string(e.rendition_count()) +
+                    ",\"has_renditions\":" + (e.rendition_count() > 0 ? "true" : "false") + "}";
         }
         body += "]}";
         return body;
@@ -502,7 +505,9 @@ private:
         std::string body = "{\"uid\":\"" + jsonEscape(i.uid()) + "\",\"name\":\"" + jsonEscape(i.name()) +
                            "\",\"parent_uid\":\"" + jsonEscape(i.parent_uid()) + "\",\"type\":\"" + fileTypeName(i.type()) +
                            "\",\"size\":" + std::to_string(i.size()) + ",\"owner\":\"" + jsonEscape(i.owner()) +
-                           "\",\"version\":\"" + jsonEscape(i.version()) + "\"}";
+                           "\",\"version\":\"" + jsonEscape(i.version()) +
+                           "\",\"rendition_count\":" + std::to_string(i.rendition_count()) +
+                           ",\"has_renditions\":" + (i.rendition_count() > 0 ? "true" : "false") + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
@@ -523,6 +528,17 @@ private:
             if (!r.success()) return mapError(resp, r.error());
             sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
         }
+    }
+
+    // List a file's hidden renditions on demand (children of the file UID).
+    // Normal browsing never surfaces these; this is the explicit opt-in path.
+    void listRenditions(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::ListDirectoryRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->listDirectory(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
     }
 
     void removeFile(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {

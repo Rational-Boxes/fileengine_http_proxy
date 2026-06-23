@@ -256,6 +256,19 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "413": { $ref: "#/components/responses/TooLarge" }
 
+  /v1/files/{uid}/renditions:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [filesystem]
+      summary: List a file's hidden renditions (alternate-format children)
+      description: >
+        Renditions are hidden from normal directory listings; this endpoint
+        reveals them on demand for a file UID. Use has_renditions on the file's
+        directory entry / stat to decide whether to call this.
+      responses:
+        "200": { description: Entries, content: { application/json: { schema: { $ref: "#/components/schemas/EntryList" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
   /v1/files/{uid}/versions:
     parameters: [ { $ref: "#/components/parameters/Uid" } ]
     get:
@@ -478,6 +491,8 @@ components:
         size: { type: integer }
         owner: { type: string }
         version: { type: string }
+        rendition_count: { type: integer, description: Hidden child renditions (files only; 0 for dirs) }
+        has_renditions: { type: boolean, description: True if the file has hidden renditions }
     DirectoryEntry:
       type: object
       properties:
@@ -486,6 +501,8 @@ components:
         type: { $ref: "#/components/schemas/FileType" }
         size: { type: integer }
         version_count: { type: integer }
+        rendition_count: { type: integer, description: Hidden child renditions (files only; 0 for dirs) }
+        has_renditions: { type: boolean, description: True if the file has hidden renditions }
     EntryList:
       type: object
       properties: { entries: { type: array, items: { $ref: "#/components/schemas/DirectoryEntry" } } }
