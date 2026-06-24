@@ -53,6 +53,13 @@ public:
     // names; empty if the user or their memberships cannot be resolved.
     std::vector<std::string> getTenantsForUser(const std::string& username);
 
+    // Type-ahead user search for the ACL editor. Returns up to `limit` distinct
+    // uids whose uid, cn, or mail begins with `prefix` (LDAP substring matching
+    // is case-insensitive for these attributes). `prefix` is escaped, so raw
+    // user input is safe. An empty prefix returns the first `limit` users. A
+    // limit <= 0 applies a sane internal cap.
+    std::vector<std::string> searchUsers(const std::string& prefix, int limit);
+
 private:
     std::string ldap_endpoint_;
     std::string ldap_domain_;

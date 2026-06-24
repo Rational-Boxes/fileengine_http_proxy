@@ -52,6 +52,7 @@ service FileService {
     rpc GetRolesForUser(GetRolesForUserRequest) returns (GetRolesForUserResponse);
     rpc GetUsersForRole(GetUsersForRoleRequest) returns (GetUsersForRoleResponse);
     rpc GetAllRoles(GetAllRolesRequest) returns (GetAllRolesResponse);
+    rpc ListClaims(ListClaimsRequest) returns (ListClaimsResponse);
 
     // Streaming operations for large files
     rpc StreamFileUpload(stream PutFileRequest) returns (PutFileResponse);
@@ -507,6 +508,18 @@ message GetAllRolesResponse {
     bool success = 1;
     string error = 2;
     repeated string roles = 3;          // List of all roles
+}
+
+message ListClaimsRequest {
+    AuthenticationContext auth = 1;
+    string prefix = 2;                  // optional case-insensitive prefix filter ("" = all)
+    int32 limit = 3;                    // optional cap on results (0 = no cap)
+}
+
+message ListClaimsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string claims = 3;         // distinct "key=value" claim principals used in ACLs
 }
 
 // Administrative operations

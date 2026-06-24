@@ -325,6 +325,9 @@ private:
         if (res0 == "users" && segs.size() == 4 && segs[3] == "roles" && method == "GET") {
             return getRolesForUser(resp, id, segs[2]);
         }
+        if (res0 == "principals" && segs.size() == 2 && method == "GET") {
+            return searchPrincipals(req, resp, id);
+        }
 
         if (segs.size() >= 3) {
             const std::string& resource = segs[1];
@@ -829,6 +832,70 @@ private:
         if (!r.success()) return mapError(resp, r.error());
         std::vector<std::string> v(r.roles().begin(), r.roles().end());
         sendJson(resp, HTTPResponse::HTTP_OK, "{\"roles\":" + jsonArray(v) + "}");
+    }
+
+    // GET /v1/principals?q=<prefix>&types=role,claim,user&limit=<n>
+    // Type-ahead source for the ACL editor. Returns the roles, claims, and users
+    // whose identifier begins (case-insensitively) with `q`. `types` selects
+    // which categories to include (comma-separated; default all three); `limit`
+    // caps each category. Roles come from core's role registry (filtered here),
+    // claims from core's ACL claim catalog (ListClaims), users from LDAP.
+    void searchPrincipals(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string q, typesParam;
+        int limit = 20;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "q" || kv.first == "prefix") q = kv.second;
+            else if (kv.first == "types") typesParam = kv.second;
+            else if (kv.first == "limit") { try { limit = std::stoi(kv.second); } catch (...) {} }
+        }
+        if (limit <= 0 || limit > 100) limit = 20;
+
+        bool wantRoles = true, wantClaims = true, wantUsers = true;
+        if (!typesParam.empty()) {
+            wantRoles = wantClaims = wantUsers = false;
+            for (auto& t : webdav::splitString(typesParam, ',')) {
+                if (t == "role" || t == "roles")  wantRoles = true;
+                else if (t == "claim" || t == "claims") wantClaims = true;
+                else if (t == "user" || t == "users")   wantUsers = true;
+            }
+        }
+
+        auto lower = [](std::string s) { for (char& c : s) if (c >= 'A' && c <= 'Z') c += 32; return s; };
+        std::string lq = lower(q);
+
+        std::vector<std::string> roles, claims, users;
+
+        if (wantRoles) {
+            fileengine_rpc::GetAllRolesRequest rq;
+            fillAuth(rq.mutable_auth(), id);
+            auto r = grpc_->getAllRoles(rq);
+            if (!r.success()) return mapError(resp, r.error());
+            for (const auto& role : r.roles()) {
+                if (lq.empty() || lower(role).compare(0, lq.size(), lq) == 0) {
+                    roles.push_back(role);
+                    if (static_cast<int>(roles.size()) >= limit) break;
+                }
+            }
+        }
+
+        if (wantClaims) {
+            fileengine_rpc::ListClaimsRequest rq;
+            fillAuth(rq.mutable_auth(), id);
+            rq.set_prefix(q);
+            rq.set_limit(limit);
+            auto r = grpc_->listClaims(rq);
+            if (!r.success()) return mapError(resp, r.error());
+            claims.assign(r.claims().begin(), r.claims().end());
+        }
+
+        if (wantUsers && ldap_) {
+            users = ldap_->searchUsers(q, limit);
+        }
+
+        std::string body = "{\"users\":" + jsonArray(users) +
+                           ",\"roles\":" + jsonArray(roles) +
+                           ",\"claims\":" + jsonArray(claims) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
     // --- admin ---
