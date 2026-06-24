@@ -309,6 +309,12 @@ private:
 
         if (segs.size() == 2 && segs[1] == "whoami") return whoami(resp, id);
 
+        // Token introspection for downstream services (e.g. convert_search_ai):
+        // validate the caller's bearer token and return the resolved identity, so
+        // one bridge-issued token (LDAP or OAuth) authenticates across services.
+        if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "introspect" && method == "GET")
+            return introspect(resp, id);
+
         // Top-level admin / role resources (no uid in the path).
         const std::string res0 = segs.size() >= 2 ? segs[1] : "";
         if (res0 == "tenants" && segs.size() == 2 && method == "GET") return listTenants(resp, id);
@@ -1096,6 +1102,18 @@ private:
 
     void whoami(HTTPServerResponse& resp, const AuthIdentity& id) {
         std::string body = "{\"user\":\"" + jsonEscape(id.user) +
+                           "\",\"tenant\":\"" + jsonEscape(id.tenant) +
+                           "\",\"roles\":" + jsonArray(id.roles) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
+    // RFC 7662-style token introspection. The request already passed
+    // authenticate(), so reaching here means the bearer token is valid; reply
+    // with active=true and the resolved identity (honoring X-Tenant). Invalid
+    // tokens are rejected upstream with 401. Downstream services call this to
+    // accept a bridge token without re-authenticating the user themselves.
+    void introspect(HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string body = "{\"active\":true,\"user\":\"" + jsonEscape(id.user) +
                            "\",\"tenant\":\"" + jsonEscape(id.tenant) +
                            "\",\"roles\":" + jsonArray(id.roles) + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);

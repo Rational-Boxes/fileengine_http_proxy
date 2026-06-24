@@ -51,6 +51,12 @@ TOKEN=$(grep -oE '"token":"[a-f0-9]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
 [ -n "$TOKEN" ] && ok "POST /v1/auth/token issues token" || bad "issue token" "$out"
 grep -q '"token_type":"Bearer"' <<<"$out" && ok "token_type Bearer + expires_in" || bad "token_type" "$out"
 grep -q "\"user\":\"$EXPECT_USER\"" <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")" && ok "Bearer token authenticates (no LDAP)" || bad "bearer auth"
+# token introspection (consumed by downstream services for auth coordination)
+intro=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/introspect")
+{ grep -q '"active":true' <<<"$intro" && grep -q "\"user\":\"$EXPECT_USER\"" <<<"$intro"; } \
+  && ok "GET /v1/auth/introspect -> active + identity" || bad "introspect" "$intro"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/auth/introspect")
+[ "$code" = "401" ] && ok "introspect bogus token -> 401" || bad "introspect bogus" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "bogus bearer -> 401" || bad "bogus bearer" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/token")

@@ -122,6 +122,28 @@ paths:
           description: Identity
           content: { application/json: { schema: { $ref: "#/components/schemas/Identity" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/auth/introspect:
+    get:
+      tags: [auth]
+      summary: Token introspection (RFC 7662-style) for downstream services
+      description: >
+        Validates the caller's bearer token and returns the resolved identity, so
+        a downstream service (e.g. convert_search_ai) can accept a bridge-issued
+        token without re-authenticating the user. Honors `X-Tenant`. An invalid
+        token is rejected with 401 (rather than `active: false`).
+      responses:
+        "200":
+          description: Active token + identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean, enum: [true] }
+                  user:   { type: string }
+                  tenant: { type: string }
+                  roles:  { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /v1/tenants:
     get:
       tags: [auth]
