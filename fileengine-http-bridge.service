@@ -1,0 +1,42 @@
+[Unit]
+Description=FileEngine HTTP/REST Bridge
+Documentation=https://github.com/fileengine/fileengine-http-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Read configuration (gRPC core address, LDAP, ports, OAuth, secrets) from the
+# packaged environment file. Lines are KEY=VALUE; see the file for the full set.
+EnvironmentFile=/etc/fileengine-http-bridge/bridge.env
+ExecStart=/usr/bin/fileengine-http-bridge
+Restart=always
+RestartSec=3
+WorkingDirectory=/
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fileengine-http-bridge
+
+# Run as a transient, unprivileged system user allocated by systemd — the
+# bridge keeps no local state (it proxies to the gRPC core), so no dedicated
+# account or data directory is needed. All listen ports are > 1024.
+DynamicUser=yes
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+[Install]
+WantedBy=multi-user.target

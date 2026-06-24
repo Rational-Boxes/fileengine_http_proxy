@@ -3,7 +3,10 @@ project(http_bridge)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_BUILD_TYPE Debug)
+# Default to Debug for local dev, but let packaging pass -DCMAKE_BUILD_TYPE=Release.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
 
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
@@ -71,3 +74,6 @@ target_link_libraries(http_bridge
     ${LDAP_LIBRARIES}
     Threads::Threads
 )
+
+# Install the binary (packaging renames it to fileengine-http-bridge).
+install(TARGETS http_bridge RUNTIME DESTINATION bin)

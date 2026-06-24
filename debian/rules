@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		-DCMAKE_BUILD_TYPE=Release
+
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/tmp
+	# Rename the generic binary to a fileengine-prefixed name.
+	mv debian/tmp/usr/bin/http_bridge debian/tmp/usr/bin/fileengine-http-bridge
+	# systemd unit (canonical vendor location), default config, OpenAPI spec.
+	install -D -m 0644 fileengine-http-bridge.service \
+		debian/tmp/lib/systemd/system/fileengine-http-bridge.service
+	install -D -m 0640 http-bridge.env \
+		debian/tmp/etc/fileengine-http-bridge/bridge.env
+	install -D -m 0644 openapi.yaml \
+		debian/tmp/usr/share/fileengine-http-bridge/openapi.yaml
+
+override_dh_installsystemd:
+	dh_installsystemd --name=fileengine-http-bridge

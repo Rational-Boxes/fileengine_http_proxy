@@ -1,0 +1,33 @@
+Source: fileengine-http-bridge
+Section: utils
+Priority: optional
+Maintainer: FileEngine Team <maintainer@fileengine.example.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkg-config,
+               libgrpc++-dev,
+               libprotobuf-dev,
+               protobuf-compiler,
+               protobuf-compiler-grpc,
+               libpoco-dev,
+               libssl-dev,
+               libldap2-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/fileengine/fileengine-http-bridge
+
+Package: fileengine-http-bridge
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: REST/HTTP bridge for the FileEngine gRPC core
+ fileengine-http-bridge exposes the FileEngine gRPC core as a JSON/REST API
+ (default :8090): authenticated filesystem, versioning, metadata, ACL/role
+ management, and an ACL-editor principal type-ahead, plus LDAP Basic + bearer
+ token + OAuth2 login.
+ .
+ A dedicated, correctly-sized worker pool serves concurrent long-lived
+ transfers, and a separate reporter listener (default :8091) exposes /healthz,
+ /readyz, and /poolz for load-balancer health checks.
+ .
+ Ships a systemd unit (runs as a transient DynamicUser) and a default
+ environment file at /etc/fileengine-http-bridge/bridge.env.
