@@ -5,6 +5,7 @@
 #include <string>
 
 #include <Poco/Net/HTTPServer.h>
+#include <Poco/ThreadPool.h>
 
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
@@ -18,6 +19,7 @@ struct Config {
     std::string http_host = "0.0.0.0";
     int http_port = 8090;
     int thread_pool = 16;
+    int monitoring_port = 8091;   // dedicated reporter listener (pool usage / health)
     int token_ttl = 3600;
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
     std::string cors_origin;                   // empty => no CORS header
@@ -49,7 +51,14 @@ private:
     std::shared_ptr<TokenStore> tokens_;
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
+    // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
+    // it is destroyed *after* the server stops using it.
+    std::unique_ptr<Poco::ThreadPool> pool_;
     std::unique_ptr<Poco::Net::HTTPServer> server_;
+    // Dedicated reporter: its own single held-back thread + listener, so pool
+    // usage / health are answerable even when every worker thread is mid-transfer.
+    std::unique_ptr<Poco::ThreadPool> monitor_pool_;
+    std::unique_ptr<Poco::Net::HTTPServer> monitor_server_;
 };
 
 }  // namespace httpbridge

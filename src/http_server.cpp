@@ -1122,23 +1122,105 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
+// ---- Monitoring / reporting API (consistent across the HTTP services) --------
+namespace {
+std::string poolFields(Poco::ThreadPool& pool, int maxQueued) {
+    return std::string("\"pool\":{\"capacity\":") + std::to_string(pool.capacity()) +
+           ",\"used\":" + std::to_string(pool.used()) +
+           ",\"available\":" + std::to_string(pool.available()) +
+           ",\"max_queued\":" + std::to_string(maxQueued) + "}";
+}
+
+// Served on the reporter's own held-back thread, so these answer even when every
+// worker thread is mid-transfer. /healthz = liveness; /readyz = has free worker
+// capacity (503 when saturated → LB drains this instance); /poolz = live usage.
+class MonitorHandler : public HTTPRequestHandler {
+public:
+    MonitorHandler(Poco::ThreadPool* pool, int maxQueued, std::string service)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
+        const std::string path = req.getURI();
+        const bool hasCapacity = pool_->available() > 0;
+        if (path == "/healthz") {
+            sendJson(resp, HTTPResponse::HTTP_OK,
+                     std::string("{\"status\":\"ok\",\"service\":\"") + service_ + "\"}");
+        } else if (path == "/readyz") {
+            sendJson(resp, hasCapacity ? HTTPResponse::HTTP_OK : HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                     std::string("{\"ready\":") + (hasCapacity ? "true" : "false") +
+                     "," + poolFields(*pool_, maxQueued_) + "}");
+        } else if (path == "/poolz") {
+            sendJson(resp, HTTPResponse::HTTP_OK,
+                     std::string("{") + poolFields(*pool_, maxQueued_) +
+                     ",\"saturated\":" + (hasCapacity ? "false" : "true") + "}");
+        } else {
+            sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+    }
+private:
+    Poco::ThreadPool* pool_;
+    int maxQueued_;
+    std::string service_;
+};
+
+class MonitorHandlerFactory : public HTTPRequestHandlerFactory {
+public:
+    MonitorHandlerFactory(Poco::ThreadPool* pool, int maxQueued, std::string service)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
+        return new MonitorHandler(pool_, maxQueued_, service_);
+    }
+private:
+    Poco::ThreadPool* pool_;
+    int maxQueued_;
+    std::string service_;
+};
+}  // namespace
+
 void HttpBridgeServer::start() {
+    const int threads = cfg_.thread_pool > 0 ? cfg_.thread_pool : 16;
+
     auto params = new Poco::Net::HTTPServerParams;
-    params->setMaxThreads(cfg_.thread_pool);
-    params->setMaxQueued(cfg_.thread_pool * 8);
+    params->setMaxThreads(threads);
+    params->setMaxQueued(threads * 8);
     params->setKeepAlive(true);
+
+    // Use a *dedicated* pool sized to `threads` rather than Poco's shared
+    // defaultPool() (capacity 16) — otherwise setMaxThreads is silently capped at
+    // 16 and HTTP_THREAD_POOL above 16 has no effect. Each long-lived transfer
+    // pins one of these threads for its duration, so this is the real concurrency.
+    pool_ = std::make_unique<Poco::ThreadPool>(
+        std::min(2, threads), threads, 60 /* idle seconds */);
 
     Poco::Net::ServerSocket socket(
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_), socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_), *pool_, socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");
+
+    // Dedicated reporter: a single held-back thread + listener so pool usage /
+    // health stay answerable for the load balancer even at full saturation.
+    monitor_pool_ = std::make_unique<Poco::ThreadPool>(1, 1, 60);
+    auto mparams = new Poco::Net::HTTPServerParams;
+    mparams->setMaxThreads(1);
+    mparams->setMaxQueued(64);
+    mparams->setKeepAlive(false);  // free the reporter thread after each response
+    Poco::Net::ServerSocket msocket(
+        Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.monitoring_port)));
+    monitor_server_ = std::make_unique<Poco::Net::HTTPServer>(
+        new MonitorHandlerFactory(pool_.get(), threads * 8, "http_bridge"), *monitor_pool_, msocket, mparams);
+    monitor_server_->start();
+    webdav::infoLog("HTTP bridge monitoring (/healthz /readyz /poolz) listening on " +
+                    cfg_.http_host + ":" + std::to_string(cfg_.monitoring_port));
 }
 
 void HttpBridgeServer::stop() {
+    if (monitor_server_) {
+        monitor_server_->stop();
+        monitor_server_.reset();
+    }
     if (server_) {
         server_->stop();
         server_.reset();
