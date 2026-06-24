@@ -483,6 +483,67 @@ std::vector<std::string> LDAPAuthenticator::getTenantsForUser(const std::string&
     return tenants;
 }
 
+std::vector<std::string> LDAPAuthenticator::searchUsers(const std::string& prefix, int limit) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+
+    // Cap the result set so an empty/short prefix can't drag the whole directory
+    // across the wire. The caller's limit narrows it further.
+    const int kMaxResults = 50;
+    int cap = (limit > 0 && limit < kMaxResults) ? limit : kMaxResults;
+
+    std::vector<std::string> uids;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::searchUsers: failed to connect to LDAP");
+        return uids;
+    }
+
+    // Prefix (substring-initial) match across uid, cn, and mail. The prefix is
+    // escaped, then a single trailing '*' is appended so it stays a prefix match
+    // and the user can't inject their own wildcards.
+    std::string esc = escapeLdapFilterValue(prefix);
+    std::string filter = "(&(objectClass=person)(|(uid=" + esc + "*)(cn=" + esc +
+                         "*)(mail=" + esc + "*)))";
+    webdav::debugLog("LDAPAuthenticator::searchUsers: base: " + user_base_ + " filter: " + filter);
+
+    const char* attrs[] = {"uid", nullptr};
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, user_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                           filter.c_str(), const_cast<char**>(attrs), false, &result);
+    if (rc != LDAP_SUCCESS) {
+        webdav::errorLog("LDAPAuthenticator::searchUsers: search failed: " +
+                         std::string(ldap_err2string(rc)));
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return uids;
+    }
+
+    for (LDAPMessage* e = ldap_first_entry(ld, result);
+         e != nullptr && static_cast<int>(uids.size()) < cap;
+         e = ldap_next_entry(ld, e)) {
+        std::string uid;
+        berval** vals = ldap_get_values_len(ld, e, "uid");
+        if (vals != nullptr) {
+            if (vals[0] != nullptr) uid.assign(vals[0]->bv_val, vals[0]->bv_len);
+            ldap_value_free_len(vals);
+        }
+        if (uid.empty()) {
+            char* dn = ldap_get_dn(ld, e);
+            if (dn) { uid = uidFromDN(std::string(dn)); ldap_memfree(dn); }
+        }
+        if (uid.empty()) continue;
+        if (std::find(uids.begin(), uids.end(), uid) == uids.end()) uids.push_back(uid);
+    }
+    ldap_msgfree(result);
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    std::sort(uids.begin(), uids.end());
+    webdav::debugLog("LDAPAuthenticator::searchUsers: found " + std::to_string(uids.size()) +
+                     " user(s) for prefix: '" + prefix + "'");
+    return uids;
+}
+
 std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_dn) {
     // Example: if user DN is "uid=john,ou=users,ou=tenant1,dc=example,dc=com"
     // we want to extract "tenant1" from the ou=tenant1 part

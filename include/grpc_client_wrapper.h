@@ -75,6 +75,7 @@ public:
     fileengine_rpc::GetRolesForUserResponse getRolesForUser(const fileengine_rpc::GetRolesForUserRequest& request);
     fileengine_rpc::GetUsersForRoleResponse getUsersForRole(const fileengine_rpc::GetUsersForRoleRequest& request);
     fileengine_rpc::GetAllRolesResponse getAllRoles(const fileengine_rpc::GetAllRolesRequest& request);
+    fileengine_rpc::ListClaimsResponse listClaims(const fileengine_rpc::ListClaimsRequest& request);
 
     // Administrative operations
     fileengine_rpc::StorageUsageResponse getStorageUsage(const fileengine_rpc::StorageUsageRequest& request);

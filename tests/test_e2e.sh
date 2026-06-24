@@ -187,6 +187,27 @@ grep -q '"has_permission":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/per
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"dave","permission":"r"}')
 [ "$code" = "204" ] && ok "DELETE revoke permission -> 204" || bad "revoke" "got $code"
 
+# ---- principals type-ahead (ACL editor) ----
+echo "[principals type-ahead]"
+# Seed a CLAIM-type ACL so the claim catalog has something to return.
+CLAIM="dept=eng_$(date +%s)"
+curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d "{\"principal\":\"claim:$CLAIM\",\"permission\":\"r\"}"
+out=$(curl -s "${A[@]}" "$BASE/v1/principals")
+{ grep -q '"roles"' <<<"$out" && grep -q '"claims"' <<<"$out" && grep -q '"users"' <<<"$out"; } \
+  && ok "GET /v1/principals returns roles+claims+users" || bad "principals shape" "$out"
+grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim")" \
+  && ok "claim catalog includes granted claim" || bad "claim catalog"
+grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=dept=")" \
+  && ok "claim prefix filter matches" || bad "claim prefix match"
+! grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=zzz_nomatch")" \
+  && ok "claim prefix filter excludes non-matches" || bad "claim prefix exclude"
+grep -q "$ROLE" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=role&q=hbrole_")" \
+  && ok "role type-ahead by prefix" || bad "role type-ahead"
+grep -q '"roles":\[\]' <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim")" \
+  && ok "types=claim yields empty roles array" || bad "types filter"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/principals")
+[ "$code" = "401" ] && ok "principals without creds -> 401" || bad "principals auth" "got $code"
+
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/roles/$ROLE")
 [ "$code" = "204" ] && ok "DELETE /v1/roles/{role} -> 204" || bad "delete role" "got $code"
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
