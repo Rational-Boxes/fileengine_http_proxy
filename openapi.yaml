@@ -399,6 +399,32 @@ paths:
       summary: List a user's roles
       responses: { "200": { description: Roles, content: { application/json: { schema: { $ref: "#/components/schemas/RoleList" } } } } }
 
+  /v1/principals:
+    get:
+      tags: [roles]
+      summary: Type-ahead search of principals for the ACL editor
+      description: >
+        Returns the roles, claims, and users whose identifier begins
+        (case-insensitively) with the query prefix, for populating an ACL
+        editor's principal type-ahead. Roles come from the core role registry
+        (prefix-filtered), claims from the core ACL claim catalog (ListClaims),
+        and users from LDAP (uid/cn/mail prefix match).
+      parameters:
+        - { name: q, in: query, required: false, schema: { type: string }, description: "Case-insensitive prefix to match (empty = all)." }
+        - { name: types, in: query, required: false, schema: { type: string }, description: "Comma-separated subset of role,claim,user (default all three)." }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 }, description: "Max results per category." }
+      responses:
+        "200":
+          description: Matching principals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:  { type: array, items: { type: string } }
+                  roles:  { type: array, items: { type: string } }
+                  claims: { type: array, items: { type: string }, description: "Distinct 'key=value' claim principals used in ACLs." }
+
   /v1/storage:
     get:
       tags: [admin]

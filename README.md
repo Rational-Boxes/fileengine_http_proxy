@@ -90,8 +90,9 @@ for full schemas.
 | Metadata | `GET /v1/nodes/{uid}/metadata`, `GET/PUT/DELETE …/metadata/{key}` |
 | ACL | `GET/POST/DELETE /v1/nodes/{uid}/permissions` |
 | Roles | `GET/POST /v1/roles`, `…/{role}`, `…/{role}/users[/{user}]`, `/v1/users/{user}/roles` |
+| Principals | `GET /v1/principals?q=&types=role,claim,user&limit=` (ACL-editor type-ahead) |
 | Admin | `GET /v1/storage`, `POST /v1/sync` |
-| Health | `GET /healthz`, `GET /readyz` |
+| Health | `GET /healthz`, `GET /readyz`, `GET /poolz` (on the monitoring port) |
 
 Errors are `{"error": "..."}` with the mapped status (`400/401/403/404/409/413/503`).
 
@@ -100,7 +101,8 @@ Errors are `{"error": "..."}` with the mapped status (`400/401/403/404/409/413/5
 | Variable | Default | Meaning |
 |---|---|---|
 | `HTTP_HOST` / `HTTP_PORT` | `0.0.0.0` / `8090` | listen address |
-| `HTTP_THREAD_POOL` | `16` | worker threads |
+| `HTTP_THREAD_POOL` | `16` | worker threads on a dedicated, correctly-sized pool (not Poco's 16-capped `defaultPool`) |
+| `HTTP_MONITORING_PORT` | `8091` | dedicated reporter listener for `/healthz` `/readyz` `/poolz`; one worker is held back for it so reporting stays responsive under load |
 | `TOKEN_TTL_SECONDS` | `3600` | bearer-token lifetime |
 | `HTTP_MAX_BODY_BYTES` | `104857600` | request-body cap |
 | `HTTP_CORS_ORIGIN` | _(empty)_ | scoped CORS origin (empty = off) |
@@ -109,7 +111,7 @@ Errors are `{"error": "..."}` with the mapped status (`400/401/403/404/409/413/5
 
 ## Testing
 
-`tests/test_e2e.sh` is a curl-driven end-to-end suite (59 checks) run against a
+`tests/test_e2e.sh` is a curl-driven end-to-end suite (66 checks) run against a
 live bridge + gRPC core + LDAP — the regression gate for every change:
 
 ```bash
@@ -118,7 +120,7 @@ BASE=http://localhost:8090 ./tests/test_e2e.sh
 
 It covers health, LDAP + token auth, the filesystem round-trip, streaming +
 `Range`, versioning, metadata, ACL (grant/check/revoke, role principals, DENY
-precedence), role management, admin, and hardening.
+precedence), role management, principal type-ahead, admin, and hardening.
 
 ## Project layout
 
