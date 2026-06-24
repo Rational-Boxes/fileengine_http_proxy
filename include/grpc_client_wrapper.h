@@ -64,6 +64,7 @@ public:
 
     // ACL operations
     fileengine_rpc::CheckPermissionResponse checkPermission(const fileengine_rpc::CheckPermissionRequest& request);
+    fileengine_rpc::GetResourceAclsResponse getResourceAcls(const fileengine_rpc::GetResourceAclsRequest& request);
     fileengine_rpc::GrantPermissionResponse grantPermission(const fileengine_rpc::GrantPermissionRequest& request);
     fileengine_rpc::RevokePermissionResponse revokePermission(const fileengine_rpc::RevokePermissionRequest& request);
 

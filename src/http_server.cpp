@@ -374,6 +374,7 @@ private:
                     if (sub == "permissions" && method == "GET")    return checkPerm(req, resp, id, uid);
                     if (sub == "permissions" && method == "POST")   return grantPerm(req, resp, id, uid);
                     if (sub == "permissions" && method == "DELETE") return revokePerm(req, resp, id, uid);
+                    if (sub == "acls" && method == "GET")           return getAcls(resp, id, uid);
                 } else if (segs.size() == 5 && sub == "metadata") {
                     const std::string& key = segs[4];
                     if (method == "GET")    return getMeta(resp, id, uid, key);
@@ -738,6 +739,28 @@ private:
         auto r = grpc_->checkPermission(rq);
         if (!r.success()) return mapError(resp, r.error());
         sendJson(resp, HTTPResponse::HTTP_OK, std::string("{\"has_permission\":") + (r.has_permission() ? "true" : "false") + "}");
+    }
+
+    // List a node's ACL entries (for the ACL editor). Requires MANAGE_ACL on the
+    // node (enforced by the core). type: 0 user, 1 role, 2 group, 3 other, 4 claim.
+    void getAcls(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::GetResourceAclsRequest rq;
+        rq.set_resource_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getResourceAcls(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::string body = "{\"acls\":[";
+        bool first = true;
+        for (const auto& e : r.acls()) {
+            if (!first) body += ",";
+            first = false;
+            body += "{\"principal\":\"" + jsonEscape(e.principal()) +
+                    "\",\"type\":" + std::to_string(e.type()) +
+                    ",\"permissions\":" + std::to_string(e.permissions()) +
+                    ",\"effect\":" + std::to_string(e.effect()) + "}";
+        }
+        body += "]}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
     void grantPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {

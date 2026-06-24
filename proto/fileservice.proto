@@ -43,6 +43,7 @@ service FileService {
     rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
     rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
     rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+    rpc GetResourceAcls(GetResourceAclsRequest) returns (GetResourceAclsResponse);
 
     // Role management operations
     rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
@@ -403,6 +404,24 @@ message GrantPermissionRequest {
     Permission permission = 3;          // Permission to grant
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // ALLOW (default) or DENY
+}
+
+message GetResourceAclsRequest {
+    string resource_uid = 1;
+    AuthenticationContext auth = 2;
+}
+
+message AclEntryMessage {
+    string principal = 1;               // bare principal (role/claim prefixes stripped at store time)
+    int32 type = 2;                     // PrincipalType: 0 user, 1 role, 2 group, 3 other, 4 claim
+    int32 permissions = 3;              // permission bitmask
+    int32 effect = 4;                   // 0 = ALLOW, 1 = DENY
+}
+
+message GetResourceAclsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated AclEntryMessage acls = 3;
 }
 
 message GrantPermissionResponse {

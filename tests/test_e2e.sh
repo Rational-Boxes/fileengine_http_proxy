@@ -190,6 +190,11 @@ grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/perm
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r"}'
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r","effect":"deny"}'
 grep -q '"has_permission":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=erin&permission=r")" && ok "DENY overrides ALLOW" || bad "deny precedence"
+# list ACL entries (backs the ACL editor); principals are bare, type 1 = role, effect 1 = DENY
+acls=$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/acls")
+{ grep -q '"principal":"dave"' <<<"$acls" && grep -q "\"principal\":\"$ROLE\"" <<<"$acls" && grep -q '"type":1' <<<"$acls"; } \
+  && ok "GET /v1/nodes/{uid}/acls lists entries (user + role)" || bad "list acls" "$acls"
+grep -q '"effect":1' <<<"$acls" && ok "acls include DENY effect" || bad "acls deny effect" "$acls"
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"dave","permission":"r"}')
 [ "$code" = "204" ] && ok "DELETE revoke permission -> 204" || bad "revoke" "got $code"
 

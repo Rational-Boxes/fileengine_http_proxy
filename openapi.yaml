@@ -377,6 +377,33 @@ paths:
       summary: Revoke a permission
       requestBody: { $ref: "#/components/requestBodies/Acl" }
       responses: { "204": { description: Revoked }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /v1/nodes/{uid}/acls:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    get:
+      tags: [acl]
+      summary: List a node's ACL entries (for the ACL editor)
+      description: >
+        Returns every ACL entry on the node. Requires MANAGE_ACL on the node.
+        Principals are stored bare; `type` distinguishes them (0 user, 1 role,
+        2 group, 3 other, 4 claim) and `effect` is 0=ALLOW, 1=DENY.
+      responses:
+        "200":
+          description: ACL entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  acls:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        principal:   { type: string }
+                        type:        { type: integer, description: "0 user, 1 role, 2 group, 3 other, 4 claim" }
+                        permissions: { type: integer, description: permission bitmask }
+                        effect:      { type: integer, description: "0 ALLOW, 1 DENY" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /v1/roles:
     get:
