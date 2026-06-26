@@ -6,7 +6,7 @@
 
 .PHONY: dist rpm-package deb-package clean
 
-VERSION := 1.0.0
+VERSION := 1.1.0
 PACKAGE_NAME := fileengine-http-bridge
 BUILD_DIR := build-pkg
 
