@@ -1,5 +1,5 @@
 Name:           fileengine-http-bridge
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        REST/HTTP bridge for the FileEngine gRPC core
 License:        MIT
@@ -79,6 +79,9 @@ install -D -m 0640 http-bridge.env \
 rm -rf %{buildroot}
 
 %changelog
+* Fri Jun 26 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.1.0-1
+- Sync fileservice.proto to canonical (CULL_VERSIONS permission + ACL RPCs).
+
 * Wed Jun 24 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
 - Initial RPM packaging: fileengine-http-bridge daemon, systemd unit
   (DynamicUser), and default environment file.
