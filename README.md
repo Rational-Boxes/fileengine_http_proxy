@@ -1,5 +1,7 @@
 # FileEngine HTTP REST Proxy
 
+> ⚠️ **Active development — not production-ready.** This project is under active development and should **not** be considered safe for mission-critical use.
+
 A lightweight, concurrent **C++ HTTP service** that exposes the FileEngine gRPC
 `FileService` (`fileengine_rpc` protocol) as a clean **JSON/REST API**, secured
 against an **LDAP** directory. It is the REST sibling of the WebDAV bridge and a
