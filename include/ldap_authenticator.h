@@ -7,6 +7,8 @@
 #include <memory>
 #include <mutex>
 
+#include "circuit_breaker.h"
+
 namespace webdav {
 
 struct UserInfo {
@@ -25,7 +27,12 @@ public:
         const std::string& bind_dn,
         const std::string& bind_password,
         const std::string& tenant_base = "",
-        const std::string& user_base = ""
+        const std::string& user_base = "",
+        // Read-only replica directory for disconnect fault tolerance
+        // (REPLICATION_FAILOVER.md). Empty disables failover. When the master is
+        // unreachable, auth (read-only) fails over to this replica.
+        const std::string& replica_endpoint = "",
+        double failover_cooldown_s = 30.0
     );
     
     ~LDAPAuthenticator();
@@ -67,11 +74,17 @@ private:
     std::string bind_password_;
     std::string tenant_base_;
     std::string user_base_;
+    std::string replica_endpoint_;       // empty => failover disabled
+    CircuitBreaker breaker_;             // master availability (guarded by ldap_mutex_)
 
     mutable std::mutex ldap_mutex_;  // Protect LDAP operations
-    
-    // Helper function to connect to LDAP server
+
+    // Connect to the master, or fail over to the read-only replica when the master
+    // is unreachable (master-only when no replica is configured).
     LDAP* connectToLDAP();
+
+    // Bind a service connection to a specific endpoint; nullptr on failure.
+    LDAP* connectToEndpoint(const std::string& endpoint);
     
     // Helper function to search for a user by an arbitrary filter. `display_id`
     // is used only for logging; the real uid is read from the matched entry.

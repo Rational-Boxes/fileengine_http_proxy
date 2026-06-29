@@ -77,3 +77,10 @@ target_link_libraries(http_bridge
 
 # Install the binary (packaging renames it to fileengine-http-bridge).
 install(TARGETS http_bridge RUNTIME DESTINATION bin)
+
+# --- unit tests (CTest) — header-only failover circuit-breaker ---
+enable_testing()
+add_executable(failover_tests tests/test_failover.cpp)
+target_include_directories(failover_tests PRIVATE include)
+target_compile_features(failover_tests PRIVATE cxx_std_17)
+add_test(NAME failover_tests COMMAND failover_tests)

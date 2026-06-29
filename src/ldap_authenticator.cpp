@@ -16,13 +16,17 @@ LDAPAuthenticator::LDAPAuthenticator(
     const std::string& bind_dn,
     const std::string& bind_password,
     const std::string& tenant_base,
-    const std::string& user_base)
+    const std::string& user_base,
+    const std::string& replica_endpoint,
+    double failover_cooldown_s)
     : ldap_endpoint_(ldap_endpoint),
       ldap_domain_(ldap_domain),
       bind_dn_(bind_dn),
       bind_password_(bind_password),
       tenant_base_(tenant_base.empty() ? ldap_domain : tenant_base),
-      user_base_(user_base.empty() ? ldap_domain : user_base) {
+      user_base_(user_base.empty() ? ldap_domain : user_base),
+      replica_endpoint_(replica_endpoint),
+      breaker_(failover_cooldown_s) {
 }
 
 LDAPAuthenticator::~LDAPAuthenticator() {
@@ -284,10 +288,30 @@ UserInfo LDAPAuthenticator::getUserInfo(const std::string& username) {
 }
 
 LDAP* LDAPAuthenticator::connectToLDAP() {
+    // No replica configured -> master only (unchanged behavior).
+    if (replica_endpoint_.empty()) {
+        return connectToEndpoint(ldap_endpoint_);
+    }
+    // Master-preferred with read-only replica fallback (REPLICATION_FAILOVER.md).
+    // Access to breaker_ is serialized by ldap_mutex_ (held by the public callers).
+    if (breaker_.shouldTryPrimary()) {
+        LDAP* ld = connectToEndpoint(ldap_endpoint_);
+        if (ld) {
+            breaker_.reset();
+            return ld;
+        }
+        breaker_.trip();
+        std::cerr << "LDAP master unreachable; failing over to read-only replica: "
+                  << replica_endpoint_ << std::endl;
+    }
+    return connectToEndpoint(replica_endpoint_);
+}
+
+LDAP* LDAPAuthenticator::connectToEndpoint(const std::string& endpoint) {
     LDAP* ld = nullptr;
     int version = LDAP_VERSION3;
 
-    int rc = ldap_initialize(&ld, ldap_endpoint_.c_str());
+    int rc = ldap_initialize(&ld, endpoint.c_str());
     if (rc != LDAP_SUCCESS) {
         std::cerr << "Failed to initialize LDAP connection: " << ldap_err2string(rc) << std::endl;
         return nullptr;

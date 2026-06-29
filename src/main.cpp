@@ -77,7 +77,11 @@ int main() {
         webdav::getEnvOrDefault("FILEENGINE_LDAP_BIND_DN", "cn=admin,dc=rationalboxes,dc=com"),
         webdav::getEnvOrDefault("FILEENGINE_LDAP_BIND_PASSWORD", "admin"),
         webdav::getEnvOrDefault("FILEENGINE_LDAP_TENANT_BASE", "ou=tenants,dc=rationalboxes,dc=com"),
-        webdav::getEnvOrDefault("FILEENGINE_LDAP_USER_BASE", "ou=users,dc=rationalboxes,dc=com"));
+        webdav::getEnvOrDefault("FILEENGINE_LDAP_USER_BASE", "ou=users,dc=rationalboxes,dc=com"),
+        // Read-only replica directory for failover (empty = disabled; see
+        // REPLICATION_FAILOVER.md).
+        webdav::getEnvOrDefault("FILEENGINE_LDAP_ENDPOINT_REPLICA", ""),
+        std::stod(webdav::getEnvOrDefault("FILEENGINE_FAILOVER_COOLDOWN_S", "30")));
 
     httpbridge::HttpBridgeServer server(cfg, grpc, ldap);
     server.start();
