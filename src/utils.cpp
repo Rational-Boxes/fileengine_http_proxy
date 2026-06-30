@@ -120,10 +120,12 @@ std::string calculateDigestResponse(const std::string& ha1, const std::string& n
 }
 
 std::string extractTenantFromHostname(const std::string& hostname) {
-    // The first DNS label of the host is the tenant name. Hyphens are valid in
-    // labels and tenant names, so the WHOLE label is used (no truncation):
+    // The tenant is the first '-'-delimited segment of the leading DNS label.
+    // Any remainder is an interface suffix (e.g. "<tenant>-drive" for the
+    // WebDAV host), so the SPA and WebDAV hosts resolve to the same tenant:
     //   acme.example.com          -> "acme"
-    //   acme-staging.example.com  -> "acme-staging"
+    //   acme-drive.example.com    -> "acme"
+    //   acme-staging.example.com  -> "acme"
     //   www.example.com           -> ""  (reserved; default tenant)
     //   example.com / localhost   -> ""  (no subdomain; default tenant)
     //   127.0.0.1                 -> ""  (IP literal; default tenant)
@@ -138,6 +140,14 @@ std::string extractTenantFromHostname(const std::string& hostname) {
 
     std::string subdomain = host.substr(0, first_dot);
 
+    // Always split the leading label on '-' and keep the first segment: the
+    // label follows the "<tenant>-<interface>" convention (e.g. "acme-drive"),
+    // so the tenant is everything before the first hyphen.
+    size_t dash = subdomain.find('-');
+    if (dash != std::string::npos) {
+        subdomain = subdomain.substr(0, dash);
+    }
+
     // Reserved / non-tenant first labels.
     if (subdomain.empty() || subdomain == "www") {
         return "";
@@ -149,7 +159,7 @@ std::string extractTenantFromHostname(const std::string& hostname) {
         return "";
     }
 
-    return subdomain;  // full label; hyphens preserved
+    return subdomain;  // tenant = first hyphen-delimited segment of the label
 }
 
 std::string getEnvOrDefault(const std::string& env_var, const std::string& default_val) {
