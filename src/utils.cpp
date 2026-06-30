@@ -6,8 +6,25 @@
 #include <iostream>
 #include <Poco/DateTimeFormatter.h>
 #include <Poco/Timestamp.h>
+#include <Poco/MD5Engine.h>
+#include <Poco/DigestEngine.h>
 
 namespace webdav {
+
+namespace {
+// MD5 of the input rendered as LOWERCASE hex. RFC 2617 requires the HA1/HA2 and
+// the response digest to be lowercase hex — uppercase (Poco NumberFormatter's
+// default) would never match a standard client's computation, so Digest auth
+// would always fail.
+std::string md5HexLower(const std::string& input) {
+    Poco::MD5Engine md5;
+    md5.update(input);
+    std::string hex = Poco::DigestEngine::digestToHex(md5.digest());
+    std::transform(hex.begin(), hex.end(), hex.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return hex;
+}
+}  // namespace
 
 std::vector<std::string> splitString(const std::string& str, char delimiter) {
     std::vector<std::string> tokens;
@@ -69,18 +86,7 @@ std::string urlEncode(const std::string& decoded) {
 }
 
 std::string generateDigestHash(const std::string& username, const std::string& realm, const std::string& password) {
-    std::string a1 = username + ":" + realm + ":" + password;
-    
-    Poco::MD5Engine md5;
-    md5.update(a1);
-    Poco::DigestEngine::Digest digest = md5.digest();
-    
-    std::string result;
-    for (auto byte : digest) {
-        result += Poco::NumberFormatter::formatHex(byte, 2);
-    }
-    
-    return result;
+    return md5HexLower(username + ":" + realm + ":" + password);
 }
 
 std::string calculateHA1(const std::string& username, const std::string& realm, const std::string& password) {
@@ -88,35 +94,13 @@ std::string calculateHA1(const std::string& username, const std::string& realm, 
 }
 
 std::string calculateHA2(const std::string& method, const std::string& uri) {
-    std::string a2 = method + ":" + uri;
-    
-    Poco::MD5Engine md5;
-    md5.update(a2);
-    Poco::DigestEngine::Digest digest = md5.digest();
-    
-    std::string result;
-    for (auto byte : digest) {
-        result += Poco::NumberFormatter::formatHex(byte, 2);
-    }
-    
-    return result;
+    return md5HexLower(method + ":" + uri);
 }
 
-std::string calculateDigestResponse(const std::string& ha1, const std::string& nonce, 
-                                  const std::string& nc, const std::string& cnonce, 
+std::string calculateDigestResponse(const std::string& ha1, const std::string& nonce,
+                                  const std::string& nc, const std::string& cnonce,
                                   const std::string& qop, const std::string& ha2) {
-    std::string a3 = ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2;
-    
-    Poco::MD5Engine md5;
-    md5.update(a3);
-    Poco::DigestEngine::Digest digest = md5.digest();
-    
-    std::string result;
-    for (auto byte : digest) {
-        result += Poco::NumberFormatter::formatHex(byte, 2);
-    }
-    
-    return result;
+    return md5HexLower(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2);
 }
 
 std::string extractTenantFromHostname(const std::string& hostname) {

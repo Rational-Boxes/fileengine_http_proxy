@@ -78,8 +78,29 @@ target_link_libraries(http_bridge
 # Install the binary (packaging renames it to fileengine-http-bridge).
 install(TARGETS http_bridge RUNTIME DESTINATION bin)
 
-# --- unit tests (CTest) — header-only failover circuit-breaker ---
+# ---------------------------------------------------------------------------
+# Unit tests (CTest)
+# ---------------------------------------------------------------------------
 enable_testing()
+find_package(GTest REQUIRED)
+
+# gtest suite over the pure utilities in src/utils.cpp (tenant parsing, string
+# helpers, URL codec, RFC 2617 Digest helpers). These need no gRPC/LDAP, so the
+# target links only utils.cpp + Poco::Foundation.
+add_executable(http_tests
+    tests/test_main.cpp
+    tests/test_utils.cpp
+    src/utils.cpp
+)
+target_include_directories(http_tests PRIVATE include)
+target_link_libraries(http_tests
+    Poco::Foundation
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME http_tests COMMAND http_tests)
+
+# --- header-only failover circuit-breaker ---
 add_executable(failover_tests tests/test_failover.cpp)
 target_include_directories(failover_tests PRIVATE include)
 target_compile_features(failover_tests PRIVATE cxx_std_17)
