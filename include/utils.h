@@ -31,6 +31,15 @@ std::string calculateDigestResponse(const std::string& ha1, const std::string& n
 // Utility functions for tenant extraction
 std::string extractTenantFromHostname(const std::string& hostname);
 
+// Resolve the tenant for a request: an explicit X-Tenant header wins; otherwise
+// the host's leading subdomain label; otherwise "default". Pure form of the
+// bridge's per-request tenant precedence (no Poco request needed).
+std::string resolveTenant(const std::string& x_tenant_header, const std::string& host);
+
+// True if `url` begins with any non-empty, comma-separated prefix in `allowlist`
+// (each prefix is whitespace-trimmed). Used to gate OAuth return URLs.
+bool returnUrlAllowed(const std::string& allowlist, const std::string& url);
+
 // Utility functions for environment/config handling
 std::string getEnvOrDefault(const std::string& env_var, const std::string& default_val);
 

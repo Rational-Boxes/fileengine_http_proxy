@@ -40,6 +40,42 @@ TEST(ExtractTenantFromHostname, OnlyWwwIsReservedNotAppApi) {
     EXPECT_EQ(extractTenantFromHostname("api.example.com"), "api");
 }
 
+// --- resolveTenant (X-Tenant header > host subdomain > "default") ---------
+
+TEST(ResolveTenant, ExplicitHeaderWins) {
+    EXPECT_EQ(resolveTenant("acme", "other.example.com"), "acme");
+    EXPECT_EQ(resolveTenant("acme", "localhost"), "acme");
+}
+
+TEST(ResolveTenant, FallsBackToHostSubdomain) {
+    EXPECT_EQ(resolveTenant("", "acme.example.com"), "acme");
+    EXPECT_EQ(resolveTenant("", "acme-drive.example.com"), "acme");  // hyphen split
+}
+
+TEST(ResolveTenant, FallsBackToDefault) {
+    EXPECT_EQ(resolveTenant("", "localhost"), "default");      // no subdomain
+    EXPECT_EQ(resolveTenant("", "www.example.com"), "default"); // reserved label
+    EXPECT_EQ(resolveTenant("", ""), "default");               // no host
+}
+
+// --- returnUrlAllowed (OAuth return-URL allowlist) ------------------------
+
+TEST(ReturnUrlAllowed, MatchesAConfiguredPrefix) {
+    const std::string allow = "https://app.example.com,https://admin.example.com";
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com/oauth/callback"));
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://admin.example.com/"));
+}
+
+TEST(ReturnUrlAllowed, RejectsNonMatchingOrEmptyAllowlist) {
+    EXPECT_FALSE(returnUrlAllowed("https://app.example.com", "https://evil.com/app.example.com"));
+    EXPECT_FALSE(returnUrlAllowed("", "https://app.example.com/cb"));   // empty allowlist
+    EXPECT_FALSE(returnUrlAllowed("   ", "https://app.example.com/cb")); // blank-only entry
+}
+
+TEST(ReturnUrlAllowed, TrimsWhitespaceAroundPrefixes) {
+    EXPECT_TRUE(returnUrlAllowed("  https://a.com , https://b.com ", "https://b.com/cb"));
+}
+
 // --- splitString ----------------------------------------------------------
 
 TEST(SplitString, SplitsAndPreservesEmptyInteriorTokens) {

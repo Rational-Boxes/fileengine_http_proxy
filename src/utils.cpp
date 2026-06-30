@@ -146,6 +146,20 @@ std::string extractTenantFromHostname(const std::string& hostname) {
     return subdomain;  // tenant = first hyphen-delimited segment of the label
 }
 
+std::string resolveTenant(const std::string& x_tenant_header, const std::string& host) {
+    if (!x_tenant_header.empty()) return x_tenant_header;
+    std::string t = extractTenantFromHostname(host);
+    return t.empty() ? "default" : t;
+}
+
+bool returnUrlAllowed(const std::string& allowlist, const std::string& url) {
+    for (const auto& p : splitString(allowlist, ',')) {
+        std::string pre = trim(p);
+        if (!pre.empty() && url.rfind(pre, 0) == 0) return true;
+    }
+    return false;
+}
+
 std::string getEnvOrDefault(const std::string& env_var, const std::string& default_val) {
     std::string val = Poco::Environment::get(env_var, "");
     if (val.empty()) {

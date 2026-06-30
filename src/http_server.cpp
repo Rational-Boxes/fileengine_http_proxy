@@ -953,21 +953,16 @@ private:
     // --- OAuth2 login (BFF) ---
 
     // Tenant resolution shared with Basic auth: X-Tenant > host subdomain > default.
+    // Pure logic lives in webdav::resolveTenant (unit-tested in test_utils.cpp).
     std::string resolveTenant(HTTPServerRequest& req) {
-        std::string xt = req.get("X-Tenant", "");
-        if (!xt.empty()) return xt;
-        std::string t = webdav::extractTenantFromHostname(req.getHost());
-        return t.empty() ? "default" : t;
+        return webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
     }
 
     // A return URL is allowed only if it begins with a configured prefix. Without
     // this, the callback would hand a valid bridge token to any attacker URL.
+    // Pure logic lives in webdav::returnUrlAllowed (unit-tested in test_utils.cpp).
     bool returnAllowed(const std::string& url) {
-        for (auto& p : webdav::splitString(cfg_.oauth_return_allowlist, ',')) {
-            std::string pre = webdav::trim(p);
-            if (!pre.empty() && url.rfind(pre, 0) == 0) return true;
-        }
-        return false;
+        return webdav::returnUrlAllowed(cfg_.oauth_return_allowlist, url);
     }
 
     void oauthStart(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
