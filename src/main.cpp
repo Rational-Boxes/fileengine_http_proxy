@@ -60,6 +60,7 @@ int main() {
     cfg.http_host = webdav::getEnvOrDefault("HTTP_HOST", "0.0.0.0");
     cfg.http_port = std::stoi(webdav::getEnvOrDefault("HTTP_PORT", "8090"));
     cfg.thread_pool = std::stoi(webdav::getEnvOrDefault("HTTP_THREAD_POOL", "16"));
+    cfg.monitoring_host = webdav::getEnvOrDefault("HTTP_MONITORING_HOST", "127.0.0.1");
     cfg.monitoring_port = std::stoi(webdav::getEnvOrDefault("HTTP_MONITORING_PORT", "8091"));
     cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "3600"));
     cfg.max_body_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_BODY_BYTES", "104857600"));

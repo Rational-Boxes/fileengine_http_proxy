@@ -19,7 +19,10 @@ struct Config {
     std::string http_host = "0.0.0.0";
     int http_port = 8090;
     int thread_pool = 16;
-    int monitoring_port = 8091;   // dedicated reporter listener (pool usage / health)
+    // Dedicated reporter listener (pool usage / health). Unauthenticated, so it
+    // binds to loopback by default — protect it by network isolation, not auth.
+    std::string monitoring_host = "127.0.0.1";
+    int monitoring_port = 8091;
     int token_ttl = 3600;
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
     std::string cors_origin;                   // empty => no CORS header

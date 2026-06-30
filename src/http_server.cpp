@@ -1316,12 +1316,12 @@ void HttpBridgeServer::start() {
     mparams->setMaxQueued(64);
     mparams->setKeepAlive(false);  // free the reporter thread after each response
     Poco::Net::ServerSocket msocket(
-        Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.monitoring_port)));
+        Poco::Net::SocketAddress(cfg_.monitoring_host, static_cast<Poco::UInt16>(cfg_.monitoring_port)));
     monitor_server_ = std::make_unique<Poco::Net::HTTPServer>(
         new MonitorHandlerFactory(pool_.get(), threads * 8, "http_bridge"), *monitor_pool_, msocket, mparams);
     monitor_server_->start();
     webdav::infoLog("HTTP bridge monitoring (/healthz /readyz /poolz) listening on " +
-                    cfg_.http_host + ":" + std::to_string(cfg_.monitoring_port));
+                    cfg_.monitoring_host + ":" + std::to_string(cfg_.monitoring_port));
 }
 
 void HttpBridgeServer::stop() {
