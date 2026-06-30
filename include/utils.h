@@ -36,8 +36,11 @@ std::string extractTenantFromHostname(const std::string& hostname);
 // bridge's per-request tenant precedence (no Poco request needed).
 std::string resolveTenant(const std::string& x_tenant_header, const std::string& host);
 
-// True if `url` begins with any non-empty, comma-separated prefix in `allowlist`
-// (each prefix is whitespace-trimmed). Used to gate OAuth return URLs.
+// True if `url` matches any non-empty, comma-separated prefix in `allowlist`
+// (each prefix whitespace-trimmed), where the match must end at an origin/path
+// boundary: an exact match, a prefix ending in '/', or a following '/' '?' '#'.
+// This prevents "https://app.example.com" from matching a confusable host such
+// as "https://app.example.com.evil.com". Used to gate OAuth return URLs.
 bool returnUrlAllowed(const std::string& allowlist, const std::string& url);
 
 // Utility functions for environment/config handling

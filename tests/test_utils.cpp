@@ -60,10 +60,23 @@ TEST(ResolveTenant, FallsBackToDefault) {
 
 // --- returnUrlAllowed (OAuth return-URL allowlist) ------------------------
 
-TEST(ReturnUrlAllowed, MatchesAConfiguredPrefix) {
+TEST(ReturnUrlAllowed, MatchesAtAnOriginOrPathBoundary) {
     const std::string allow = "https://app.example.com,https://admin.example.com";
-    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com/oauth/callback"));
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com"));              // exact
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com/oauth/callback")); // '/'
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com?next=/x"));      // '?'
+    EXPECT_TRUE(returnUrlAllowed(allow, "https://app.example.com#frag"));         // '#'
     EXPECT_TRUE(returnUrlAllowed(allow, "https://admin.example.com/"));
+    // A path-prefix entry (ends in '/') matches anything beneath it.
+    EXPECT_TRUE(returnUrlAllowed("https://app.example.com/spa/", "https://app.example.com/spa/page"));
+}
+
+TEST(ReturnUrlAllowed, RejectsConfusableHostsAndDifferentPorts) {
+    // The hardening: a confusable host that merely *starts with* the prefix.
+    EXPECT_FALSE(returnUrlAllowed("https://app.example.com", "https://app.example.com.evil.com/cb"));
+    EXPECT_FALSE(returnUrlAllowed("https://app.example.com", "https://app.example.comX"));
+    // A different port is a different origin.
+    EXPECT_FALSE(returnUrlAllowed("https://app.example.com", "https://app.example.com:8443/cb"));
 }
 
 TEST(ReturnUrlAllowed, RejectsNonMatchingOrEmptyAllowlist) {

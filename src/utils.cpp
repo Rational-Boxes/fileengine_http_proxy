@@ -155,7 +155,16 @@ std::string resolveTenant(const std::string& x_tenant_header, const std::string&
 bool returnUrlAllowed(const std::string& allowlist, const std::string& url) {
     for (const auto& p : splitString(allowlist, ',')) {
         std::string pre = trim(p);
-        if (!pre.empty() && url.rfind(pre, 0) == 0) return true;
+        if (pre.empty()) continue;
+        if (url.rfind(pre, 0) != 0) continue;     // url must start with the prefix
+        // Require the match to end at an origin/path boundary so a prefix like
+        // "https://app.example.com" cannot match "https://app.example.com.evil.com"
+        // or a different port. An exact match, a prefix that already ends in '/',
+        // or a following '/'?'#' are all boundaries.
+        if (url.size() == pre.size()) return true;       // exact
+        if (pre.back() == '/') return true;              // prefix ends at a boundary
+        const char next = url[pre.size()];
+        if (next == '/' || next == '?' || next == '#') return true;
     }
     return false;
 }
