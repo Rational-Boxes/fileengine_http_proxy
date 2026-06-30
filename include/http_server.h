@@ -5,9 +5,12 @@
 #include <string>
 
 #include <Poco/Net/HTTPServer.h>
+#include <Poco/ThreadPool.h>
 
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
+#include "oauth_provider.h"
+#include "oauth_state_store.h"
 #include "token_store.h"
 
 namespace httpbridge {
@@ -16,10 +19,19 @@ struct Config {
     std::string http_host = "0.0.0.0";
     int http_port = 8090;
     int thread_pool = 16;
+    // Dedicated reporter listener (pool usage / health). Unauthenticated, so it
+    // binds to loopback by default — protect it by network isolation, not auth.
+    std::string monitoring_host = "127.0.0.1";
+    int monitoring_port = 8091;
     int token_ttl = 3600;
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
     std::string cors_origin;                   // empty => no CORS header
     std::string grpc_address = "localhost:50051";
+
+    // OAuth2 / OIDC login (BFF). Empty oauth_redirect_base disables OAuth routes.
+    std::string oauth_redirect_base;        // public base URL of the bridge
+    std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
+    int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -40,7 +52,16 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
+    // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
+    // it is destroyed *after* the server stops using it.
+    std::unique_ptr<Poco::ThreadPool> pool_;
     std::unique_ptr<Poco::Net::HTTPServer> server_;
+    // Dedicated reporter: its own single held-back thread + listener, so pool
+    // usage / health are answerable even when every worker thread is mid-transfer.
+    std::unique_ptr<Poco::ThreadPool> monitor_pool_;
+    std::unique_ptr<Poco::Net::HTTPServer> monitor_server_;
 };
 
 }  // namespace httpbridge

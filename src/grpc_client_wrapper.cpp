@@ -153,6 +153,11 @@ fileengine_rpc::CheckPermissionResponse GRPCClientWrapper::checkPermission(const
         [&](grpc::ClientContext& c, fileengine_rpc::CheckPermissionResponse& r) { return stub_->CheckPermission(&c, request, &r); });
 }
 
+fileengine_rpc::GetResourceAclsResponse GRPCClientWrapper::getResourceAcls(const fileengine_rpc::GetResourceAclsRequest& request) {
+    return invoke<fileengine_rpc::GetResourceAclsResponse>("GetResourceAcls",
+        [&](grpc::ClientContext& c, fileengine_rpc::GetResourceAclsResponse& r) { return stub_->GetResourceAcls(&c, request, &r); });
+}
+
 fileengine_rpc::GrantPermissionResponse GRPCClientWrapper::grantPermission(const fileengine_rpc::GrantPermissionRequest& request) {
     return invoke<fileengine_rpc::GrantPermissionResponse>("GrantPermission",
         [&](grpc::ClientContext& c, fileengine_rpc::GrantPermissionResponse& r) { return stub_->GrantPermission(&c, request, &r); });
@@ -197,6 +202,11 @@ fileengine_rpc::GetUsersForRoleResponse GRPCClientWrapper::getUsersForRole(const
 fileengine_rpc::GetAllRolesResponse GRPCClientWrapper::getAllRoles(const fileengine_rpc::GetAllRolesRequest& request) {
     return invoke<fileengine_rpc::GetAllRolesResponse>("GetAllRoles",
         [&](grpc::ClientContext& c, fileengine_rpc::GetAllRolesResponse& r) { return stub_->GetAllRoles(&c, request, &r); });
+}
+
+fileengine_rpc::ListClaimsResponse GRPCClientWrapper::listClaims(const fileengine_rpc::ListClaimsRequest& request) {
+    return invoke<fileengine_rpc::ListClaimsResponse>("ListClaims",
+        [&](grpc::ClientContext& c, fileengine_rpc::ListClaimsResponse& r) { return stub_->ListClaims(&c, request, &r); });
 }
 
 // Administrative operations

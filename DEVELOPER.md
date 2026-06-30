@@ -153,3 +153,14 @@ and hardening (CORS, body cap). The default test user is `testuser` /
   a configured origin (never `*`).
 - The core gRPC service enforces all ACLs; the bridge forwards identity and maps
   allow/deny to `200`/`403` — it makes no local authorization decisions.
+
+## File renditions
+
+Files may have hidden **renditions** (alternate-format children). They never
+appear in directory listings or stat as entries. To support clients:
+
+- Directory entries (`GET /v1/dirs/{uid}`) and stat (`GET /v1/nodes/{uid}`)
+  include `rendition_count` (integer) and `has_renditions` (boolean).
+- Fetch a file's renditions on demand:
+  `GET /v1/files/{uid}/renditions` -> `EntryList` (same shape as a directory
+  listing). This is the only path that exposes them over REST.

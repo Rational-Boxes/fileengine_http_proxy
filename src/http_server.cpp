@@ -13,11 +13,13 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/Dynamic/Var.h>
 #include <Poco/URI.h>
+#include <Poco/SHA2Engine.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <istream>
 #include <map>
 #include <ostream>
@@ -65,6 +67,40 @@ std::string jsonArray(const std::vector<std::string>& v) {
     }
     o += "]";
     return o;
+}
+
+// base64url without padding (RFC 4648 §5) — the encoding PKCE and JWT use.
+std::string base64UrlEncode(const unsigned char* data, size_t len) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve((len + 2) / 3 * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned v = data[i] << 16;
+        int n = 1;
+        if (i + 1 < len) { v |= data[i + 1] << 8; n = 2; }
+        if (i + 2 < len) { v |= data[i + 2]; n = 3; }
+        out += tbl[(v >> 18) & 0x3f];
+        out += tbl[(v >> 12) & 0x3f];
+        if (n >= 2) out += tbl[(v >> 6) & 0x3f];
+        if (n >= 3) out += tbl[v & 0x3f];
+    }
+    return out;
+}
+
+// A PKCE code verifier: 32 random bytes -> 43 base64url chars (all unreserved).
+std::string randomCodeVerifier() {
+    unsigned char buf[32] = {0};
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
+    return base64UrlEncode(buf, sizeof(buf));
+}
+
+// PKCE S256 challenge = base64url(SHA-256(verifier)).
+std::string pkceChallengeS256(const std::string& verifier) {
+    Poco::SHA2Engine engine(Poco::SHA2Engine::SHA_256);
+    engine.update(verifier);
+    const Poco::DigestEngine::Digest& d = engine.digest();
+    return base64UrlEncode(d.data(), d.size());
 }
 
 void sendJson(HTTPServerResponse& resp, HTTPResponse::HTTPStatus status, const std::string& body) {
@@ -181,8 +217,11 @@ public:
     RequestHandler(Config cfg,
                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
-                   std::shared_ptr<TokenStore> tokens)
-        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
+                   std::shared_ptr<TokenStore> tokens,
+                   std::shared_ptr<OAuthProvider> oauth,
+                   std::shared_ptr<OAuthStateStore> oauth_states)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -249,6 +288,20 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
 
+        // OAuth2 login (BFF). Pre-auth: the browser has no bearer token yet.
+        //   GET /v1/auth/oauth/{provider}            -> redirect to the IdP
+        //   GET /v1/auth/oauth/{provider}/callback   -> exchange + issue token
+        {
+            auto s = pathSegments(path);
+            if (s.size() >= 4 && s[1] == "auth" && s[2] == "oauth") {
+                if (s.size() == 4 && method == "GET")
+                    return oauthStart(req, resp, s[3]);
+                if (s.size() == 5 && s[4] == "callback" && method == "GET")
+                    return oauthCallback(req, resp, s[3]);
+                return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+            }
+        }
+
         AuthIdentity id;
         if (!authenticate(req, id)) return unauthorized(resp);
 
@@ -256,8 +309,15 @@ private:
 
         if (segs.size() == 2 && segs[1] == "whoami") return whoami(resp, id);
 
+        // Token introspection for downstream services (e.g. convert_search_ai):
+        // validate the caller's bearer token and return the resolved identity, so
+        // one bridge-issued token (LDAP or OAuth) authenticates across services.
+        if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "introspect" && method == "GET")
+            return introspect(resp, id);
+
         // Top-level admin / role resources (no uid in the path).
         const std::string res0 = segs.size() >= 2 ? segs[1] : "";
+        if (res0 == "tenants" && segs.size() == 2 && method == "GET") return listTenants(resp, id);
         if (res0 == "storage" && segs.size() == 2 && method == "GET")  return storageUsage(resp, id);
         if (res0 == "sync" && segs.size() == 2 && method == "POST")    return triggerSync(resp, id);
         if (res0 == "roles") {
@@ -270,6 +330,9 @@ private:
         }
         if (res0 == "users" && segs.size() == 4 && segs[3] == "roles" && method == "GET") {
             return getRolesForUser(resp, id, segs[2]);
+        }
+        if (res0 == "principals" && segs.size() == 2 && method == "GET") {
+            return searchPrincipals(req, resp, id);
         }
 
         if (segs.size() >= 3) {
@@ -293,6 +356,7 @@ private:
                     if (sub == "content" && method == "GET")    return getContent(req, resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
+                    if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
                     if (sub == "restore" && method == "POST")   return restoreVersion(req, resp, id, uid);
                     if (sub == "purge" && method == "POST")     return purgeVersions(req, resp, id, uid);
                 } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
@@ -310,6 +374,7 @@ private:
                     if (sub == "permissions" && method == "GET")    return checkPerm(req, resp, id, uid);
                     if (sub == "permissions" && method == "POST")   return grantPerm(req, resp, id, uid);
                     if (sub == "permissions" && method == "DELETE") return revokePerm(req, resp, id, uid);
+                    if (sub == "acls" && method == "GET")           return getAcls(resp, id, uid);
                 } else if (segs.size() == 5 && sub == "metadata") {
                     const std::string& key = segs[4];
                     if (method == "GET")    return getMeta(resp, id, uid, key);
@@ -336,7 +401,9 @@ private:
             first = false;
             body += "{\"uid\":\"" + jsonEscape(e.uid()) + "\",\"name\":\"" + jsonEscape(e.name()) +
                     "\",\"type\":\"" + fileTypeName(e.type()) + "\",\"size\":" + std::to_string(e.size()) +
-                    ",\"version_count\":" + std::to_string(e.version_count()) + "}";
+                    ",\"version_count\":" + std::to_string(e.version_count()) +
+                    ",\"rendition_count\":" + std::to_string(e.rendition_count()) +
+                    ",\"has_renditions\":" + (e.rendition_count() > 0 ? "true" : "false") + "}";
         }
         body += "]}";
         return body;
@@ -448,7 +515,9 @@ private:
         std::string body = "{\"uid\":\"" + jsonEscape(i.uid()) + "\",\"name\":\"" + jsonEscape(i.name()) +
                            "\",\"parent_uid\":\"" + jsonEscape(i.parent_uid()) + "\",\"type\":\"" + fileTypeName(i.type()) +
                            "\",\"size\":" + std::to_string(i.size()) + ",\"owner\":\"" + jsonEscape(i.owner()) +
-                           "\",\"version\":\"" + jsonEscape(i.version()) + "\"}";
+                           "\",\"version\":\"" + jsonEscape(i.version()) +
+                           "\",\"rendition_count\":" + std::to_string(i.rendition_count()) +
+                           ",\"has_renditions\":" + (i.rendition_count() > 0 ? "true" : "false") + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
@@ -469,6 +538,17 @@ private:
             if (!r.success()) return mapError(resp, r.error());
             sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
         }
+    }
+
+    // List a file's hidden renditions on demand (children of the file UID).
+    // Normal browsing never surfaces these; this is the explicit opt-in path.
+    void listRenditions(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::ListDirectoryRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->listDirectory(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
     }
 
     void removeFile(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
@@ -661,6 +741,28 @@ private:
         sendJson(resp, HTTPResponse::HTTP_OK, std::string("{\"has_permission\":") + (r.has_permission() ? "true" : "false") + "}");
     }
 
+    // List a node's ACL entries (for the ACL editor). Requires MANAGE_ACL on the
+    // node (enforced by the core). type: 0 user, 1 role, 2 group, 3 other, 4 claim.
+    void getAcls(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::GetResourceAclsRequest rq;
+        rq.set_resource_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getResourceAcls(rq);
+        if (!r.success()) return mapError(resp, r.error());
+        std::string body = "{\"acls\":[";
+        bool first = true;
+        for (const auto& e : r.acls()) {
+            if (!first) body += ",";
+            first = false;
+            body += "{\"principal\":\"" + jsonEscape(e.principal()) +
+                    "\",\"type\":" + std::to_string(e.type()) +
+                    ",\"permissions\":" + std::to_string(e.permissions()) +
+                    ",\"effect\":" + std::to_string(e.effect()) + "}";
+        }
+        body += "]}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
     void grantPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         std::string body = readBody(req);
         std::string principal = jsonField(body, "principal");
@@ -761,6 +863,70 @@ private:
         sendJson(resp, HTTPResponse::HTTP_OK, "{\"roles\":" + jsonArray(v) + "}");
     }
 
+    // GET /v1/principals?q=<prefix>&types=role,claim,user&limit=<n>
+    // Type-ahead source for the ACL editor. Returns the roles, claims, and users
+    // whose identifier begins (case-insensitively) with `q`. `types` selects
+    // which categories to include (comma-separated; default all three); `limit`
+    // caps each category. Roles come from core's role registry (filtered here),
+    // claims from core's ACL claim catalog (ListClaims), users from LDAP.
+    void searchPrincipals(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string q, typesParam;
+        int limit = 20;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "q" || kv.first == "prefix") q = kv.second;
+            else if (kv.first == "types") typesParam = kv.second;
+            else if (kv.first == "limit") { try { limit = std::stoi(kv.second); } catch (...) {} }
+        }
+        if (limit <= 0 || limit > 100) limit = 20;
+
+        bool wantRoles = true, wantClaims = true, wantUsers = true;
+        if (!typesParam.empty()) {
+            wantRoles = wantClaims = wantUsers = false;
+            for (auto& t : webdav::splitString(typesParam, ',')) {
+                if (t == "role" || t == "roles")  wantRoles = true;
+                else if (t == "claim" || t == "claims") wantClaims = true;
+                else if (t == "user" || t == "users")   wantUsers = true;
+            }
+        }
+
+        auto lower = [](std::string s) { for (char& c : s) if (c >= 'A' && c <= 'Z') c += 32; return s; };
+        std::string lq = lower(q);
+
+        std::vector<std::string> roles, claims, users;
+
+        if (wantRoles) {
+            fileengine_rpc::GetAllRolesRequest rq;
+            fillAuth(rq.mutable_auth(), id);
+            auto r = grpc_->getAllRoles(rq);
+            if (!r.success()) return mapError(resp, r.error());
+            for (const auto& role : r.roles()) {
+                if (lq.empty() || lower(role).compare(0, lq.size(), lq) == 0) {
+                    roles.push_back(role);
+                    if (static_cast<int>(roles.size()) >= limit) break;
+                }
+            }
+        }
+
+        if (wantClaims) {
+            fileengine_rpc::ListClaimsRequest rq;
+            fillAuth(rq.mutable_auth(), id);
+            rq.set_prefix(q);
+            rq.set_limit(limit);
+            auto r = grpc_->listClaims(rq);
+            if (!r.success()) return mapError(resp, r.error());
+            claims.assign(r.claims().begin(), r.claims().end());
+        }
+
+        if (wantUsers && ldap_) {
+            users = ldap_->searchUsers(q, limit);
+        }
+
+        std::string body = "{\"users\":" + jsonArray(users) +
+                           ",\"roles\":" + jsonArray(roles) +
+                           ",\"claims\":" + jsonArray(claims) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
     // --- admin ---
     void storageUsage(HTTPServerResponse& resp, const AuthIdentity& id) {
         fileengine_rpc::StorageUsageRequest rq;
@@ -784,6 +950,110 @@ private:
         else mapError(resp, r.error());
     }
 
+    // --- OAuth2 login (BFF) ---
+
+    // Tenant resolution shared with Basic auth: X-Tenant > host subdomain > default.
+    std::string resolveTenant(HTTPServerRequest& req) {
+        std::string xt = req.get("X-Tenant", "");
+        if (!xt.empty()) return xt;
+        std::string t = webdav::extractTenantFromHostname(req.getHost());
+        return t.empty() ? "default" : t;
+    }
+
+    // A return URL is allowed only if it begins with a configured prefix. Without
+    // this, the callback would hand a valid bridge token to any attacker URL.
+    bool returnAllowed(const std::string& url) {
+        for (auto& p : webdav::splitString(cfg_.oauth_return_allowlist, ',')) {
+            std::string pre = webdav::trim(p);
+            if (!pre.empty() && url.rfind(pre, 0) == 0) return true;
+        }
+        return false;
+    }
+
+    void oauthStart(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
+        const OAuthProviderConfig* cfg = oauth_ ? oauth_->get(provider) : nullptr;
+        if (!cfg) return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"unknown provider"})");
+
+        std::string return_to;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "return_to") return_to = kv.second;
+        }
+        if (return_to.empty()) {  // default to the first configured prefix
+            auto prefixes = webdav::splitString(cfg_.oauth_return_allowlist, ',');
+            if (!prefixes.empty()) return_to = webdav::trim(prefixes[0]);
+        }
+        if (return_to.empty() || !returnAllowed(return_to)) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"return_to not allowed"})");
+        }
+
+        std::string verifier = randomCodeVerifier();
+        std::string challenge = pkceChallengeS256(verifier);
+
+        OAuthState st;
+        st.provider = provider;
+        st.code_verifier = verifier;
+        st.tenant = resolveTenant(req);
+        st.return_to = return_to;
+        std::string state = oauth_states_->create(std::move(st));
+
+        resp.redirect(oauth_->buildAuthorizeUrl(*cfg, state, challenge), HTTPResponse::HTTP_FOUND);
+    }
+
+    void oauthCallback(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
+        std::string code, state, idp_error;
+        for (const auto& kv : Poco::URI(req.getURI()).getQueryParameters()) {
+            if (kv.first == "code") code = kv.second;
+            else if (kv.first == "state") state = kv.second;
+            else if (kv.first == "error") idp_error = kv.second;
+        }
+
+        // state is the CSRF + replay + binding token; consume it exactly once.
+        OAuthState st;
+        if (state.empty() || !oauth_states_->consume(state, st)) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"invalid or expired state"})");
+        }
+        if (st.provider != provider) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"provider mismatch"})");
+        }
+        if (!idp_error.empty() || code.empty()) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"authorization denied"})");
+        }
+
+        const OAuthProviderConfig* cfg = oauth_->get(provider);
+        if (!cfg) return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"unknown provider"})");
+
+        std::string access_token, err;
+        if (!oauth_->exchangeCode(*cfg, code, st.code_verifier, access_token, err)) {
+            webdav::warnLog("oauth: code exchange failed for '" + provider + "': " + err);
+            return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"token exchange failed"})");
+        }
+
+        VerifiedIdentity vid;
+        if (!oauth_->fetchIdentity(*cfg, access_token, vid, err)) {
+            webdav::warnLog("oauth: identity fetch failed for '" + provider + "': " + err);
+            return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"identity lookup failed"})");
+        }
+        if (!vid.email_verified) {
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"email not verified by provider"})");
+        }
+
+        // Map the verified email to the LDAP identity so OAuth and Basic logins
+        // resolve to the same uid/roles for gRPC ACL purposes.
+        webdav::UserInfo info = ldap_->getUserInfoByEmail(vid.email);
+        if (!info.authenticated || info.user_id.empty()) {
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"no matching user"})");
+        }
+
+        std::string token = tokens_->issue(info.user_id, st.tenant, info.roles);
+
+        // Token returned in the URL fragment (not the query) so it is not sent to
+        // the SPA's server or leaked via Referer. The SPA scrubs it from history.
+        std::string sep = st.return_to.find('#') == std::string::npos ? "#" : "&";
+        std::string location = st.return_to + sep + "token=" + webdav::urlEncode(token) +
+                               "&token_type=Bearer&expires_in=" + std::to_string(tokens_->ttl());
+        resp.redirect(location, HTTPResponse::HTTP_FOUND);
+    }
+
     // Authenticate via a cached Bearer token (no LDAP) or HTTP Basic (LDAP).
     bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
         std::string h = req.get("Authorization", "");
@@ -793,6 +1063,13 @@ private:
             out.user = s.user;
             out.tenant = s.tenant;
             out.roles = s.roles;
+            // Per-request tenant selection: an X-Tenant header overrides the
+            // tenant bound to the token at issue time, letting a single session
+            // operate across the tenants it can access without re-authenticating.
+            // The core still enforces ACLs, so a tenant the user cannot reach
+            // simply yields permission errors / empty listings.
+            std::string xt = req.get("X-Tenant", "");
+            if (!xt.empty()) out.tenant = xt;
             return true;
         }
         return authenticateBasic(req, out);
@@ -853,6 +1130,38 @@ private:
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
+    // RFC 7662-style token introspection. The request already passed
+    // authenticate(), so reaching here means the bearer token is valid; reply
+    // with active=true and the resolved identity (honoring X-Tenant). Invalid
+    // tokens are rejected upstream with 401. Downstream services call this to
+    // accept a bridge token without re-authenticating the user themselves.
+    void introspect(HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string body = "{\"active\":true,\"user\":\"" + jsonEscape(id.user) +
+                           "\",\"tenant\":\"" + jsonEscape(id.tenant) +
+                           "\",\"roles\":" + jsonArray(id.roles) + "}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
+    // The tenants the authenticated user can operate in (from LDAP group
+    // membership), plus the tenant active on this request so the caller can
+    // present a selector with the current choice highlighted. Always includes at
+    // least the active tenant; falls back to "default" if nothing resolves.
+    void listTenants(HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::vector<std::string> tenants = ldap_->getTenantsForUser(id.user);
+        if (!id.tenant.empty() &&
+            std::find(tenants.begin(), tenants.end(), id.tenant) == tenants.end()) {
+            tenants.push_back(id.tenant);
+        }
+        if (tenants.empty()) tenants.push_back("default");
+        std::sort(tenants.begin(), tenants.end());
+        tenants.erase(std::unique(tenants.begin(), tenants.end()), tenants.end());
+
+        std::string current = id.tenant.empty() ? "default" : id.tenant;
+        std::string body = "{\"tenants\":" + jsonArray(tenants) +
+                           ",\"current\":\"" + jsonEscape(current) + "\"}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
     // Liveness: the process is up and serving.
     void healthz(HTTPServerResponse& resp) {
         sendJson(resp, HTTPResponse::HTTP_OK, R"({"status":"ok"})");
@@ -881,6 +1190,8 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {
@@ -888,11 +1199,14 @@ public:
     HandlerFactory(Config cfg,
                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
-                   std::shared_ptr<TokenStore> tokens)
-        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)) {}
+                   std::shared_ptr<TokenStore> tokens,
+                   std::shared_ptr<OAuthProvider> oauth,
+                   std::shared_ptr<OAuthStateStore> oauth_states)
+        : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new RequestHandler(cfg_, grpc_, ldap_, tokens_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_);
     }
 
 private:
@@ -900,6 +1214,8 @@ private:
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
+    std::shared_ptr<OAuthProvider> oauth_;
+    std::shared_ptr<OAuthStateStore> oauth_states_;
 };
 
 }  // namespace
@@ -908,27 +1224,111 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
                                    std::shared_ptr<webdav::GRPCClientWrapper> grpc,
                                    std::shared_ptr<webdav::LDAPAuthenticator> ldap)
     : cfg_(cfg), grpc_(std::move(grpc)), ldap_(std::move(ldap)),
-      tokens_(std::make_shared<TokenStore>(cfg.token_ttl)) {}
+      tokens_(std::make_shared<TokenStore>(cfg.token_ttl)),
+      oauth_(std::make_shared<OAuthProvider>(OAuthProvider::fromEnv(cfg.oauth_redirect_base))),
+      oauth_states_(std::make_shared<OAuthStateStore>(cfg.oauth_state_ttl)) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
+// ---- Monitoring / reporting API (consistent across the HTTP services) --------
+namespace {
+std::string poolFields(Poco::ThreadPool& pool, int maxQueued) {
+    return std::string("\"pool\":{\"capacity\":") + std::to_string(pool.capacity()) +
+           ",\"used\":" + std::to_string(pool.used()) +
+           ",\"available\":" + std::to_string(pool.available()) +
+           ",\"max_queued\":" + std::to_string(maxQueued) + "}";
+}
+
+// Served on the reporter's own held-back thread, so these answer even when every
+// worker thread is mid-transfer. /healthz = liveness; /readyz = has free worker
+// capacity (503 when saturated → LB drains this instance); /poolz = live usage.
+class MonitorHandler : public HTTPRequestHandler {
+public:
+    MonitorHandler(Poco::ThreadPool* pool, int maxQueued, std::string service)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
+        const std::string path = req.getURI();
+        const bool hasCapacity = pool_->available() > 0;
+        if (path == "/healthz") {
+            sendJson(resp, HTTPResponse::HTTP_OK,
+                     std::string("{\"status\":\"ok\",\"service\":\"") + service_ + "\"}");
+        } else if (path == "/readyz") {
+            sendJson(resp, hasCapacity ? HTTPResponse::HTTP_OK : HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                     std::string("{\"ready\":") + (hasCapacity ? "true" : "false") +
+                     "," + poolFields(*pool_, maxQueued_) + "}");
+        } else if (path == "/poolz") {
+            sendJson(resp, HTTPResponse::HTTP_OK,
+                     std::string("{") + poolFields(*pool_, maxQueued_) +
+                     ",\"saturated\":" + (hasCapacity ? "false" : "true") + "}");
+        } else {
+            sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+    }
+private:
+    Poco::ThreadPool* pool_;
+    int maxQueued_;
+    std::string service_;
+};
+
+class MonitorHandlerFactory : public HTTPRequestHandlerFactory {
+public:
+    MonitorHandlerFactory(Poco::ThreadPool* pool, int maxQueued, std::string service)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
+        return new MonitorHandler(pool_, maxQueued_, service_);
+    }
+private:
+    Poco::ThreadPool* pool_;
+    int maxQueued_;
+    std::string service_;
+};
+}  // namespace
+
 void HttpBridgeServer::start() {
+    const int threads = cfg_.thread_pool > 0 ? cfg_.thread_pool : 16;
+
     auto params = new Poco::Net::HTTPServerParams;
-    params->setMaxThreads(cfg_.thread_pool);
-    params->setMaxQueued(cfg_.thread_pool * 8);
+    params->setMaxThreads(threads);
+    params->setMaxQueued(threads * 8);
     params->setKeepAlive(true);
+
+    // Use a *dedicated* pool sized to `threads` rather than Poco's shared
+    // defaultPool() (capacity 16) — otherwise setMaxThreads is silently capped at
+    // 16 and HTTP_THREAD_POOL above 16 has no effect. Each long-lived transfer
+    // pins one of these threads for its duration, so this is the real concurrency.
+    pool_ = std::make_unique<Poco::ThreadPool>(
+        std::min(2, threads), threads, 60 /* idle seconds */);
 
     Poco::Net::ServerSocket socket(
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_), socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_), *pool_, socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");
+
+    // Dedicated reporter: a single held-back thread + listener so pool usage /
+    // health stay answerable for the load balancer even at full saturation.
+    monitor_pool_ = std::make_unique<Poco::ThreadPool>(1, 1, 60);
+    auto mparams = new Poco::Net::HTTPServerParams;
+    mparams->setMaxThreads(1);
+    mparams->setMaxQueued(64);
+    mparams->setKeepAlive(false);  // free the reporter thread after each response
+    Poco::Net::ServerSocket msocket(
+        Poco::Net::SocketAddress(cfg_.monitoring_host, static_cast<Poco::UInt16>(cfg_.monitoring_port)));
+    monitor_server_ = std::make_unique<Poco::Net::HTTPServer>(
+        new MonitorHandlerFactory(pool_.get(), threads * 8, "http_bridge"), *monitor_pool_, msocket, mparams);
+    monitor_server_->start();
+    webdav::infoLog("HTTP bridge monitoring (/healthz /readyz /poolz) listening on " +
+                    cfg_.monitoring_host + ":" + std::to_string(cfg_.monitoring_port));
 }
 
 void HttpBridgeServer::stop() {
+    if (monitor_server_) {
+        monitor_server_->stop();
+        monitor_server_.reset();
+    }
     if (server_) {
         server_->stop();
         server_.reset();

@@ -1,0 +1,14 @@
+fileengine-http-bridge (1.1.0-1) unstable; urgency=low
+
+  * Sync fileservice.proto to the canonical schema: adds the CULL_VERSIONS
+    permission and the GetEffectivePermissions/GetResourceAcls/ListClaims RPCs.
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Fri, 26 Jun 2026 00:00:00 +0000
+
+fileengine-http-bridge (1.0.0-1) unstable; urgency=low
+
+  * Initial Debian packaging: fileengine-http-bridge daemon, systemd unit
+    (DynamicUser), and default environment file at
+    /etc/fileengine-http-bridge/bridge.env.
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Wed, 24 Jun 2026 12:00:00 +0000

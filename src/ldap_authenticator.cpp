@@ -16,17 +16,68 @@ LDAPAuthenticator::LDAPAuthenticator(
     const std::string& bind_dn,
     const std::string& bind_password,
     const std::string& tenant_base,
-    const std::string& user_base)
+    const std::string& user_base,
+    const std::string& replica_endpoint,
+    double failover_cooldown_s)
     : ldap_endpoint_(ldap_endpoint),
       ldap_domain_(ldap_domain),
       bind_dn_(bind_dn),
       bind_password_(bind_password),
       tenant_base_(tenant_base.empty() ? ldap_domain : tenant_base),
-      user_base_(user_base.empty() ? ldap_domain : user_base) {
+      user_base_(user_base.empty() ? ldap_domain : user_base),
+      replica_endpoint_(replica_endpoint),
+      breaker_(failover_cooldown_s) {
 }
 
 LDAPAuthenticator::~LDAPAuthenticator() {
 }
+
+namespace {
+
+// RFC 4515 filter-value escaping. Login names (uid or email) are user-supplied,
+// so they must never be concatenated raw into a search filter (LDAP injection).
+std::string escapeLdapFilterValue(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        switch (c) {
+            case '*':  out += "\\2a"; break;
+            case '(':  out += "\\28"; break;
+            case ')':  out += "\\29"; break;
+            case '\\': out += "\\5c"; break;
+            case '\0': out += "\\00"; break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+// Pull the uid out of a DN like "uid=alice,ou=users,...". Empty if absent.
+std::string uidFromDN(const std::string& dn) {
+    size_t pos = dn.find("uid=");
+    if (pos == std::string::npos) return "";
+    pos += 4;
+    size_t end = dn.find(',', pos);
+    return dn.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+// Given a group DN that sits under the tenant base, return the tenant it belongs
+// to: the ou= component immediately above the tenant base. For example, with a
+// tenant_base of "ou=tenants,dc=example,dc=com" and a group DN of
+// "cn=administrators,ou=acme,ou=tenants,dc=example,dc=com" this returns "acme".
+// Empty if the DN is not under the tenant base.
+std::string tenantFromGroupDN(const std::string& dn, const std::string& tenant_base) {
+    if (tenant_base.empty()) return "";
+    std::string suffix = "," + tenant_base;
+    size_t pos = dn.find(suffix);
+    if (pos == std::string::npos) return "";
+    std::string head = dn.substr(0, pos);  // e.g. "cn=administrators,ou=acme"
+    size_t oupos = head.rfind("ou=");
+    if (oupos == std::string::npos) return "";
+    return head.substr(oupos + 3);
+}
+
+}  // namespace
 
 UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const std::string& password) {
     std::lock_guard<std::mutex> lock(ldap_mutex_);
@@ -42,8 +93,10 @@ UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const 
     std::string user_dn;
     LDAPMessage* result = nullptr;
 
-    // Search for the user's DN
-    std::string search_filter = "(uid=" + username + ")";
+    // Search for the user's DN by EITHER their uid or their email address, so
+    // the login form accepts either form of identifier.
+    std::string esc = escapeLdapFilterValue(username);
+    std::string search_filter = "(|(uid=" + esc + ")(mail=" + esc + "))";
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Searching for user with base: " + user_base_ + " and filter: " + search_filter);
 
     int ldap_result = ldap_search_s(
@@ -118,7 +171,17 @@ UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const 
     // We need to search for the user again to get their roles
     UserInfo user_info;
     user_info.dn = user_dn;
-    user_info.user_id = username;
+    // The login name may have been an email; resolve the canonical uid from the
+    // matched entry so the gRPC identity is the uid regardless of login form.
+    std::string resolved_uid;
+    berval** uid_vals = ldap_get_values_len(ld, entry, "uid");
+    if (uid_vals) {
+        if (uid_vals[0]) resolved_uid.assign(uid_vals[0]->bv_val, uid_vals[0]->bv_len);
+        ldap_value_free_len(uid_vals);
+    }
+    if (resolved_uid.empty()) resolved_uid = uidFromDN(user_dn);
+    if (resolved_uid.empty()) resolved_uid = username;
+    user_info.user_id = resolved_uid;
     user_info.tenant = extractTenantFromUserDN(user_dn);
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Extracting roles for user from groups...");
 
@@ -225,10 +288,30 @@ UserInfo LDAPAuthenticator::getUserInfo(const std::string& username) {
 }
 
 LDAP* LDAPAuthenticator::connectToLDAP() {
+    // No replica configured -> master only (unchanged behavior).
+    if (replica_endpoint_.empty()) {
+        return connectToEndpoint(ldap_endpoint_);
+    }
+    // Master-preferred with read-only replica fallback (REPLICATION_FAILOVER.md).
+    // Access to breaker_ is serialized by ldap_mutex_ (held by the public callers).
+    if (breaker_.shouldTryPrimary()) {
+        LDAP* ld = connectToEndpoint(ldap_endpoint_);
+        if (ld) {
+            breaker_.reset();
+            return ld;
+        }
+        breaker_.trip();
+        std::cerr << "LDAP master unreachable; failing over to read-only replica: "
+                  << replica_endpoint_ << std::endl;
+    }
+    return connectToEndpoint(replica_endpoint_);
+}
+
+LDAP* LDAPAuthenticator::connectToEndpoint(const std::string& endpoint) {
     LDAP* ld = nullptr;
     int version = LDAP_VERSION3;
 
-    int rc = ldap_initialize(&ld, ldap_endpoint_.c_str());
+    int rc = ldap_initialize(&ld, endpoint.c_str());
     if (rc != LDAP_SUCCESS) {
         std::cerr << "Failed to initialize LDAP connection: " << ldap_err2string(rc) << std::endl;
         return nullptr;
@@ -261,10 +344,14 @@ LDAP* LDAPAuthenticator::connectToLDAP() {
 }
 
 UserInfo LDAPAuthenticator::searchUser(LDAP* ld, const std::string& username) {
-    std::string search_filter = "(uid=" + username + ")";
+    return searchUserByFilter(ld, "(uid=" + escapeLdapFilterValue(username) + ")", username);
+}
+
+UserInfo LDAPAuthenticator::searchUserByFilter(LDAP* ld, const std::string& search_filter,
+                                               const std::string& display_id) {
     LDAPMessage* result = nullptr;
 
-    std::cout << "[DEBUG] Searching for user with base: " << user_base_ << " and filter: " << search_filter << std::endl;
+    webdav::debugLog("LDAPAuthenticator::searchUserByFilter: base: " + user_base_ + " filter: " + search_filter);
 
     int ldap_result = ldap_search_s(
         ld,
@@ -277,39 +364,50 @@ UserInfo LDAPAuthenticator::searchUser(LDAP* ld, const std::string& username) {
     );
 
     if (ldap_result != LDAP_SUCCESS) {
-        std::cerr << "[ERROR] User search failed: " << ldap_err2string(ldap_result) << std::endl;
-        std::cerr << "[ERROR] Search base: " << user_base_ << ", Filter: " << search_filter << std::endl;
+        webdav::errorLog("LDAPAuthenticator::searchUserByFilter: search failed: " + std::string(ldap_err2string(ldap_result)));
         return { "", "", {}, "", false };
     }
 
     int count = ldap_count_entries(ld, result);
     if (count != 1) {
-        std::cerr << "[ERROR] User not found or multiple entries found (count: " << count << ")" << std::endl;
+        webdav::errorLog("LDAPAuthenticator::searchUserByFilter: user '" + display_id +
+                         "' not found or ambiguous (count: " + std::to_string(count) + ")");
         ldap_msgfree(result);
         return { "", "", {}, "", false };
     }
 
     LDAPMessage* entry = ldap_first_entry(ld, result);
     if (!entry) {
-        std::cerr << "[ERROR] Failed to get LDAP entry" << std::endl;
+        webdav::errorLog("LDAPAuthenticator::searchUserByFilter: failed to get LDAP entry");
         ldap_msgfree(result);
         return { "", "", {}, "", false };
     }
 
     char* dn = ldap_get_dn(ld, entry);
     if (!dn) {
-        std::cerr << "[ERROR] Failed to get DN" << std::endl;
+        webdav::errorLog("LDAPAuthenticator::searchUserByFilter: failed to get DN");
         ldap_msgfree(result);
         return { "", "", {}, "", false };
     }
 
     UserInfo user_info;
     user_info.dn = std::string(dn);
-    user_info.user_id = username;
+
+    // The real uid must be the gRPC identity, not the lookup key (which may be an
+    // email). Prefer the uid attribute, fall back to the DN, then display_id.
+    std::string uid;
+    berval** uid_vals = ldap_get_values_len(ld, entry, "uid");
+    if (uid_vals != nullptr) {
+        if (uid_vals[0] != nullptr) uid.assign(uid_vals[0]->bv_val, uid_vals[0]->bv_len);
+        ldap_value_free_len(uid_vals);
+    }
+    if (uid.empty()) uid = uidFromDN(user_info.dn);
+    if (uid.empty()) uid = display_id;
+    user_info.user_id = uid;
     user_info.tenant = extractTenantFromUserDN(user_info.dn);
 
-    std::cout << "[DEBUG] Found user: " << user_info.user_id << " with DN: " << user_info.dn << std::endl;
-    std::cout << "[DEBUG] Extracting roles for user from groups..." << std::endl;
+    webdav::debugLog("LDAPAuthenticator::searchUserByFilter: found uid '" + user_info.user_id +
+                     "' DN '" + user_info.dn + "'");
 
     // Extract roles from groups the user belongs to
     user_info.roles = extractRolesFromGroups(ld, user_info.dn);
@@ -318,12 +416,156 @@ UserInfo LDAPAuthenticator::searchUser(LDAP* ld, const std::string& username) {
     ldap_memfree(dn);
     ldap_msgfree(result);
 
-    std::cout << "[DEBUG] User roles extracted: " << user_info.roles.size() << " roles" << std::endl;
-    for (size_t i = 0; i < user_info.roles.size(); ++i) {
-        std::cout << "[DEBUG]   Role " << i+1 << ": " << user_info.roles[i] << std::endl;
+    return user_info;
+}
+
+UserInfo LDAPAuthenticator::getUserInfoByEmail(const std::string& email) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::getUserInfoByEmail: failed to connect to LDAP");
+        return { "", "", {}, "", false };
     }
 
+    UserInfo user_info = searchUserByFilter(ld, "(mail=" + escapeLdapFilterValue(email) + ")", email);
+    user_info.authenticated = !user_info.user_id.empty();
+
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
     return user_info;
+}
+
+std::vector<std::string> LDAPAuthenticator::getTenantsForUser(const std::string& username) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+    webdav::debugLog("LDAPAuthenticator::getTenantsForUser: resolving tenants for user: " + username);
+
+    std::vector<std::string> tenants;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: failed to connect to LDAP");
+        return tenants;
+    }
+
+    // 1. Resolve the user's DN (accept either uid or email as the login name).
+    std::string esc = escapeLdapFilterValue(username);
+    std::string user_filter = "(|(uid=" + esc + ")(mail=" + esc + "))";
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, user_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                           user_filter.c_str(), nullptr, false, &result);
+    if (rc != LDAP_SUCCESS || ldap_count_entries(ld, result) != 1) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: user not found or ambiguous: " + username);
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return tenants;
+    }
+
+    LDAPMessage* entry = ldap_first_entry(ld, result);
+    char* dn = entry ? ldap_get_dn(ld, entry) : nullptr;
+    std::string user_dn = dn ? std::string(dn) : "";
+    std::string uid = uidFromDN(user_dn);
+    if (dn) ldap_memfree(dn);
+    ldap_msgfree(result);
+    result = nullptr;
+
+    if (user_dn.empty()) {
+        webdav::errorLog("LDAPAuthenticator::getTenantsForUser: could not resolve DN for user: " + username);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return tenants;
+    }
+
+    // 2. Find every group under the tenant base the user is a member of, and map
+    // each matched group DN back to its owning tenant. The DN is LDAP-sourced
+    // (not user input), so it is safe to embed directly in the filter.
+    std::string member_filter = "(|(member=" + user_dn + ")(uniqueMember=" + user_dn + ")"
+                                "(memberUid=" + (uid.empty() ? username : uid) + "))";
+    rc = ldap_search_s(ld, tenant_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                       member_filter.c_str(), nullptr, false, &result);
+    if (rc == LDAP_SUCCESS) {
+        for (LDAPMessage* e = ldap_first_entry(ld, result); e != nullptr; e = ldap_next_entry(ld, e)) {
+            char* gdn = ldap_get_dn(ld, e);
+            if (!gdn) continue;
+            std::string tenant = tenantFromGroupDN(std::string(gdn), tenant_base_);
+            ldap_memfree(gdn);
+            if (tenant.empty()) continue;
+            if (std::find(tenants.begin(), tenants.end(), tenant) == tenants.end()) {
+                tenants.push_back(tenant);
+            }
+        }
+        ldap_msgfree(result);
+    } else {
+        webdav::debugLog("LDAPAuthenticator::getTenantsForUser: tenant group search failed: " +
+                         std::string(ldap_err2string(rc)));
+        if (result) ldap_msgfree(result);
+    }
+
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    std::sort(tenants.begin(), tenants.end());
+    webdav::debugLog("LDAPAuthenticator::getTenantsForUser: found " + std::to_string(tenants.size()) +
+                     " tenant(s) for user: " + username);
+    return tenants;
+}
+
+std::vector<std::string> LDAPAuthenticator::searchUsers(const std::string& prefix, int limit) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+
+    // Cap the result set so an empty/short prefix can't drag the whole directory
+    // across the wire. The caller's limit narrows it further.
+    const int kMaxResults = 50;
+    int cap = (limit > 0 && limit < kMaxResults) ? limit : kMaxResults;
+
+    std::vector<std::string> uids;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::searchUsers: failed to connect to LDAP");
+        return uids;
+    }
+
+    // Prefix (substring-initial) match across uid, cn, and mail. The prefix is
+    // escaped, then a single trailing '*' is appended so it stays a prefix match
+    // and the user can't inject their own wildcards.
+    std::string esc = escapeLdapFilterValue(prefix);
+    std::string filter = "(&(objectClass=person)(|(uid=" + esc + "*)(cn=" + esc +
+                         "*)(mail=" + esc + "*)))";
+    webdav::debugLog("LDAPAuthenticator::searchUsers: base: " + user_base_ + " filter: " + filter);
+
+    const char* attrs[] = {"uid", nullptr};
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, user_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                           filter.c_str(), const_cast<char**>(attrs), false, &result);
+    if (rc != LDAP_SUCCESS) {
+        webdav::errorLog("LDAPAuthenticator::searchUsers: search failed: " +
+                         std::string(ldap_err2string(rc)));
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return uids;
+    }
+
+    for (LDAPMessage* e = ldap_first_entry(ld, result);
+         e != nullptr && static_cast<int>(uids.size()) < cap;
+         e = ldap_next_entry(ld, e)) {
+        std::string uid;
+        berval** vals = ldap_get_values_len(ld, e, "uid");
+        if (vals != nullptr) {
+            if (vals[0] != nullptr) uid.assign(vals[0]->bv_val, vals[0]->bv_len);
+            ldap_value_free_len(vals);
+        }
+        if (uid.empty()) {
+            char* dn = ldap_get_dn(ld, e);
+            if (dn) { uid = uidFromDN(std::string(dn)); ldap_memfree(dn); }
+        }
+        if (uid.empty()) continue;
+        if (std::find(uids.begin(), uids.end(), uid) == uids.end()) uids.push_back(uid);
+    }
+    ldap_msgfree(result);
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    std::sort(uids.begin(), uids.end());
+    webdav::debugLog("LDAPAuthenticator::searchUsers: found " + std::to_string(uids.size()) +
+                     " user(s) for prefix: '" + prefix + "'");
+    return uids;
 }
 
 std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_dn) {

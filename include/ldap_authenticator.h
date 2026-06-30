@@ -7,6 +7,8 @@
 #include <memory>
 #include <mutex>
 
+#include "circuit_breaker.h"
+
 namespace webdav {
 
 struct UserInfo {
@@ -25,7 +27,12 @@ public:
         const std::string& bind_dn,
         const std::string& bind_password,
         const std::string& tenant_base = "",
-        const std::string& user_base = ""
+        const std::string& user_base = "",
+        // Read-only replica directory for disconnect fault tolerance
+        // (REPLICATION_FAILOVER.md). Empty disables failover. When the master is
+        // unreachable, auth (read-only) fails over to this replica.
+        const std::string& replica_endpoint = "",
+        double failover_cooldown_s = 30.0
     );
     
     ~LDAPAuthenticator();
@@ -40,7 +47,26 @@ public:
     
     // Get user information without authenticating (for already authenticated users)
     UserInfo getUserInfo(const std::string& username);
-    
+
+    // Resolve a user already authenticated by an external IdP (OAuth/OIDC) from
+    // their email address. Returns the LDAP-resolved identity (real uid + roles)
+    // so an OAuth login maps to exactly the same gRPC identity as a Basic login.
+    // `authenticated` is false if no single matching entry exists.
+    UserInfo getUserInfoByEmail(const std::string& email);
+
+    // Enumerate the tenants a user has access to. A user has access to a tenant
+    // when they are a member of any group under that tenant's subtree
+    // (ou=<tenant>,<tenant_base>). Returns the sorted, de-duplicated tenant
+    // names; empty if the user or their memberships cannot be resolved.
+    std::vector<std::string> getTenantsForUser(const std::string& username);
+
+    // Type-ahead user search for the ACL editor. Returns up to `limit` distinct
+    // uids whose uid, cn, or mail begins with `prefix` (LDAP substring matching
+    // is case-insensitive for these attributes). `prefix` is escaped, so raw
+    // user input is safe. An empty prefix returns the first `limit` users. A
+    // limit <= 0 applies a sane internal cap.
+    std::vector<std::string> searchUsers(const std::string& prefix, int limit);
+
 private:
     std::string ldap_endpoint_;
     std::string ldap_domain_;
@@ -48,13 +74,23 @@ private:
     std::string bind_password_;
     std::string tenant_base_;
     std::string user_base_;
+    std::string replica_endpoint_;       // empty => failover disabled
+    CircuitBreaker breaker_;             // master availability (guarded by ldap_mutex_)
 
     mutable std::mutex ldap_mutex_;  // Protect LDAP operations
-    
-    // Helper function to connect to LDAP server
+
+    // Connect to the master, or fail over to the read-only replica when the master
+    // is unreachable (master-only when no replica is configured).
     LDAP* connectToLDAP();
+
+    // Bind a service connection to a specific endpoint; nullptr on failure.
+    LDAP* connectToEndpoint(const std::string& endpoint);
     
-    // Helper function to search for a user
+    // Helper function to search for a user by an arbitrary filter. `display_id`
+    // is used only for logging; the real uid is read from the matched entry.
+    UserInfo searchUserByFilter(LDAP* ld, const std::string& filter, const std::string& display_id);
+
+    // Helper function to search for a user by uid.
     UserInfo searchUser(LDAP* ld, const std::string& username);
     
     // Helper function to extract tenant from user's DN

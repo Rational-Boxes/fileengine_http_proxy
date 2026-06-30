@@ -3,9 +3,17 @@
 # Assumes the service is already running (default http://localhost:8090) and a
 # live FileEngine gRPC core + LDAP directory are reachable.
 #
-# Usage: BASE=http://localhost:8090 ./tests/test_e2e.sh
+# Usage: BASE=http://localhost:8090 \
+#        FE_USER=<login> FE_PASS=<password> [FE_EXPECT_USER=<resolved uid>] \
+#        ./tests/test_e2e.sh
+# Credentials/identity are configurable so the suite runs against any directory
+# (defaults match a testuser:password fixture).
 
 BASE="${BASE:-http://localhost:8090}"
+CRED="${FE_USER:-testuser}:${FE_PASS:-password}"
+WRONG="${FE_USER:-testuser}:wrongpass-nope"
+EXPECT_USER="${FE_EXPECT_USER:-${FE_USER:-testuser}}"
+CORS_ORIGIN="${FE_CORS_ORIGIN:-https://app.example.com}"   # must match the bridge's HTTP_CORS_ORIGIN
 PASS=0; FAIL=0; FAILED=()
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -25,24 +33,30 @@ echo "[auth]"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "whoami without creds -> 401" || bad "whoami without creds -> 401" "got $code"
 
-out=$(curl -s -u testuser:password "$BASE/v1/whoami")
-grep -q '"user":"testuser"' <<<"$out" && ok "whoami authenticates testuser (LDAP)" || bad "whoami testuser" "$out"
+out=$(curl -s -u "$CRED" "$BASE/v1/whoami")
+grep -q "\"user\":\"$EXPECT_USER\"" <<<"$out" && ok "whoami authenticates testuser (LDAP)" || bad "whoami testuser" "$out"
 grep -q '"tenant":"default"' <<<"$out" && ok "default tenant (non-subdomain)" || bad "default tenant" "$out"
 grep -q 'system_admin' <<<"$out" && ok "administrators group -> system_admin role" || bad "system_admin role" "$out"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -u testuser:wrongpass "$BASE/v1/whoami")
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WRONG" "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "wrong password -> 401" || bad "wrong password -> 401" "got $code"
 
-out=$(curl -s -u testuser:password -H 'X-Tenant: acme' "$BASE/v1/whoami")
+out=$(curl -s -u "$CRED" -H 'X-Tenant: acme' "$BASE/v1/whoami")
 grep -q '"tenant":"acme"' <<<"$out" && ok "X-Tenant header overrides tenant" || bad "X-Tenant override" "$out"
 
 # ---- token auth ----
 echo "[token auth]"
-out=$(curl -s -u testuser:password -X POST "$BASE/v1/auth/token")
+out=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
 TOKEN=$(grep -oE '"token":"[a-f0-9]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
 [ -n "$TOKEN" ] && ok "POST /v1/auth/token issues token" || bad "issue token" "$out"
 grep -q '"token_type":"Bearer"' <<<"$out" && ok "token_type Bearer + expires_in" || bad "token_type" "$out"
-grep -q '"user":"testuser"' <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")" && ok "Bearer token authenticates (no LDAP)" || bad "bearer auth"
+grep -q "\"user\":\"$EXPECT_USER\"" <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")" && ok "Bearer token authenticates (no LDAP)" || bad "bearer auth"
+# token introspection (consumed by downstream services for auth coordination)
+intro=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/introspect")
+{ grep -q '"active":true' <<<"$intro" && grep -q "\"user\":\"$EXPECT_USER\"" <<<"$intro"; } \
+  && ok "GET /v1/auth/introspect -> active + identity" || bad "introspect" "$intro"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/auth/introspect")
+[ "$code" = "401" ] && ok "introspect bogus token -> 401" || bad "introspect bogus" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "bogus bearer -> 401" || bad "bogus bearer" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/token")
@@ -54,7 +68,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" 
 echo "[filesystem]"
 ROOT="00000000-0000-0000-0000-000000000000"      # all-zeros UUID = root
 SUF="hb_$(date +%s)_$RANDOM"
-A=(-u testuser:password)
+A=(-u "$CRED")
 uidof() { grep -oE '"uid":"[a-f0-9-]+"' | head -1 | sed 's/.*"uid":"//;s/"//'; }
 
 out=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"$SUF\"}")
@@ -176,8 +190,34 @@ grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/perm
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r"}'
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r","effect":"deny"}'
 grep -q '"has_permission":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=erin&permission=r")" && ok "DENY overrides ALLOW" || bad "deny precedence"
+# list ACL entries (backs the ACL editor); principals are bare, type 1 = role, effect 1 = DENY
+acls=$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/acls")
+{ grep -q '"principal":"dave"' <<<"$acls" && grep -q "\"principal\":\"$ROLE\"" <<<"$acls" && grep -q '"type":1' <<<"$acls"; } \
+  && ok "GET /v1/nodes/{uid}/acls lists entries (user + role)" || bad "list acls" "$acls"
+grep -q '"effect":1' <<<"$acls" && ok "acls include DENY effect" || bad "acls deny effect" "$acls"
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"dave","permission":"r"}')
 [ "$code" = "204" ] && ok "DELETE revoke permission -> 204" || bad "revoke" "got $code"
+
+# ---- principals type-ahead (ACL editor) ----
+echo "[principals type-ahead]"
+# Seed a CLAIM-type ACL so the claim catalog has something to return.
+CLAIM="dept=eng_$(date +%s)"
+curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d "{\"principal\":\"claim:$CLAIM\",\"permission\":\"r\"}"
+out=$(curl -s "${A[@]}" "$BASE/v1/principals")
+{ grep -q '"roles"' <<<"$out" && grep -q '"claims"' <<<"$out" && grep -q '"users"' <<<"$out"; } \
+  && ok "GET /v1/principals returns roles+claims+users" || bad "principals shape" "$out"
+grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim")" \
+  && ok "claim catalog includes granted claim" || bad "claim catalog"
+grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=dept=")" \
+  && ok "claim prefix filter matches" || bad "claim prefix match"
+! grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=zzz_nomatch")" \
+  && ok "claim prefix filter excludes non-matches" || bad "claim prefix exclude"
+grep -q "$ROLE" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=role&q=hbrole_")" \
+  && ok "role type-ahead by prefix" || bad "role type-ahead"
+grep -q '"roles":\[\]' <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim")" \
+  && ok "types=claim yields empty roles array" || bad "types filter"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/principals")
+[ "$code" = "401" ] && ok "principals without creds -> 401" || bad "principals auth" "got $code"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/roles/$ROLE")
 [ "$code" = "204" ] && ok "DELETE /v1/roles/{role} -> 204" || bad "delete role" "got $code"
@@ -186,8 +226,8 @@ curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
 # ---- hardening ----
 echo "[hardening]"
 # scoped CORS (configured origin, never *)
-hdr=$(curl -s -D - -o /dev/null -X OPTIONS -H 'Origin: https://app.example.com' "$BASE/v1/whoami")
-grep -qi 'access-control-allow-origin: https://app.example.com' <<<"$hdr" && ok "CORS scoped origin header" || bad "CORS header" "$(grep -i access-control <<<"$hdr" | head -1)"
+hdr=$(curl -s -D - -o /dev/null -X OPTIONS -H "Origin: $CORS_ORIGIN" "$BASE/v1/whoami")
+grep -qi "access-control-allow-origin: $CORS_ORIGIN" <<<"$hdr" && ok "CORS scoped origin header" || bad "CORS header" "$(grep -i access-control <<<"$hdr" | head -1)"
 ! grep -qi 'access-control-allow-origin: \*' <<<"$hdr" && ok "CORS is not wildcard" || bad "CORS wildcard"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/v1/whoami")
 [ "$code" = "204" ] && ok "OPTIONS preflight -> 204" || bad "preflight" "got $code"

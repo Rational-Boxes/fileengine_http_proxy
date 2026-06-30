@@ -1,0 +1,4 @@
+usr/bin/fileengine-http-bridge
+lib/systemd/system/fileengine-http-bridge.service
+etc/fileengine-http-bridge/bridge.env
+usr/share/fileengine-http-bridge/openapi.yaml

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package fileengine_rpc;
 
+import "google/protobuf/empty.proto";
+
 // Service definition for the FileEngine virtual filesystem
 service FileService {
     // Directory operations
@@ -43,6 +45,8 @@ service FileService {
     rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
     rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
     rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+    rpc GetEffectivePermissions(GetEffectivePermissionsRequest) returns (GetEffectivePermissionsResponse);
+    rpc GetResourceAcls(GetResourceAclsRequest) returns (GetResourceAclsResponse);
 
     // Role management operations
     rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
@@ -52,6 +56,7 @@ service FileService {
     rpc GetRolesForUser(GetRolesForUserRequest) returns (GetRolesForUserResponse);
     rpc GetUsersForRole(GetUsersForRoleRequest) returns (GetUsersForRoleResponse);
     rpc GetAllRoles(GetAllRolesRequest) returns (GetAllRolesResponse);
+    rpc ListClaims(ListClaimsRequest) returns (ListClaimsResponse);
 
     // Streaming operations for large files
     rpc StreamFileUpload(stream PutFileRequest) returns (PutFileResponse);
@@ -80,6 +85,7 @@ message DirectoryEntry {
     int64 created_at = 5;         // Creation timestamp (UNIX epoch seconds)
     int64 modified_at = 6;        // Modification timestamp (UNIX epoch seconds)
     int32 version_count = 7;      // Number of versions for this file
+    int32 rendition_count = 8;    // Hidden child renditions (files only; 0 for dirs)
 }
 
 enum FileType {
@@ -100,6 +106,7 @@ enum Permission {
     EXECUTE = 8;           // Execute permission
     MANAGE_ACL = 9;        // Grant/revoke permissions on this resource (Phase 5)
     ACL_INHERIT = 10;      // Marks a rule for parent->child propagation (Phase 5)
+    CULL_VERSIONS = 11;    // Permanently purge old versions (destroy-data op; must be granted explicitly)
 }
 
 // Directory operations
@@ -229,6 +236,7 @@ message FileInfo {
     int64 created_at = 8;               // Creation timestamp
     int64 modified_at = 9;              // Modification timestamp
     string version = 10;                 // Current version timestamp
+    int32 rendition_count = 11;          // Hidden child renditions (files only; 0 for dirs)
 }
 
 message ExistsRequest {
@@ -402,6 +410,26 @@ message GrantPermissionRequest {
     AclEffect effect = 5;               // ALLOW (default) or DENY
 }
 
+// List all ACL entries on a resource (for an ACL editor). Requires MANAGE_ACL on
+// the resource.
+message GetResourceAclsRequest {
+    string resource_uid = 1;
+    AuthenticationContext auth = 2;
+}
+
+message AclEntryMessage {
+    string principal = 1;               // bare principal (role/claim prefixes stripped at store time)
+    int32 type = 2;                     // PrincipalType: 0 user, 1 role, 2 group, 3 other, 4 claim
+    int32 permissions = 3;              // permission bitmask
+    int32 effect = 4;                   // 0 = ALLOW, 1 = DENY
+}
+
+message GetResourceAclsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated AclEntryMessage acls = 3;
+}
+
 message GrantPermissionResponse {
     bool success = 1;
     string error = 2;
@@ -430,6 +458,21 @@ message CheckPermissionResponse {
     bool success = 1;
     string error = 2;
     bool has_permission = 3;            // Whether the user has the required permission
+}
+
+// Interrogate the full effective permission set for a principal on a resource,
+// in one call, without accessing the entity's contents. The principal is the
+// auth context's user + roles (set them to query an arbitrary principal).
+message GetEffectivePermissionsRequest {
+    string resource_uid = 1;            // Resource UUID to evaluate
+    AuthenticationContext auth = 2;     // Principal (user + roles) being evaluated
+}
+
+message GetEffectivePermissionsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated Permission permissions = 3; // Effective (granted) permissions
+    int32 permission_bits = 4;           // Raw effective bitmask (server-internal flags)
 }
 
 // Role management operations
@@ -505,6 +548,21 @@ message GetAllRolesResponse {
     bool success = 1;
     string error = 2;
     repeated string roles = 3;          // List of all roles
+}
+
+// Catalog the distinct CLAIM-type ACL principals already defined in the tenant
+// (the "key=value" strings on claim-based ACL rules), for an ACL editor's claim
+// type-ahead.
+message ListClaimsRequest {
+    AuthenticationContext auth = 1;
+    string prefix = 2;                  // optional case-insensitive prefix filter ("" = all)
+    int32 limit = 3;                    // optional cap on results (0 = no cap)
+}
+
+message ListClaimsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string claims = 3;         // distinct "key=value" claim principals used in ACLs
 }
 
 // Administrative operations
