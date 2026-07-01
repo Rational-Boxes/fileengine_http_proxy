@@ -87,6 +87,9 @@ message DirectoryEntry {
     int32 version_count = 7;      // Number of versions for this file
     int32 rendition_count = 8;    // Hidden child renditions (files only; 0 for dirs)
     bool deleted = 9;             // soft-deleted (only set by ListDirectoryWithDeleted)
+    string owner = 10;            // owning user (surfaced in listings)
+    string created_by = 11;       // creator = first revision author (else owner)
+    string modified_by = 12;      // latest reviser = last revision author (else owner)
 }
 
 enum FileType {

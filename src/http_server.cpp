@@ -404,7 +404,12 @@ private:
                     ",\"version_count\":" + std::to_string(e.version_count()) +
                     ",\"rendition_count\":" + std::to_string(e.rendition_count()) +
                     ",\"has_renditions\":" + (e.rendition_count() > 0 ? "true" : "false") +
-                    ",\"deleted\":" + (e.deleted() ? "true" : "false") + "}";
+                    ",\"deleted\":" + (e.deleted() ? "true" : "false") +
+                    ",\"created_at\":" + std::to_string(e.created_at()) +
+                    ",\"modified_at\":" + std::to_string(e.modified_at()) +
+                    ",\"owner\":\"" + jsonEscape(e.owner()) + "\"" +
+                    ",\"created_by\":\"" + jsonEscape(e.created_by()) + "\"" +
+                    ",\"modified_by\":\"" + jsonEscape(e.modified_by()) + "\"}";
         }
         body += "]}";
         return body;
@@ -734,12 +739,18 @@ private:
         rq.set_resource_uid(uid);
         rq.set_required_permission(coercePermission(qPerm));
         auto* a = rq.mutable_auth();
-        // Default to the requesting identity (user + roles + tenant) so the check
-        // reflects the caller's real permissions — including the system_admin
-        // bypass. ?user / ?roles override it to evaluate a different principal.
+        // Default to the requesting identity (user + roles + tenant) so a plain
+        // self-check reflects the caller's real permissions — including the
+        // system_admin bypass. But when impersonating a different principal via
+        // ?user, DO NOT inherit the caller's roles: use only ?roles (possibly
+        // empty), else the impersonated user would be evaluated with the caller's
+        // privileges (e.g. an admin's system_admin bypass).
         fillAuth(a, id);
-        if (!qUser.empty()) a->set_user(qUser);
-        if (!qRoles.empty()) {
+        if (!qUser.empty()) {
+            a->set_user(qUser);
+            a->clear_roles();  // impersonation: caller's roles must not leak
+            for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+        } else if (!qRoles.empty()) {
             a->clear_roles();
             for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
         }
