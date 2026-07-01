@@ -734,9 +734,15 @@ private:
         rq.set_resource_uid(uid);
         rq.set_required_permission(coercePermission(qPerm));
         auto* a = rq.mutable_auth();
-        a->set_user(qUser.empty() ? id.user : qUser);
-        a->set_tenant(id.tenant);
-        for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+        // Default to the requesting identity (user + roles + tenant) so the check
+        // reflects the caller's real permissions — including the system_admin
+        // bypass. ?user / ?roles override it to evaluate a different principal.
+        fillAuth(a, id);
+        if (!qUser.empty()) a->set_user(qUser);
+        if (!qRoles.empty()) {
+            a->clear_roles();
+            for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+        }
         auto r = grpc_->checkPermission(rq);
         if (!r.success()) return mapError(resp, r.error());
         sendJson(resp, HTTPResponse::HTTP_OK, std::string("{\"has_permission\":") + (r.has_permission() ? "true" : "false") + "}");

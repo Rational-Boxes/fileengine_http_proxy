@@ -186,6 +186,10 @@ grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/perm
 # role-based grant + role check
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d "{\"principal\":\"role:$ROLE\",\"permission\":\"r\"}"
 grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?user=carol&permission=r&roles=$ROLE")" && ok "GET check: carol(role) has READ" || bad "role check"
+# self-check defaults to the CALLER's own identity (user + roles): the admin holds
+# LIST_DELETED only via its system_admin role, so a no-user/no-roles check must use
+# the caller's roles and pass (regression: checkPerm previously dropped them).
+grep -q '"has_permission":true' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$GF/permissions?permission=l")" && ok "GET check defaults to caller roles (admin has LIST_DELETED)" || bad "self-role check"
 # deny precedence
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r"}'
 curl -s -o /dev/null "${A[@]}" -X POST "$BASE/v1/nodes/$GF/permissions" -d '{"principal":"erin","permission":"r","effect":"deny"}'
