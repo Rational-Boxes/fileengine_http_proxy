@@ -86,6 +86,7 @@ message DirectoryEntry {
     int64 modified_at = 6;        // Modification timestamp (UNIX epoch seconds)
     int32 version_count = 7;      // Number of versions for this file
     int32 rendition_count = 8;    // Hidden child renditions (files only; 0 for dirs)
+    bool deleted = 9;             // soft-deleted (only set by ListDirectoryWithDeleted)
 }
 
 enum FileType {

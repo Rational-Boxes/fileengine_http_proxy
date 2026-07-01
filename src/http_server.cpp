@@ -403,7 +403,8 @@ private:
                     "\",\"type\":\"" + fileTypeName(e.type()) + "\",\"size\":" + std::to_string(e.size()) +
                     ",\"version_count\":" + std::to_string(e.version_count()) +
                     ",\"rendition_count\":" + std::to_string(e.rendition_count()) +
-                    ",\"has_renditions\":" + (e.rendition_count() > 0 ? "true" : "false") + "}";
+                    ",\"has_renditions\":" + (e.rendition_count() > 0 ? "true" : "false") +
+                    ",\"deleted\":" + (e.deleted() ? "true" : "false") + "}";
         }
         body += "]}";
         return body;
