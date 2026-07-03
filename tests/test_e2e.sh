@@ -47,9 +47,12 @@ grep -q '"tenant":"acme"' <<<"$out" && ok "X-Tenant header overrides tenant" || 
 # ---- token auth ----
 echo "[token auth]"
 out=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
-TOKEN=$(grep -oE '"token":"[a-f0-9]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
+# The bearer token is a signed HS256 JWT (base64url segments, dot-separated).
+TOKEN=$(grep -oE '"token":"[^"]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
 [ -n "$TOKEN" ] && ok "POST /v1/auth/token issues token" || bad "issue token" "$out"
 grep -q '"token_type":"Bearer"' <<<"$out" && ok "token_type Bearer + expires_in" || bad "token_type" "$out"
+# Shape: a JWT is three dot-separated segments; the roles claim is a {tenant:[..]} map.
+[ "$(awk -F. '{print NF}' <<<"$TOKEN")" = "3" ] && ok "token is a 3-part JWT" || bad "jwt shape" "$TOKEN"
 grep -q "\"user\":\"$EXPECT_USER\"" <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")" && ok "Bearer token authenticates (no LDAP)" || bad "bearer auth"
 # token introspection (consumed by downstream services for auth coordination)
 intro=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/introspect")
@@ -59,10 +62,17 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeef
 [ "$code" = "401" ] && ok "introspect bogus token -> 401" || bad "introspect bogus" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer deadbeefbogus' "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "bogus bearer -> 401" || bad "bogus bearer" "got $code"
+# Periodic refresh: re-mint a fresh JWT from live LDAP using the current token.
+refr=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/refresh")
+NEWTOKEN=$(grep -oE '"token":"[^"]+"' <<<"$refr" | sed 's/.*"token":"//;s/"//')
+{ [ -n "$NEWTOKEN" ] && grep -q "\"user\":\"$EXPECT_USER\"" <<<"$(curl -s -H "Authorization: Bearer $NEWTOKEN" "$BASE/v1/whoami")"; } \
+  && ok "POST /v1/auth/refresh -> fresh usable JWT" || bad "refresh" "$refr"
+# Stateless JWT: DELETE is a no-op (logout is client-side); the token stays valid
+# until it expires (short TTL). Revocation is by expiry, not a server-side list.
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/token")
-[ "$code" = "204" ] && ok "DELETE /v1/auth/token (revoke) -> 204" || bad "revoke" "got $code"
+[ "$code" = "204" ] && ok "DELETE /v1/auth/token -> 204 (stateless no-op)" || bad "revoke" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")
-[ "$code" = "401" ] && ok "revoked token -> 401" || bad "revoked token" "got $code"
+[ "$code" = "200" ] && ok "stateless token still valid until expiry -> 200" || bad "stateless token" "got $code"
 
 # ---- filesystem round-trip ----
 echo "[filesystem]"
@@ -216,8 +226,10 @@ grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=dept
   && ok "claim prefix filter matches" || bad "claim prefix match"
 ! grep -q "$CLAIM" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim&q=zzz_nomatch")" \
   && ok "claim prefix filter excludes non-matches" || bad "claim prefix exclude"
-grep -q "$ROLE" <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=role&q=hbrole_")" \
-  && ok "role type-ahead by prefix" || bad "role type-ahead"
+# Role type-ahead is sourced from LDAP groups (groupOfNames under the tenant),
+# not the core role registry — so match a seeded tenant group by prefix.
+grep -q '"administrators"' <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=role&q=admin")" \
+  && ok "role type-ahead by prefix (LDAP group)" || bad "role type-ahead"
 grep -q '"roles":\[\]' <<<"$(curl -s "${A[@]}" "$BASE/v1/principals?types=claim")" \
   && ok "types=claim yields empty roles array" || bad "types filter"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/principals")
