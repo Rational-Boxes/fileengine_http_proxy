@@ -395,10 +395,25 @@ private:
         sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
     }
 
+    // Add roles to the auth context, aliasing the tenant "administrators" role to
+    // "system_admin" so the core's single system_admin bypass grants a tenant
+    // admin full access to their tenant's files. Roles are already tenant-scoped
+    // (resolved for the active tenant), so the alias never crosses tenants.
+    static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
+                                const std::vector<std::string>& roles) {
+        bool tenantAdmin = false;
+        for (const auto& r : roles) {
+            if (r.empty()) continue;
+            a->add_roles(r);
+            if (r == "administrators") tenantAdmin = true;
+        }
+        if (tenantAdmin) a->add_roles("system_admin");
+    }
+
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
         a->set_user(id.user);
         a->set_tenant(id.tenant);
-        for (const auto& r : id.roles) a->add_roles(r);
+        addRolesAliased(a, id.roles);
     }
 
     template <typename Resp>
@@ -758,10 +773,10 @@ private:
         if (!qUser.empty()) {
             a->set_user(qUser);
             a->clear_roles();  // impersonation: caller's roles must not leak
-            for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+            addRolesAliased(a, webdav::splitString(qRoles, ','));
         } else if (!qRoles.empty()) {
             a->clear_roles();
-            for (auto& r : webdav::splitString(qRoles, ',')) if (!r.empty()) a->add_roles(r);
+            addRolesAliased(a, webdav::splitString(qRoles, ','));
         }
         auto r = grpc_->checkPermission(rq);
         if (!r.success()) return mapError(resp, r.error());
