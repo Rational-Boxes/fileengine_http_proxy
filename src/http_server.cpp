@@ -818,8 +818,12 @@ private:
     // Depth-first collect the uids of all descendant DIRECTORIES under `root`,
     // using the caller's identity to list (so a cascade only reaches subtrees the
     // caller can see). Bounded to avoid pathological/cyclic trees.
-    void collectDescendantDirs(const std::string& root, const AuthIdentity& id,
-                               std::vector<std::string>& out, int depth) {
+    // Depth-first collect the uids of ALL descendant entities (files AND
+    // directories) under `root`, recursing into directories. Uses the caller's
+    // identity to list, so a cascade only reaches subtrees they can see. Bounded
+    // to avoid pathological/cyclic trees.
+    void collectDescendants(const std::string& root, const AuthIdentity& id,
+                            std::vector<std::string>& out, int depth) {
         static const int kMaxAclCascadeDepth = 64;
         if (depth >= kMaxAclCascadeDepth) return;
         fileengine_rpc::ListDirectoryRequest rq;
@@ -828,9 +832,10 @@ private:
         auto r = grpc_->listDirectory(rq);
         if (!r.success()) return;
         for (const auto& e : r.entries()) {
-            if (e.type() == fileengine_rpc::DIRECTORY && !e.deleted()) {
-                out.push_back(e.uid());
-                collectDescendantDirs(e.uid(), id, out, depth + 1);
+            if (e.deleted()) continue;
+            out.push_back(e.uid());  // apply to files and directories alike
+            if (e.type() == fileengine_rpc::DIRECTORY) {
+                collectDescendants(e.uid(), id, out, depth + 1);  // recurse to reach nested files
             }
         }
     }
@@ -855,12 +860,12 @@ private:
         auto r = grantOne(uid);
         if (!r.success()) return mapError(resp, r.error());
         if (recursive) {
-            // Apply the same grant to every descendant directory. Not atomic — a
-            // mid-walk failure leaves a partial cascade, which is safe to re-run.
-            std::vector<std::string> dirs;
-            collectDescendantDirs(uid, id, dirs, 0);
-            for (const auto& d : dirs) {
-                auto rr = grantOne(d);
+            // Apply the same grant to every descendant file and directory. Not
+            // atomic — a mid-walk failure leaves a partial cascade, safe to re-run.
+            std::vector<std::string> nodes;
+            collectDescendants(uid, id, nodes, 0);
+            for (const auto& n : nodes) {
+                auto rr = grantOne(n);
                 if (!rr.success()) return mapError(resp, rr.error());
             }
         }
@@ -887,12 +892,12 @@ private:
         auto r = revokeOne(uid);
         if (!r.success()) return mapError(resp, r.error());
         if (recursive) {
-            // Remove the same rule from every descendant directory. Not atomic —
-            // a mid-walk failure leaves a partial cascade, safe to re-run.
-            std::vector<std::string> dirs;
-            collectDescendantDirs(uid, id, dirs, 0);
-            for (const auto& d : dirs) {
-                auto rr = revokeOne(d);
+            // Remove the same rule from every descendant file and directory. Not
+            // atomic — a mid-walk failure leaves a partial cascade, safe to re-run.
+            std::vector<std::string> nodes;
+            collectDescendants(uid, id, nodes, 0);
+            for (const auto& n : nodes) {
+                auto rr = revokeOne(n);
                 if (!rr.success()) return mapError(resp, rr.error());
             }
         }
