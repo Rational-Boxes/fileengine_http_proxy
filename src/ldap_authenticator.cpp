@@ -568,6 +568,74 @@ std::vector<std::string> LDAPAuthenticator::searchUsers(const std::string& prefi
     return uids;
 }
 
+std::vector<std::string> LDAPAuthenticator::searchRoles(const std::string& tenant,
+                                                        const std::string& prefix, int limit) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+
+    const int kMaxResults = 100;
+    int cap = (limit > 0 && limit < kMaxResults) ? limit : kMaxResults;
+
+    std::vector<std::string> roles;
+
+    // Roles are groupOfNames under the tenant's own subtree
+    // (ou=<tenant>,<tenant_base_>). Scope strictly to that subtree so one tenant's
+    // ACL editor never sees another tenant's role names.
+    if (tenant.empty() || tenant_base_.empty()) {
+        webdav::errorLog("LDAPAuthenticator::searchRoles: no tenant/tenant_base configured");
+        return roles;
+    }
+    std::string base = "ou=" + tenant + "," + tenant_base_;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::searchRoles: failed to connect to LDAP");
+        return roles;
+    }
+
+    // Prefix (substring-initial) match on cn; prefix escaped + a single trailing
+    // '*' so the user can't inject wildcards.
+    std::string esc = escapeLdapFilterValue(prefix);
+    std::string filter = "(&(objectClass=groupOfNames)(cn=" + esc + "*))";
+    webdav::debugLog("LDAPAuthenticator::searchRoles: base: " + base + " filter: " + filter);
+
+    const char* attrs[] = {"cn", nullptr};
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, base.c_str(), LDAP_SCOPE_SUBTREE,
+                           filter.c_str(), const_cast<char**>(attrs), false, &result);
+    if (rc != LDAP_SUCCESS) {
+        // NO_SUCH_OBJECT just means the tenant has no roles subtree yet — not fatal.
+        if (rc != LDAP_NO_SUCH_OBJECT) {
+            webdav::errorLog("LDAPAuthenticator::searchRoles: search failed: " +
+                             std::string(ldap_err2string(rc)));
+        }
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return roles;
+    }
+
+    for (LDAPMessage* e = ldap_first_entry(ld, result);
+         e != nullptr && static_cast<int>(roles.size()) < cap;
+         e = ldap_next_entry(ld, e)) {
+        berval** vals = ldap_get_values_len(ld, e, "cn");
+        if (vals != nullptr) {
+            if (vals[0] != nullptr) {
+                std::string cn(vals[0]->bv_val, vals[0]->bv_len);
+                if (!cn.empty() && std::find(roles.begin(), roles.end(), cn) == roles.end()) {
+                    roles.push_back(cn);
+                }
+            }
+            ldap_value_free_len(vals);
+        }
+    }
+    ldap_msgfree(result);
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    std::sort(roles.begin(), roles.end());
+    webdav::debugLog("LDAPAuthenticator::searchRoles: found " + std::to_string(roles.size()) +
+                     " role(s) for prefix: '" + prefix + "' in tenant: '" + tenant + "'");
+    return roles;
+}
+
 std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_dn) {
     // Example: if user DN is "uid=john,ou=users,ou=tenant1,dc=example,dc=com"
     // we want to extract "tenant1" from the ou=tenant1 part

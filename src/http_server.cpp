@@ -907,22 +907,15 @@ private:
             }
         }
 
-        auto lower = [](std::string s) { for (char& c : s) if (c >= 'A' && c <= 'Z') c += 32; return s; };
-        std::string lq = lower(q);
-
         std::vector<std::string> roles, claims, users;
 
-        if (wantRoles) {
-            fileengine_rpc::GetAllRolesRequest rq;
-            fillAuth(rq.mutable_auth(), id);
-            auto r = grpc_->getAllRoles(rq);
-            if (!r.success()) return mapError(resp, r.error());
-            for (const auto& role : r.roles()) {
-                if (lq.empty() || lower(role).compare(0, lq.size(), lq) == 0) {
-                    roles.push_back(role);
-                    if (static_cast<int>(roles.size()) >= limit) break;
-                }
-            }
+        if (wantRoles && ldap_) {
+            // Roles are LDAP groupOfNames under the tenant's subtree — the same set
+            // authorization resolves from and the admin console manages. (Formerly
+            // sourced from core's role registry, which never sees LDAP-created
+            // roles, so tenant roles like "engineering" never appeared.) The LDAP
+            // search already does the prefix match, cap, and sort.
+            roles = ldap_->searchRoles(id.tenant, q, limit);
         }
 
         if (wantClaims) {

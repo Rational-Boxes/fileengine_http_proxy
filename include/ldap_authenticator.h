@@ -67,6 +67,15 @@ public:
     // limit <= 0 applies a sane internal cap.
     std::vector<std::string> searchUsers(const std::string& prefix, int limit);
 
+    // Type-ahead role search for the ACL editor. Returns up to `limit` distinct
+    // role names (the cn of groupOfNames entries) under the given tenant's subtree
+    // whose cn begins with `prefix`. This is the SAME set authorization resolves
+    // from and the admin console manages — so LDAP-created roles are assignable.
+    // Scoped to the tenant's subtree to avoid cross-tenant leakage. `prefix` is
+    // escaped; an empty prefix returns the first `limit` roles.
+    std::vector<std::string> searchRoles(const std::string& tenant,
+                                         const std::string& prefix, int limit);
+
 private:
     std::string ldap_endpoint_;
     std::string ldap_domain_;
