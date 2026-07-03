@@ -147,6 +147,16 @@ int jsonFieldInt(const std::string& body, const std::string& key, int def) {
     return def;
 }
 
+bool jsonFieldBool(const std::string& body, const std::string& key) {
+    try {
+        Poco::JSON::Parser p;
+        auto obj = p.parse(body).extract<Poco::JSON::Object::Ptr>();
+        if (obj && obj->has(key)) return obj->getValue<bool>(key);
+    } catch (...) {
+    }
+    return false;
+}
+
 // Accept a single-letter alias (r/w/x/d/...) or an enum name (READ/WRITE/...).
 fileengine_rpc::Permission coercePermission(const std::string& s) {
     static const std::map<std::string, fileengine_rpc::Permission> letters = {
@@ -805,34 +815,88 @@ private:
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
+    // Depth-first collect the uids of all descendant DIRECTORIES under `root`,
+    // using the caller's identity to list (so a cascade only reaches subtrees the
+    // caller can see). Bounded to avoid pathological/cyclic trees.
+    void collectDescendantDirs(const std::string& root, const AuthIdentity& id,
+                               std::vector<std::string>& out, int depth) {
+        static const int kMaxAclCascadeDepth = 64;
+        if (depth >= kMaxAclCascadeDepth) return;
+        fileengine_rpc::ListDirectoryRequest rq;
+        rq.set_uid(root);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->listDirectory(rq);
+        if (!r.success()) return;
+        for (const auto& e : r.entries()) {
+            if (e.type() == fileengine_rpc::DIRECTORY && !e.deleted()) {
+                out.push_back(e.uid());
+                collectDescendantDirs(e.uid(), id, out, depth + 1);
+            }
+        }
+    }
+
     void grantPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         std::string body = readBody(req);
         std::string principal = jsonField(body, "principal");
         if (principal.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'principal'"})");
-        fileengine_rpc::GrantPermissionRequest rq;
-        rq.set_resource_uid(uid);
-        rq.set_principal(principal);
-        rq.set_permission(coercePermission(jsonField(body, "permission")));
-        rq.set_effect(coerceEffect(jsonField(body, "effect")));
-        fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->grantPermission(rq);
-        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
-        else mapError(resp, r.error());
+        auto permission = coercePermission(jsonField(body, "permission"));
+        auto effect = coerceEffect(jsonField(body, "effect"));
+        bool recursive = jsonFieldBool(body, "recursive");
+
+        auto grantOne = [&](const std::string& target) {
+            fileengine_rpc::GrantPermissionRequest rq;
+            rq.set_resource_uid(target);
+            rq.set_principal(principal);
+            rq.set_permission(permission);
+            rq.set_effect(effect);
+            fillAuth(rq.mutable_auth(), id);
+            return grpc_->grantPermission(rq);
+        };
+        auto r = grantOne(uid);
+        if (!r.success()) return mapError(resp, r.error());
+        if (recursive) {
+            // Apply the same grant to every descendant directory. Not atomic — a
+            // mid-walk failure leaves a partial cascade, which is safe to re-run.
+            std::vector<std::string> dirs;
+            collectDescendantDirs(uid, id, dirs, 0);
+            for (const auto& d : dirs) {
+                auto rr = grantOne(d);
+                if (!rr.success()) return mapError(resp, rr.error());
+            }
+        }
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
     void revokePerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         std::string body = readBody(req);
         std::string principal = jsonField(body, "principal");
         if (principal.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'principal'"})");
-        fileengine_rpc::RevokePermissionRequest rq;
-        rq.set_resource_uid(uid);
-        rq.set_principal(principal);
-        rq.set_permission(coercePermission(jsonField(body, "permission")));
-        rq.set_effect(coerceEffect(jsonField(body, "effect")));
-        fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->revokePermission(rq);
-        if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
-        else mapError(resp, r.error());
+        auto permission = coercePermission(jsonField(body, "permission"));
+        auto effect = coerceEffect(jsonField(body, "effect"));
+        bool recursive = jsonFieldBool(body, "recursive");
+
+        auto revokeOne = [&](const std::string& target) {
+            fileengine_rpc::RevokePermissionRequest rq;
+            rq.set_resource_uid(target);
+            rq.set_principal(principal);
+            rq.set_permission(permission);
+            rq.set_effect(effect);
+            fillAuth(rq.mutable_auth(), id);
+            return grpc_->revokePermission(rq);
+        };
+        auto r = revokeOne(uid);
+        if (!r.success()) return mapError(resp, r.error());
+        if (recursive) {
+            // Remove the same rule from every descendant directory. Not atomic —
+            // a mid-walk failure leaves a partial cascade, safe to re-run.
+            std::vector<std::string> dirs;
+            collectDescendantDirs(uid, id, dirs, 0);
+            for (const auto& d : dirs) {
+                auto rr = revokeOne(d);
+                if (!rr.success()) return mapError(resp, rr.error());
+            }
+        }
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
     // --- roles ---
