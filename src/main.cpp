@@ -62,7 +62,15 @@ int main() {
     cfg.thread_pool = std::stoi(webdav::getEnvOrDefault("HTTP_THREAD_POOL", "16"));
     cfg.monitoring_host = webdav::getEnvOrDefault("HTTP_MONITORING_HOST", "127.0.0.1");
     cfg.monitoring_port = std::stoi(webdav::getEnvOrDefault("HTTP_MONITORING_PORT", "8091"));
-    cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "3600"));
+    cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "900"));
+    // Shared HS256 secret for signing/verifying bearer JWTs. Every service that
+    // verifies these tokens must share this exact value.
+    cfg.jwt_secret = webdav::getEnvOrDefault("FILEENGINE_JWT_SECRET", "");
+    cfg.jwt_issuer = webdav::getEnvOrDefault("FILEENGINE_JWT_ISSUER", "fileengine-bridge");
+    if (cfg.jwt_secret.empty()) {
+        webdav::errorLog("FATAL: FILEENGINE_JWT_SECRET is not set — cannot sign session tokens");
+        return 1;
+    }
     cfg.max_body_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_BODY_BYTES", "104857600"));
     cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
     cfg.grpc_address = webdav::getEnvOrDefault("FILEENGINE_GRPC_HOST", "localhost") + ":" +

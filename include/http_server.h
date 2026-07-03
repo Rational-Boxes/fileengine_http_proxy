@@ -23,7 +23,13 @@ struct Config {
     // binds to loopback by default — protect it by network isolation, not auth.
     std::string monitoring_host = "127.0.0.1";
     int monitoring_port = 8091;
-    int token_ttl = 3600;
+    // Bearer session tokens are signed HS256 JWTs. token_ttl is deliberately
+    // SHORT: a token is re-minted periodically (POST /v1/auth/refresh) from live
+    // LDAP, so role changes take effect within ~the refresh interval and a token
+    // that stops being refreshed (access revoked) expires quickly.
+    int token_ttl = 900;                     // JWT lifetime (s)
+    std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
+    std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
     std::string cors_origin;                   // empty => no CORS header
     std::string grpc_address = "localhost:50051";

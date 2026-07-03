@@ -636,6 +636,74 @@ std::vector<std::string> LDAPAuthenticator::searchRoles(const std::string& tenan
     return roles;
 }
 
+std::map<std::string, std::vector<std::string>>
+LDAPAuthenticator::getRolesByTenant(const std::string& username) {
+    std::lock_guard<std::mutex> lock(ldap_mutex_);
+    std::map<std::string, std::vector<std::string>> byTenant;
+
+    LDAP* ld = connectToLDAP();
+    if (!ld) {
+        webdav::errorLog("LDAPAuthenticator::getRolesByTenant: failed to connect to LDAP");
+        return byTenant;
+    }
+
+    // Resolve the user's DN (accept uid or mail).
+    std::string esc = escapeLdapFilterValue(username);
+    std::string filter = "(|(uid=" + esc + ")(mail=" + esc + "))";
+    LDAPMessage* result = nullptr;
+    int rc = ldap_search_s(ld, user_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                           filter.c_str(), nullptr, false, &result);
+    if (rc != LDAP_SUCCESS || ldap_count_entries(ld, result) != 1) {
+        if (result) ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return byTenant;
+    }
+    LDAPMessage* entry = ldap_first_entry(ld, result);
+    char* dnc = entry ? ldap_get_dn(ld, entry) : nullptr;
+    std::string user_dn = dnc ? std::string(dnc) : "";
+    if (dnc) ldap_memfree(dnc);
+    ldap_msgfree(result);
+    if (user_dn.empty()) {
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return byTenant;
+    }
+
+    // Every groupOfNames the user is a member of, under the tenant base. Bucket
+    // the role (cn) by the tenant parsed from each group's DN.
+    std::string gfilter = "(&(objectClass=groupOfNames)(member=" + user_dn + "))";
+    LDAPMessage* groups = nullptr;
+    const char* attrs[] = {"cn", nullptr};
+    rc = ldap_search_s(ld, tenant_base_.c_str(), LDAP_SCOPE_SUBTREE,
+                       gfilter.c_str(), const_cast<char**>(attrs), false, &groups);
+    if (rc == LDAP_SUCCESS) {
+        for (LDAPMessage* g = ldap_first_entry(ld, groups); g != nullptr;
+             g = ldap_next_entry(ld, g)) {
+            char* gdnc = ldap_get_dn(ld, g);
+            std::string gdn = gdnc ? std::string(gdnc) : "";
+            if (gdnc) ldap_memfree(gdnc);
+            std::string tenant = tenantFromGroupDN(gdn, tenant_base_);
+            if (tenant.empty()) continue;
+
+            std::string role;
+            berval** cnv = ldap_get_values_len(ld, g, "cn");
+            if (cnv) {
+                if (cnv[0]) role.assign(cnv[0]->bv_val, cnv[0]->bv_len);
+                ldap_value_free_len(cnv);
+            }
+            if (role.empty()) continue;
+            auto& v = byTenant[tenant];
+            if (std::find(v.begin(), v.end(), role) == v.end()) v.push_back(role);
+        }
+    }
+    if (groups) ldap_msgfree(groups);
+    ldap_unbind_ext_s(ld, nullptr, nullptr);
+
+    for (auto& kv : byTenant) std::sort(kv.second.begin(), kv.second.end());
+    webdav::debugLog("LDAPAuthenticator::getRolesByTenant: '" + username + "' has roles in " +
+                     std::to_string(byTenant.size()) + " tenant(s)");
+    return byTenant;
+}
+
 std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_dn) {
     // Example: if user DN is "uid=john,ou=users,ou=tenant1,dc=example,dc=com"
     // we want to extract "tenant1" from the ou=tenant1 part

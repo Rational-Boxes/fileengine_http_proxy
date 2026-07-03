@@ -2,6 +2,7 @@
 #define LDAP_AUTHENTICATOR_H
 
 #include <ldap.h>
+#include <map>
 #include <string>
 #include <vector>
 #include <memory>
@@ -75,6 +76,12 @@ public:
     // escaped; an empty prefix returns the first `limit` roles.
     std::vector<std::string> searchRoles(const std::string& tenant,
                                          const std::string& prefix, int limit);
+
+    // Resolve EVERY tenant the user has roles in, mapped to their roles in that
+    // tenant, by bucketing the user's groupOfNames memberships by the tenant
+    // parsed from each group DN. Backs the JWT's {tenant:[roles]} claim.
+    std::map<std::string, std::vector<std::string>>
+    getRolesByTenant(const std::string& username);
 
 private:
     std::string ldap_endpoint_;

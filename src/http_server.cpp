@@ -1,5 +1,6 @@
 #include "http_server.h"
 #include "utils.h"
+#include "jwt.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -11,6 +12,7 @@
 #include <Poco/StreamCopier.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
+#include <Poco/JSON/Array.h>
 #include <Poco/Dynamic/Var.h>
 #include <Poco/URI.h>
 #include <Poco/SHA2Engine.h>
@@ -18,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <fstream>
 #include <istream>
@@ -308,6 +311,12 @@ private:
         auto segs = pathSegments(path);            // [v1, <resource>, <uid>, <sub>?]
 
         if (segs.size() == 2 && segs[1] == "whoami") return whoami(resp, id);
+
+        // Periodic token refresh: re-mint a fresh JWT from live LDAP roles. Needs a
+        // currently-valid token (authenticate() above), so it can't outlive a
+        // revoked session beyond token_ttl.
+        if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "refresh" && method == "POST")
+            return refreshToken(resp, id);
 
         // Token introspection for downstream services (e.g. convert_search_ai):
         // validate the caller's bearer token and return the resolved identity, so
@@ -1050,13 +1059,13 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"no matching user"})");
         }
 
-        std::string token = tokens_->issue(info.user_id, st.tenant, info.roles);
+        std::string token = mintJwt(info.user_id, st.tenant);
 
         // Token returned in the URL fragment (not the query) so it is not sent to
         // the SPA's server or leaked via Referer. The SPA scrubs it from history.
         std::string sep = st.return_to.find('#') == std::string::npos ? "#" : "&";
         std::string location = st.return_to + sep + "token=" + webdav::urlEncode(token) +
-                               "&token_type=Bearer&expires_in=" + std::to_string(tokens_->ttl());
+                               "&token_type=Bearer&expires_in=" + std::to_string(cfg_.token_ttl);
         resp.redirect(location, HTTPResponse::HTTP_FOUND);
     }
 
@@ -1064,18 +1073,21 @@ private:
     bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
         std::string h = req.get("Authorization", "");
         if (h.compare(0, 7, "Bearer ") == 0) {
-            Session s;
-            if (!tokens_->lookup(webdav::trim(h.substr(7)), s)) return false;
-            out.user = s.user;
-            out.tenant = s.tenant;
-            out.roles = s.roles;
-            // Per-request tenant selection: an X-Tenant header overrides the
-            // tenant bound to the token at issue time, letting a single session
-            // operate across the tenants it can access without re-authenticating.
-            // The core still enforces ACLs, so a tenant the user cannot reach
-            // simply yields permission errors / empty listings.
+            // Verify the signed JWT locally (signature + exp) — no state lookup.
+            Poco::JSON::Object::Ptr claims;
+            std::string err;
+            long now = static_cast<long>(std::time(nullptr));
+            if (!jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
+                webdav::debugLog("authenticate: JWT rejected: " + err);
+                return false;
+            }
+            // Per-request tenant selection: an X-Tenant header picks which tenant's
+            // roles apply (from the token's {tenant:[roles]} map); otherwise the
+            // token's default `tenant` claim is used. The core still enforces ACLs.
+            std::string activeTenant = claims->optValue<std::string>("tenant", std::string());
             std::string xt = req.get("X-Tenant", "");
-            if (!xt.empty()) out.tenant = xt;
+            if (!xt.empty()) activeTenant = xt;
+            identityFromClaims(claims, activeTenant, out);
             return true;
         }
         return authenticateBasic(req, out);
@@ -1115,17 +1127,73 @@ private:
         sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":"authentication required"})");
     }
 
+    // Build a signed HS256 JWT carrying the user's identity and their roles in
+    // EVERY tenant they belong to ({tenant:[roles]}). `activeTenant` is recorded
+    // as the token's default tenant context. Roles are resolved live from LDAP.
+    std::string mintJwt(const std::string& user, const std::string& activeTenant) {
+        auto byTenant = ldap_->getRolesByTenant(user);
+
+        Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
+        long now = static_cast<long>(std::time(nullptr));
+        claims->set("iss", cfg_.jwt_issuer);
+        claims->set("sub", user);
+        claims->set("email", user);
+        claims->set("tenant", activeTenant);
+        claims->set("iat", static_cast<Poco::Int64>(now));
+        claims->set("exp", static_cast<Poco::Int64>(now + cfg_.token_ttl));
+        claims->set("jti", randomCodeVerifier());
+
+        Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
+        for (const auto& kv : byTenant) {
+            Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
+            for (const auto& r : kv.second) arr->add(r);
+            rolesObj->set(kv.first, arr);
+        }
+        claims->set("roles", rolesObj);
+        return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // Fill an AuthIdentity from verified JWT claims, scoping roles to the active
+    // tenant's entry in the {tenant:[roles]} map.
+    void identityFromClaims(const Poco::JSON::Object::Ptr& claims,
+                            const std::string& activeTenant, AuthIdentity& out) {
+        out.user = claims->optValue<std::string>("sub", std::string());
+        out.tenant = activeTenant;
+        out.roles.clear();
+        Poco::JSON::Object::Ptr rolesObj = claims->getObject("roles");
+        if (rolesObj && !activeTenant.empty() && rolesObj->has(activeTenant)) {
+            Poco::JSON::Array::Ptr arr = rolesObj->getArray(activeTenant);
+            if (arr) {
+                for (size_t i = 0; i < arr->size(); ++i)
+                    out.roles.push_back(arr->getElement<std::string>(i));
+            }
+        }
+    }
+
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
         AuthIdentity id;
         if (!authenticateBasic(req, id)) return unauthorized(resp);
-        std::string token = tokens_->issue(id.user, id.tenant, id.roles);
+        std::string token = mintJwt(id.user, id.tenant);
         sendJson(resp, HTTPResponse::HTTP_OK,
-                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" + std::to_string(tokens_->ttl()) + "}");
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
+    }
+
+    // Periodic re-mint: reaching here means the caller's current JWT already
+    // verified. Re-resolve roles from LDAP and issue a fresh short-lived token, so
+    // LDAP role changes take effect within the client's refresh interval and a
+    // token that stops being refreshed (access revoked) expires within token_ttl.
+    void refreshToken(HTTPServerResponse& resp, const AuthIdentity& id) {
+        std::string token = mintJwt(id.user, id.tenant);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
     }
 
     void revokeToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
-        std::string h = req.get("Authorization", "");
-        if (h.compare(0, 7, "Bearer ") == 0) tokens_->revoke(webdav::trim(h.substr(7)));
+        // Stateless JWTs: logout is client-side (drop the token); it expires within
+        // token_ttl. Kept for API compatibility.
+        (void)req;
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
