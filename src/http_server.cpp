@@ -601,6 +601,9 @@ private:
     }
 
     void removeDir(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
+        // The core soft-deletes the directory node; a non-empty directory is
+        // allowed and its subtree is hidden by reachability (a descendant of a
+        // deleted folder is unreachable), so no client-side recursion is needed.
         fileengine_rpc::RemoveDirectoryRequest rq;
         rq.set_uid(uid);
         fillAuth(rq.mutable_auth(), id);

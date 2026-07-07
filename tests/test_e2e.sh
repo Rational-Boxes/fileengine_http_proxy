@@ -104,6 +104,37 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/file
 
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$DIR"   # cleanup
 
+# ---- soft-delete a non-empty folder + leak-proof reachability ----
+echo "[delete non-empty + reachability]"
+# Build <root>/<suf>_del/sub/leaf.txt with content.
+RD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_del\"}" | uidof)
+RSUB=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$RD" -d '{"name":"sub"}' | uidof)
+LEAF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$RSUB/files" -d '{"name":"leaf.txt"}' | uidof)
+curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$LEAF/content" --data-binary 'buried'
+
+# Sanity: the buried file is reachable before the delete.
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/content")
+{ [ "$code" = "200" ]; } && ok "descendant readable before delete" || bad "pre-delete" "got $code"
+
+# A non-empty directory can now be soft-deleted directly (no recursive flag).
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/dirs/$RD")
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "DELETE non-empty dir -> 2xx (soft)" \
+    || bad "delete non-empty" "got $code"
+
+# The folder is gone from the root listing...
+out=$(curl -s "${A[@]}" "$BASE/v1/dirs/$ROOT")
+grep -q "${SUF}_del" <<<"$out" && bad "reachability" "deleted dir still listed at root" \
+    || ok "deleted folder no longer listed at root"
+
+# ...and its DESCENDANTS are hidden everywhere by reachability, even by direct UID
+# (leak-proof — the child's own deleted flag is untouched, it's just unreachable).
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/content")
+[ "$code" != "200" ] && ok "descendant file hidden by direct UID ($code)" \
+    || bad "reachability LEAK" "buried file still readable under deleted folder"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/dirs/$RSUB")
+[ "$code" != "200" ] && ok "descendant subdir not listable ($code)" \
+    || bad "reachability LEAK" "subdir still listable under deleted folder"
+
 # ---- streaming (large file) + Range ----
 echo "[streaming + range]"
 SD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_stream\"}" | uidof)
