@@ -2,7 +2,7 @@ Name:           fileengine-http-bridge
 Version:        1.1.0
 Release:        1%{?dist}
 Summary:        REST/HTTP bridge for the FileEngine gRPC core
-License:        MIT
+License:        AGPLv3+
 URL:            https://github.com/fileengine/fileengine-http-bridge
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
