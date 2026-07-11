@@ -57,6 +57,7 @@ add_executable(http_bridge
     src/oauth_provider.cpp
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
+    src/audit_publisher.cpp
     src/utils.cpp
     ${PROTO_SRCS}
 )
@@ -74,6 +75,20 @@ target_link_libraries(http_bridge
     ${LDAP_LIBRARIES}
     Threads::Threads
 )
+
+# Optional hiredis for durable audit emission (login_success/login_failure ->
+# fileengine:audit). Without it the audit publisher compiles as a no-op, so the
+# bridge still builds. Mirrors file_engine_core's FILEENGINE_ENABLE_EVENTS block.
+find_library(HIREDIS_LIB hiredis)
+find_path(HIREDIS_INC hiredis/hiredis.h)
+if(HIREDIS_LIB AND HIREDIS_INC)
+    target_compile_definitions(http_bridge PRIVATE HTTPBRIDGE_HAS_HIREDIS=1)
+    target_include_directories(http_bridge PRIVATE ${HIREDIS_INC})
+    target_link_libraries(http_bridge ${HIREDIS_LIB})
+    message(STATUS "http_bridge audit emission ENABLED (hiredis: ${HIREDIS_LIB})")
+else()
+    message(WARNING "hiredis not found; http_bridge audit emission compiled out")
+endif()
 
 # Install the binary (packaging renames it to fileengine-http-bridge).
 install(TARGETS http_bridge RUNTIME DESTINATION bin)

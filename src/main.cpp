@@ -79,6 +79,19 @@ int main() {
     cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
     cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
 
+    // Durable audit emission — shares the core's Redis broker + stream names.
+    {
+        std::string ae = webdav::getEnvOrDefault("FILEENGINE_AUDIT_ENABLED", "");
+        cfg.audit_enabled = (ae == "true" || ae == "1" || ae == "yes" || ae == "on");
+    }
+    cfg.redis_host = webdav::getEnvOrDefault("FILEENGINE_REDIS_HOST", "localhost");
+    cfg.redis_port = std::stoi(webdav::getEnvOrDefault("FILEENGINE_REDIS_PORT", "6379"));
+    cfg.redis_password = webdav::getEnvOrDefault("FILEENGINE_REDIS_PASSWORD",
+                             webdav::getEnvOrDefault("REDDIS_PASSWORD", ""));
+    cfg.redis_db = std::stoi(webdav::getEnvOrDefault("FILEENGINE_REDIS_DB", "0"));
+    cfg.audit_stream = webdav::getEnvOrDefault("FILEENGINE_AUDIT_STREAM", "fileengine:audit");
+    cfg.audit_stream_maxlen = std::stoll(webdav::getEnvOrDefault("FILEENGINE_AUDIT_STREAM_MAXLEN", "1000000"));
+
     auto grpc = std::make_shared<webdav::GRPCClientWrapper>(cfg.grpc_address);
     auto ldap = std::make_shared<webdav::LDAPAuthenticator>(
         webdav::getEnvOrDefault("FILEENGINE_LDAP_ENDPOINT", "ldap://localhost:1389"),

@@ -7,6 +7,7 @@
 #include <Poco/Net/HTTPServer.h>
 #include <Poco/ThreadPool.h>
 
+#include "audit_publisher.h"
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
 #include "oauth_provider.h"
@@ -38,6 +39,16 @@ struct Config {
     std::string oauth_redirect_base;        // public base URL of the bridge
     std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
     int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
+
+    // Durable audit emission (usage_logging_and_auditing §5). Shares the core's
+    // Redis broker + stream; login_success/login_failure emit from this door.
+    bool audit_enabled = false;
+    std::string redis_host = "localhost";
+    int redis_port = 6379;
+    std::string redis_password;
+    int redis_db = 0;
+    std::string audit_stream = "fileengine:audit";
+    long long audit_stream_maxlen = 1000000;
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -60,6 +71,7 @@ private:
     std::shared_ptr<TokenStore> tokens_;
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
+    std::shared_ptr<AuditPublisher> audit_;
     // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
     // it is destroyed *after* the server stops using it.
     std::unique_ptr<Poco::ThreadPool> pool_;

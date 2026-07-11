@@ -232,9 +232,10 @@ public:
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
                    std::shared_ptr<TokenStore> tokens,
                    std::shared_ptr<OAuthProvider> oauth,
-                   std::shared_ptr<OAuthStateStore> oauth_states)
+                   std::shared_ptr<OAuthStateStore> oauth_states,
+                   std::shared_ptr<AuditPublisher> audit)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
-          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -1193,6 +1194,10 @@ private:
         std::string user = creds.substr(0, colon);
         std::string pass = creds.substr(colon + 1);
 
+        // Record the attempted identity up front so a caller (issueToken) can
+        // audit a login_failure with the username even when the bind fails.
+        out.user = user;
+
         webdav::UserInfo info = ldap_->authenticateUser(user, pass);
         if (!info.authenticated) return false;
 
@@ -1257,9 +1262,33 @@ private:
         }
     }
 
+    // Client IP for the audit trail: first X-Forwarded-For hop (the bridge sits
+    // behind the nginx proxy), else the socket peer.
+    std::string clientIp(HTTPServerRequest& req) {
+        std::string xff = req.get("X-Forwarded-For", "");
+        if (!xff.empty()) {
+            auto c = xff.find(',');
+            return webdav::trim(c == std::string::npos ? xff : xff.substr(0, c));
+        }
+        try { return req.clientAddress().host().toString(); } catch (...) { return ""; }
+    }
+
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        const std::string ip = clientIp(req);
         AuthIdentity id;
-        if (!authenticateBasic(req, id)) return unauthorized(resp);
+        if (!authenticateBasic(req, id)) {
+            // login_failure — the attempted username (from authenticateBasic) is the
+            // brute-force signal; tenant is still resolvable from the request.
+            const std::string attempted = id.user.empty() ? "<unknown>" : id.user;
+            const std::string tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
+            audit_->emitAuth("login_failure", "denied", attempted, tenant, ip);
+            return unauthorized(resp);
+        }
+        // Fail-closed write-ahead (§6): do not issue a session we cannot audit.
+        if (!audit_->emitAuth("login_success", "ok", id.user, id.tenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
         std::string token = mintJwt(id.user, id.tenant);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
@@ -1353,6 +1382,7 @@ private:
     std::shared_ptr<TokenStore> tokens_;
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
+    std::shared_ptr<AuditPublisher> audit_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {
@@ -1362,12 +1392,13 @@ public:
                    std::shared_ptr<webdav::LDAPAuthenticator> ldap,
                    std::shared_ptr<TokenStore> tokens,
                    std::shared_ptr<OAuthProvider> oauth,
-                   std::shared_ptr<OAuthStateStore> oauth_states)
+                   std::shared_ptr<OAuthStateStore> oauth_states,
+                   std::shared_ptr<AuditPublisher> audit)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
-          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)) {}
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_);
     }
 
 private:
@@ -1377,6 +1408,7 @@ private:
     std::shared_ptr<TokenStore> tokens_;
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
+    std::shared_ptr<AuditPublisher> audit_;
 };
 
 }  // namespace
@@ -1387,7 +1419,10 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
     : cfg_(cfg), grpc_(std::move(grpc)), ldap_(std::move(ldap)),
       tokens_(std::make_shared<TokenStore>(cfg.token_ttl)),
       oauth_(std::make_shared<OAuthProvider>(OAuthProvider::fromEnv(cfg.oauth_redirect_base))),
-      oauth_states_(std::make_shared<OAuthStateStore>(cfg.oauth_state_ttl)) {}
+      oauth_states_(std::make_shared<OAuthStateStore>(cfg.oauth_state_ttl)),
+      audit_(std::make_shared<AuditPublisher>(AuditPublisher::Options{
+          cfg.audit_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
+          cfg.redis_db, cfg.audit_stream, cfg.audit_stream_maxlen})) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -1464,7 +1499,7 @@ void HttpBridgeServer::start() {
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_), *pool_, socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_), *pool_, socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");

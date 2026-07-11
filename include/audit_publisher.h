@@ -1,0 +1,58 @@
+#ifndef HTTP_BRIDGE_AUDIT_PUBLISHER_H
+#define HTTP_BRIDGE_AUDIT_PUBLISHER_H
+
+#include <mutex>
+#include <string>
+
+struct redisContext;  // forward-declared; hiredis is pulled in only by the .cpp
+
+namespace httpbridge {
+
+// Emits auth-category audit events (login_success / login_failure) to the shared
+// aggregating Redis stream (fileengine:audit), matching
+// audit_service/AUDIT_CONTRACT.md. This is the http_bridge door's counterpart of
+// the core's RedisAuditSink and the Python AuditPublisher.
+//
+// XADD-success is the durability point (§6 "queue-accepted"), so emitAuth()
+// returns whether the entry was durably accepted (or auditing is disabled), and a
+// fail-closed caller (login_success) gates token issuance on it. Poco dispatches
+// requests across worker threads, so the single Redis connection is guarded by a
+// mutex; login volume is low, so serializing is fine. When the build has no
+// hiredis, emit is a no-op that returns true (auditing unavailable never blocks).
+class AuditPublisher {
+public:
+    struct Options {
+        bool        enabled = false;
+        std::string host = "localhost";
+        int         port = 6379;
+        std::string password;
+        int         db = 0;
+        std::string stream = "fileengine:audit";
+        long long   stream_maxlen = 1000000;
+    };
+
+    explicit AuditPublisher(Options options);
+    ~AuditPublisher();
+
+    // Build + publish an auth envelope. `tenant` may be empty (then pass
+    // scope="global"). Returns true iff durably accepted, or auditing is off.
+    bool emitAuth(const std::string& action, const std::string& outcome,
+                  const std::string& actor, const std::string& tenant,
+                  const std::string& source_addr, const std::string& scope = "tenant");
+
+    // Serialize an auth envelope (event_id/ts filled). Exposed for testing.
+    static std::string buildAuthEnvelope(const std::string& action, const std::string& outcome,
+                                         const std::string& actor, const std::string& tenant,
+                                         const std::string& source_addr, const std::string& scope);
+
+private:
+    bool publish(const std::string& payload);  // XADD; mutex-guarded
+
+    Options opts_;
+    std::mutex mutex_;
+    redisContext* ctx_ = nullptr;  // guarded by mutex_
+};
+
+}  // namespace httpbridge
+
+#endif  // HTTP_BRIDGE_AUDIT_PUBLISHER_H
