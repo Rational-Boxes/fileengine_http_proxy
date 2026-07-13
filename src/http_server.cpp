@@ -1175,12 +1175,15 @@ private:
         resp.redirect(location, HTTPResponse::HTTP_FOUND);
     }
 
-    // True iff the token attests membership in `tenant`: either it is the tenant
-    // the token was issued for, or it appears as a key in the {tenant:[roles]}
-    // map (i.e. the user has a role there). (Security review M3.)
+    // True iff the token attests membership in `tenant`: it must appear as a key
+    // in the {tenant:[roles]} map, which is built from getRolesByTenant — i.e.
+    // the tenants the user actually has roles in. We deliberately do NOT trust
+    // the token's active `tenant` claim as a membership proof: issueToken sets it
+    // from the request context (host/X-Tenant/default), which can name a tenant
+    // the user is not a member of (e.g. the "default" fallback on a bare host).
+    // (Security review M3.)
     static bool tokenTenantMember(const Poco::JSON::Object::Ptr& claims, const std::string& tenant) {
         if (tenant.empty()) return false;
-        if (claims->optValue<std::string>("tenant", std::string()) == tenant) return true;
         Poco::JSON::Object::Ptr rolesObj = claims->getObject("roles");
         return rolesObj && rolesObj->has(tenant);
     }

@@ -1073,14 +1073,16 @@ std::vector<std::string> LDAPAuthenticator::extractRolesFromGroups(LDAP* ld, con
         roles.push_back("users");
     }
 
-    // Map the tenant "administrators" group to the server's privileged role.
-    // The FileEngine core grants admin (root-level create, ACL/role admin,
-    // permission bypass) to the `system_admin` role, so a member of a tenant's
-    // administrators group is given that role in the gRPC auth context.
+    // Map the tenant "administrators" group to the tenant-scoped admin role.
+    // The core grants admin of THE CALLER'S OWN tenant (root-level create,
+    // ACL/role admin, permission bypass) to `tenant_admin`, whose bypass cannot
+    // cross tenants (security review H2). The global `system_admin` is NOT
+    // granted here; a platform operator gets it only via a group literally named
+    // `system_admin`, already carried in `roles` verbatim.
     if (std::find(roles.begin(), roles.end(), "administrators") != roles.end() &&
-        std::find(roles.begin(), roles.end(), "system_admin") == roles.end()) {
-        roles.push_back("system_admin");
-        webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: mapped 'administrators' group -> 'system_admin' role");
+        std::find(roles.begin(), roles.end(), "tenant_admin") == roles.end()) {
+        roles.push_back("tenant_admin");
+        webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: mapped 'administrators' group -> 'tenant_admin' role");
     }
 
     return roles;
