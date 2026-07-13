@@ -317,7 +317,7 @@ private:
         }
 
         AuthIdentity id;
-        if (!authenticate(req, id)) return unauthorized(resp);
+        if (!authenticate(req, resp, id)) return;  // authenticate() emitted 401/403
 
         auto segs = pathSegments(path);            // [v1, <resource>, <uid>, <sub>?]
 
@@ -1173,8 +1173,26 @@ private:
         resp.redirect(location, HTTPResponse::HTTP_FOUND);
     }
 
-    // Authenticate via a cached Bearer token (no LDAP) or HTTP Basic (LDAP).
-    bool authenticate(HTTPServerRequest& req, AuthIdentity& out) {
+    // True iff the token attests membership in `tenant`: either it is the tenant
+    // the token was issued for, or it appears as a key in the {tenant:[roles]}
+    // map (i.e. the user has a role there). (Security review M3.)
+    static bool tokenTenantMember(const Poco::JSON::Object::Ptr& claims, const std::string& tenant) {
+        if (tenant.empty()) return false;
+        if (claims->optValue<std::string>("tenant", std::string()) == tenant) return true;
+        Poco::JSON::Object::Ptr rolesObj = claims->getObject("roles");
+        return rolesObj && rolesObj->has(tenant);
+    }
+
+    void forbidTenant(HTTPServerResponse& resp, const std::string& tenant) {
+        webdav::debugLog("authenticate: tenant membership denied for '" + tenant + "'");
+        sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                 R"({"error":"not a member of the requested tenant"})");
+    }
+
+    // Authenticate via a signed Bearer token (no LDAP) or HTTP Basic (LDAP), and
+    // enforce that the caller is a member of the selected tenant. Emits the
+    // response (401/403) itself on failure and returns false.
+    bool authenticate(HTTPServerRequest& req, HTTPServerResponse& resp, AuthIdentity& out) {
         std::string h = req.get("Authorization", "");
         if (h.compare(0, 7, "Bearer ") == 0) {
             // Verify the signed JWT locally (signature + exp) — no state lookup.
@@ -1183,18 +1201,40 @@ private:
             long now = static_cast<long>(std::time(nullptr));
             if (!jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
                 webdav::debugLog("authenticate: JWT rejected: " + err);
+                unauthorized(resp);
                 return false;
             }
             // Per-request tenant selection: an X-Tenant header picks which tenant's
             // roles apply (from the token's {tenant:[roles]} map); otherwise the
-            // token's default `tenant` claim is used. The core still enforces ACLs.
+            // token's default `tenant` claim is used.
             std::string activeTenant = claims->optValue<std::string>("tenant", std::string());
             std::string xt = req.get("X-Tenant", "");
             if (!xt.empty()) activeTenant = xt;
+            // M3: the client cannot pick a tenant it is not a member of.
+            if (!tokenTenantMember(claims, activeTenant)) {
+                forbidTenant(resp, activeTenant);
+                return false;
+            }
             identityFromClaims(claims, activeTenant, out);
             return true;
         }
-        return authenticateBasic(req, out);
+        if (!authenticateBasic(req, out)) {
+            unauthorized(resp);
+            return false;
+        }
+        // M3: when the client explicitly overrides the tenant via X-Tenant (the
+        // attacker-controlled vector), verify LDAP membership. Host/subdomain
+        // routing is set by the trusted proxy and left as-is.
+        if (!req.get("X-Tenant", "").empty()) {
+            bool member = false;
+            for (const auto& t : ldap_->getTenantsForUser(out.user))
+                if (t == out.tenant) { member = true; break; }
+            if (!member) {
+                forbidTenant(resp, out.tenant);
+                return false;
+            }
+        }
+        return true;
     }
 
     // HTTP Basic -> LDAP bind. Tenant: X-Tenant header > host subdomain >
