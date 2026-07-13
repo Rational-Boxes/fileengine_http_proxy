@@ -407,18 +407,20 @@ private:
     }
 
     // Add roles to the auth context, aliasing the tenant "administrators" role to
-    // "system_admin" so the core's single system_admin bypass grants a tenant
-    // admin full access to their tenant's files. Roles are already tenant-scoped
-    // (resolved for the active tenant), so the alias never crosses tenants.
+    // the tenant-scoped "tenant_admin" so the core grants a tenant admin full
+    // access to THEIR OWN tenant's files — and never beyond it (security review
+    // H2). The global "system_admin" bypass is NOT granted here; a platform
+    // operator gets it only by being a member of a group literally named
+    // "system_admin", which passes through verbatim below.
     static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
                                 const std::vector<std::string>& roles) {
         bool tenantAdmin = false;
         for (const auto& r : roles) {
             if (r.empty()) continue;
-            a->add_roles(r);
+            a->add_roles(r);  // verbatim — includes "system_admin" iff the user is in that group
             if (r == "administrators") tenantAdmin = true;
         }
-        if (tenantAdmin) a->add_roles("system_admin");
+        if (tenantAdmin) a->add_roles("tenant_admin");
     }
 
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
@@ -916,7 +918,7 @@ private:
     // "system_admin" for the active tenant). (Security review C1.)
     bool requireTenantAdmin(const AuthIdentity& id, HTTPServerResponse& resp) {
         for (const auto& r : id.roles)
-            if (r == "administrators" || r == "system_admin") return true;
+            if (r == "administrators" || r == "tenant_admin" || r == "system_admin") return true;
         sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"admin role required"})");
         return false;
     }
