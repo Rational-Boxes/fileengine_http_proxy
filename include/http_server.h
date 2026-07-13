@@ -24,6 +24,7 @@ struct Config {
     // binds to loopback by default — protect it by network isolation, not auth.
     std::string monitoring_host = "127.0.0.1";
     int monitoring_port = 8091;
+    std::vector<std::string> monitoring_allow_ips;  // optional client-IP allowlist for the monitor (security review L2)
     // Bearer session tokens are signed HS256 JWTs. token_ttl is deliberately
     // SHORT: a token is re-minted periodically (POST /v1/auth/refresh) from live
     // LDAP, so role changes take effect within ~the refresh interval and a token

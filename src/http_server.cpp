@@ -1496,9 +1496,19 @@ std::string poolFields(Poco::ThreadPool& pool, int maxQueued) {
 // capacity (503 when saturated → LB drains this instance); /poolz = live usage.
 class MonitorHandler : public HTTPRequestHandler {
 public:
-    MonitorHandler(Poco::ThreadPool* pool, int maxQueued, std::string service)
-        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    MonitorHandler(Poco::ThreadPool* pool, int maxQueued, std::string service,
+                   std::vector<std::string> allowIps)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)),
+          allowIps_(std::move(allowIps)) {}
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
+        // Optional IP allowlist (L2). Enforced before serving any probe.
+        if (!allowIps_.empty()) {
+            std::string ip;
+            try { ip = req.clientAddress().host().toString(); } catch (...) {}
+            bool ok = false;
+            for (const auto& a : allowIps_) if (a == ip) { ok = true; break; }
+            if (!ok) return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"forbidden"})");
+        }
         const std::string path = req.getURI();
         const bool hasCapacity = pool_->available() > 0;
         if (path == "/healthz") {
@@ -1520,19 +1530,23 @@ private:
     Poco::ThreadPool* pool_;
     int maxQueued_;
     std::string service_;
+    std::vector<std::string> allowIps_;
 };
 
 class MonitorHandlerFactory : public HTTPRequestHandlerFactory {
 public:
-    MonitorHandlerFactory(Poco::ThreadPool* pool, int maxQueued, std::string service)
-        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)) {}
+    MonitorHandlerFactory(Poco::ThreadPool* pool, int maxQueued, std::string service,
+                          std::vector<std::string> allowIps)
+        : pool_(pool), maxQueued_(maxQueued), service_(std::move(service)),
+          allowIps_(std::move(allowIps)) {}
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new MonitorHandler(pool_, maxQueued_, service_);
+        return new MonitorHandler(pool_, maxQueued_, service_, allowIps_);
     }
 private:
     Poco::ThreadPool* pool_;
     int maxQueued_;
     std::string service_;
+    std::vector<std::string> allowIps_;
 };
 }  // namespace
 
@@ -1570,7 +1584,7 @@ void HttpBridgeServer::start() {
     Poco::Net::ServerSocket msocket(
         Poco::Net::SocketAddress(cfg_.monitoring_host, static_cast<Poco::UInt16>(cfg_.monitoring_port)));
     monitor_server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new MonitorHandlerFactory(pool_.get(), threads * 8, "http_bridge"), *monitor_pool_, msocket, mparams);
+        new MonitorHandlerFactory(pool_.get(), threads * 8, "http_bridge", cfg_.monitoring_allow_ips), *monitor_pool_, msocket, mparams);
     monitor_server_->start();
     webdav::infoLog("HTTP bridge monitoring (/healthz /readyz /poolz) listening on " +
                     cfg_.monitoring_host + ":" + std::to_string(cfg_.monitoring_port));

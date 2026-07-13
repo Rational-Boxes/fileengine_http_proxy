@@ -62,6 +62,15 @@ int main() {
     cfg.thread_pool = std::stoi(webdav::getEnvOrDefault("HTTP_THREAD_POOL", "16"));
     cfg.monitoring_host = webdav::getEnvOrDefault("HTTP_MONITORING_HOST", "127.0.0.1");
     cfg.monitoring_port = std::stoi(webdav::getEnvOrDefault("HTTP_MONITORING_PORT", "8091"));
+    {
+        // Optional comma-separated client-IP allowlist for the unauthenticated
+        // monitoring listener (L2). Empty = allow any host reaching the bound addr.
+        std::string ips = webdav::getEnvOrDefault("HTTP_MONITORING_ALLOW_IPS", "");
+        for (auto& ip : webdav::splitString(ips, ',')) {
+            std::string t = webdav::trim(ip);
+            if (!t.empty()) cfg.monitoring_allow_ips.push_back(t);
+        }
+    }
     cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "900"));
     // Shared HS256 secret for signing/verifying bearer JWTs. Every service that
     // verifies these tokens must share this exact value.
