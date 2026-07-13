@@ -144,6 +144,16 @@ UserInfo LDAPAuthenticator::authenticateUser(const std::string& username, const 
     ldap_memfree(dn);
     webdav::debugLog("LDAPAuthenticator::authenticateUser: Found user DN: " + user_dn);
 
+    // Reject empty passwords BEFORE binding: an LDAP simple bind with a valid DN
+    // and a zero-length password is an *unauthenticated bind* that most servers
+    // answer with LDAP_SUCCESS — an auth bypass. (Security review C2.)
+    if (password.empty()) {
+        webdav::errorLog("LDAPAuthenticator::authenticateUser: rejecting empty password (unauthenticated-bind guard)");
+        ldap_msgfree(result);
+        ldap_unbind_ext_s(ld, nullptr, nullptr);
+        return { "", "", {}, "", false };
+    }
+
     // Now try to bind with the user's DN and provided password
     struct berval cred;
     cred.bv_val = const_cast<char*>(password.c_str());

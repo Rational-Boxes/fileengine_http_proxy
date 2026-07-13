@@ -909,7 +909,20 @@ private:
     }
 
     // --- roles ---
+    // Role administration is admin-only. The core trusts the AuthenticationContext
+    // and does NOT gate role RPCs, so this bridge is the enforcement point: without
+    // it any authenticated user could self-assign system_admin and bypass every
+    // ACL. A tenant admin carries the "administrators" role (aliased to
+    // "system_admin" for the active tenant). (Security review C1.)
+    bool requireTenantAdmin(const AuthIdentity& id, HTTPServerResponse& resp) {
+        for (const auto& r : id.roles)
+            if (r == "administrators" || r == "system_admin") return true;
+        sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"admin role required"})");
+        return false;
+    }
+
     void createRole(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        if (!requireTenantAdmin(id, resp)) return;
         std::string role = jsonField(readBody(req), "role");
         if (role.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'role'"})");
         fileengine_rpc::CreateRoleRequest rq;
@@ -921,6 +934,7 @@ private:
     }
 
     void deleteRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role) {
+        if (!requireTenantAdmin(id, resp)) return;
         fileengine_rpc::DeleteRoleRequest rq;
         rq.set_role(role);
         fillAuth(rq.mutable_auth(), id);
@@ -939,6 +953,7 @@ private:
     }
 
     void assignUserToRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
+        if (!requireTenantAdmin(id, resp)) return;
         fileengine_rpc::AssignUserToRoleRequest rq;
         rq.set_user(user);
         rq.set_role(role);
@@ -949,6 +964,7 @@ private:
     }
 
     void removeUserFromRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
+        if (!requireTenantAdmin(id, resp)) return;
         fileengine_rpc::RemoveUserFromRoleRequest rq;
         rq.set_user(user);
         rq.set_role(role);
