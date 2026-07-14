@@ -22,6 +22,7 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
+#include <mutex>
 #include <cstdio>
 #include <fstream>
 #include <istream>
@@ -1250,6 +1251,19 @@ private:
                 return false;
             }
             identityFromClaims(claims, activeTenant, out);
+            // Per-tenant 2FA enforcement on tenant switch (PROPOSAL §4.6): 2FA
+            // enrollment is per-user, but the requirement to USE it is per-tenant.
+            // A password-only session that becomes active in a tenant which
+            // requires 2FA is refused here, so the SPA forces a fresh login (which
+            // runs the challenge). Sessions that already cleared a second factor
+            // satisfy any requiring tenant. Applies to the bearer (SPA) path only;
+            // Basic-auth API/WebDAV is covered by its own (IP-binding) track.
+            if (cfg_.mfa_enabled && !sessionHas2fa(out.amr)
+                && tenantRequires2fa(out.user, activeTenant)) {
+                sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                         "{\"error\":\"2fa_required\",\"tenant\":\"" + activeTenant + "\"}");
+                return false;
+            }
             return true;
         }
         if (!authenticateBasic(req, out)) {
@@ -1440,6 +1454,40 @@ private:
         HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/2fa/email-challenge",
                                        bs.str(), mfaHeaders(ip));
         return r.ok && r.status == 200;
+    }
+
+    // A session that carries any of these amr values has satisfied a second factor
+    // (or federated the check to an IdP) and may operate in any requiring tenant.
+    // A password-only session (amr = ["pwd"]) has not.
+    static bool sessionHas2fa(const std::vector<std::string>& amr) {
+        for (const auto& m : amr)
+            if (m == "otp" || m == "totp" || m == "email" || m == "recovery" || m == "oauth")
+                return true;
+        return false;
+    }
+
+    // Whether the tenant requires 2FA (per-tenant policy; user-independent), cached
+    // briefly. Only consulted for password-only sessions, so most requests never
+    // hit it. Fail-closed on an ldap_manager error (treat as required) — consistent
+    // with the login path, and the short TTL absorbs brief blips.
+    bool tenantRequires2fa(const std::string& user, const std::string& tenant) {
+        const long now = static_cast<long>(std::time(nullptr));
+        {
+            std::lock_guard<std::mutex> lk(requiresMu_);
+            auto it = requiresCache_.find(tenant);
+            if (it != requiresCache_.end() && it->second.second > now)
+                return it->second.first;
+        }
+        bool required = false, mustEnroll = false;
+        std::vector<std::string> methods;
+        // internal_required returns `required` == tenant_requires (policy only).
+        const bool ok = mfaRequired(user, tenant, required, mustEnroll, methods);
+        const bool requires = ok ? required : true;  // fail-closed
+        {
+            std::lock_guard<std::mutex> lk(requiresMu_);
+            requiresCache_[tenant] = {requires, now + 30};
+        }
+        return requires;
     }
 
     // Fill an AuthIdentity from verified JWT claims, scoping roles to the active
@@ -1721,6 +1769,11 @@ private:
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
+    // Per-tenant "requires 2FA" cache (tenant -> {requires, expiry-epoch}), for the
+    // tenant-switch enforcement gate. Short-lived; user-independent. `inline static`
+    // so it is shared across the per-request handler instances (process-global).
+    inline static std::mutex requiresMu_;
+    inline static std::map<std::string, std::pair<bool, long>> requiresCache_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {
