@@ -1582,6 +1582,22 @@ private:
             audit_->emitAuth("login_failure", "denied", attempted, tenant, ip);
             return unauthorized(resp);
         }
+        // Stamp a tenant the user actually belongs to. LDAP bind succeeds regardless
+        // of tenant, and tenant resolution (X-Tenant / host / "default") can land on
+        // a tenant the user is NOT a member of — the token would then be rejected by
+        // the M3 membership check on every request (a login that "works" but 403s
+        // everything). Mirror refreshToken: keep the resolved tenant if valid, else
+        // fall back to a tenant the user does belong to (reject if none).
+        {
+            auto tenants = ldap_->getTenantsForUser(id.user);
+            if (tenants.empty()) {
+                audit_->emitAuth("login_failure", "denied", id.user, id.tenant, ip);
+                return unauthorized(resp);
+            }
+            bool member = false;
+            for (const auto& t : tenants) if (t == id.tenant) { member = true; break; }
+            if (!member) id.tenant = tenants.front();
+        }
         // Fail-closed write-ahead (§6): do not issue a session we cannot audit.
         if (!audit_->emitAuth("login_success", "ok", id.user, id.tenant, ip)) {
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
