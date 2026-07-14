@@ -88,6 +88,21 @@ int main() {
     cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
     cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
 
+    // Two-factor auth orchestration (PROPOSAL §4.6). Disabled unless MFA_ENABLED
+    // and the ldap_manager internal API URL + shared secret are configured.
+    {
+        std::string me = webdav::getEnvOrDefault("MFA_ENABLED", "");
+        cfg.mfa_enabled = (me == "true" || me == "1" || me == "yes" || me == "on");
+    }
+    cfg.ldap_manager_url = webdav::getEnvOrDefault("LDAP_MANAGER_URL", "");
+    cfg.mfa_internal_secret = webdav::getEnvOrDefault("MFA_INTERNAL_SECRET", "");
+    cfg.mfa_challenge_ttl = std::stoi(webdav::getEnvOrDefault("MFA_CHALLENGE_TTL_SECONDS", "300"));
+    if (cfg.mfa_enabled && (cfg.ldap_manager_url.empty() || cfg.mfa_internal_secret.empty())) {
+        webdav::errorLog("FATAL: MFA_ENABLED but LDAP_MANAGER_URL / MFA_INTERNAL_SECRET is unset "
+                         "— refusing to start with an unenforceable 2FA gate");
+        return 1;
+    }
+
     // Durable audit emission — shares the core's Redis broker + stream names.
     {
         std::string ae = webdav::getEnvOrDefault("FILEENGINE_AUDIT_ENABLED", "");

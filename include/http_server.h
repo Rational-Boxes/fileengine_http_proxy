@@ -41,6 +41,17 @@ struct Config {
     std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
     int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
 
+    // Two-factor auth orchestration (PROPOSAL §4.6). When mfa_enabled, a
+    // password-verified login that ldap_manager reports as MFA-required receives a
+    // short-lived, IP-bound `mfa_pending` challenge token instead of a full
+    // session; POST /v1/auth/2fa completes it. Verification is delegated to
+    // ldap_manager's internal API (shared MFA_INTERNAL_SECRET). Fail-closed: if the
+    // required-check cannot reach ldap_manager, no session is issued.
+    bool mfa_enabled = false;
+    std::string ldap_manager_url;            // e.g. http://127.0.0.1:8093 (internal 2FA API)
+    std::string mfa_internal_secret;         // X-Internal-Auth for /internal/2fa/*
+    int mfa_challenge_ttl = 300;             // mfa_pending token lifetime (s)
+
     // Durable audit emission (usage_logging_and_auditing §5). Shares the core's
     // Redis broker + stream; login_success/login_failure emit from this door.
     bool audit_enabled = false;

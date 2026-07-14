@@ -30,6 +30,11 @@ HttpResult HttpClient::postForm(const std::string& url, const std::string& form_
                    "application/x-www-form-urlencoded", headers);
 }
 
+HttpResult HttpClient::postJson(const std::string& url, const std::string& json_body,
+                                const std::map<std::string, std::string>& headers) const {
+    return request(HTTPRequest::HTTP_POST, url, json_body, "application/json", headers);
+}
+
 HttpResult HttpClient::request(const std::string& method, const std::string& url,
                                const std::string& body, const std::string& content_type,
                                const std::map<std::string, std::string>& headers) const {

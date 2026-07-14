@@ -1,6 +1,7 @@
 #include "http_server.h"
 #include "utils.h"
 #include "jwt.h"
+#include "http_client.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -288,6 +289,7 @@ private:
         std::string user;
         std::string tenant;
         std::vector<std::string> roles;
+        std::vector<std::string> amr;   // auth methods from the verified token (RFC 8176)
     };
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
@@ -299,6 +301,14 @@ private:
         if (path == "/v1/auth/token") {
             if (method == "POST")   return issueToken(req, resp);
             if (method == "DELETE") return revokeToken(req, resp);
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
+        // Second-factor completion. Pre-auth: the caller holds only the short-lived
+        // mfa_pending token from issueToken, not a full session, so it is handled
+        // before the general authenticate().
+        if (path == "/v1/auth/2fa") {
+            if (method == "POST") return verifyMfa(req, resp);
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
 
@@ -1173,7 +1183,10 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"audit log unavailable"})");
         }
-        std::string token = mintJwt(info.user_id, st.tenant);
+        // Federated login: the second factor (if any) is enforced by the external
+        // IdP, so the session records amr=["oauth"] and is not sent through the
+        // bridge's own TOTP/email challenge.
+        std::string token = mintJwt(info.user_id, st.tenant, {"oauth"});
 
         // Token returned in the URL fragment (not the query) so it is not sent to
         // the SPA's server or leaked via Referer. The SPA scrubs it from history.
@@ -1214,6 +1227,14 @@ private:
             long now = static_cast<long>(std::time(nullptr));
             if (!jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
                 webdav::debugLog("authenticate: JWT rejected: " + err);
+                unauthorized(resp);
+                return false;
+            }
+            // A pre-auth challenge token (issued before the 2FA step) carries no
+            // roles and MUST NOT reach any resource — reject it here (defence in
+            // depth; it also has no roles, so it would authorize nothing anyway).
+            if (claims->optValue<bool>("mfa_pending", false)) {
+                webdav::debugLog("authenticate: rejected mfa_pending token on a resource path");
                 unauthorized(resp);
                 return false;
             }
@@ -1291,7 +1312,11 @@ private:
     // Build a signed HS256 JWT carrying the user's identity and their roles in
     // EVERY tenant they belong to ({tenant:[roles]}). `activeTenant` is recorded
     // as the token's default tenant context. Roles are resolved live from LDAP.
-    std::string mintJwt(const std::string& user, const std::string& activeTenant) {
+    // `amr` records the authentication methods that produced this session (RFC
+    // 8176): ["pwd"] for a password-only login, ["pwd","otp"|"email"|"recovery"]
+    // once a second factor has been verified.
+    std::string mintJwt(const std::string& user, const std::string& activeTenant,
+                        const std::vector<std::string>& amr = {"pwd"}) {
         auto byTenant = ldap_->getRolesByTenant(user);
 
         Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
@@ -1311,7 +1336,109 @@ private:
             rolesObj->set(kv.first, arr);
         }
         claims->set("roles", rolesObj);
+
+        Poco::JSON::Array::Ptr amrArr = new Poco::JSON::Array();
+        for (const auto& m : amr) amrArr->add(m);
+        claims->set("amr", amrArr);
         return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // Mint a short-lived, IP-bound pre-auth token issued after a password succeeds
+    // but before the second factor is verified (PROPOSAL §4.6). It carries NO roles
+    // and an explicit `mfa_pending` marker, so even if a resource path failed to
+    // gate it, it authorizes nothing. `mip` binds it to the client IP that logged
+    // in, so a stolen challenge token can't be completed from elsewhere.
+    std::string mintMfaPending(const std::string& user, const std::string& tenant,
+                               const std::string& ip) {
+        Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
+        long now = static_cast<long>(std::time(nullptr));
+        claims->set("iss", cfg_.jwt_issuer);
+        claims->set("sub", user);
+        claims->set("tenant", tenant);
+        claims->set("iat", static_cast<Poco::Int64>(now));
+        claims->set("exp", static_cast<Poco::Int64>(now + cfg_.mfa_challenge_ttl));
+        claims->set("jti", randomCodeVerifier());
+        claims->set("mfa_pending", true);
+        claims->set("mip", ip);
+        Poco::JSON::Array::Ptr amrArr = new Poco::JSON::Array();
+        amrArr->add("pwd");
+        claims->set("amr", amrArr);
+        return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // ---- ldap_manager internal 2FA API (server-to-server) --------------------
+    // All calls carry X-Internal-Auth (shared secret) and forward the end-user's
+    // IP as X-Forwarded-For so ldap_manager rate-limits on the real client.
+
+    std::map<std::string, std::string> mfaHeaders(const std::string& ip) {
+        return {{"X-Internal-Auth", cfg_.mfa_internal_secret}, {"X-Forwarded-For", ip}};
+    }
+
+    // POST /internal/2fa/required. Returns true on a clean 200 and fills the outs;
+    // returns false on any transport/HTTP/parse failure (caller fails closed).
+    bool mfaRequired(const std::string& user, const std::string& tenant,
+                     bool& required, bool& mustEnroll, std::vector<std::string>& methods) {
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("uid", user);
+        body->set("tenant", tenant);
+        std::ostringstream bs; body->stringify(bs);
+        HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/2fa/required",
+                                       bs.str(), mfaHeaders(""));
+        if (!r.ok || r.status != 200) {
+            webdav::warnLog("mfaRequired: ldap_manager unreachable/failed (status " +
+                            std::to_string(r.status) + " " + r.error + ")");
+            return false;
+        }
+        try {
+            Poco::JSON::Parser p;
+            auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+            required = o->optValue<bool>("required", true);
+            mustEnroll = o->optValue<bool>("must_enroll", false);
+            methods.clear();
+            if (auto arr = o->getArray("methods"))
+                for (size_t i = 0; i < arr->size(); ++i)
+                    methods.push_back(arr->getElement<std::string>(i));
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    // POST /internal/2fa/verify. Returns true only on {ok:true}.
+    bool mfaVerify(const std::string& user, const std::string& tenant,
+                   const std::string& method, const std::string& code, const std::string& ip) {
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("uid", user);
+        body->set("tenant", tenant);
+        body->set("method", method);
+        body->set("code", code);
+        std::ostringstream bs; body->stringify(bs);
+        HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/2fa/verify",
+                                       bs.str(), mfaHeaders(ip));
+        if (!r.ok || r.status != 200) return false;
+        try {
+            Poco::JSON::Parser p;
+            auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+            return o->optValue<bool>("ok", false);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // POST /internal/2fa/email-challenge — asks ldap_manager to mail a one-time
+    // code. Returns true if the request was accepted (best-effort delivery).
+    bool mfaEmailChallenge(const std::string& user, const std::string& tenant,
+                           const std::string& ip) {
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("uid", user);
+        body->set("tenant", tenant);
+        std::ostringstream bs; body->stringify(bs);
+        HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/2fa/email-challenge",
+                                       bs.str(), mfaHeaders(ip));
+        return r.ok && r.status == 200;
     }
 
     // Fill an AuthIdentity from verified JWT claims, scoping roles to the active
@@ -1328,6 +1455,11 @@ private:
                 for (size_t i = 0; i < arr->size(); ++i)
                     out.roles.push_back(arr->getElement<std::string>(i));
             }
+        }
+        out.amr.clear();
+        if (auto amrArr = claims->getArray("amr")) {
+            for (size_t i = 0; i < amrArr->size(); ++i)
+                out.amr.push_back(amrArr->getElement<std::string>(i));
         }
     }
 
@@ -1358,7 +1490,95 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"audit log unavailable"})");
         }
-        std::string token = mintJwt(id.user, id.tenant);
+
+        // Two-factor gate (PROPOSAL §4.6). When enabled, ask ldap_manager whether
+        // this identity needs a second factor. Fail-closed: an unreachable identity
+        // service means we cannot confirm the user is exempt, so we issue no session.
+        if (cfg_.mfa_enabled) {
+            bool required = false, mustEnroll = false;
+            std::vector<std::string> methods;
+            if (!mfaRequired(id.user, id.tenant, required, mustEnroll, methods)) {
+                return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                                R"({"error":"2FA service unavailable"})");
+            }
+            if (required) {
+                std::string mtok = mintMfaPending(id.user, id.tenant, ip);
+                audit_->emitAuth("mfa_challenge", "ok", id.user, id.tenant, ip);
+                Poco::JSON::Object out;
+                out.set("mfa_required", true);
+                out.set("mfa_token", mtok);
+                out.set("token_type", "MfaPending");
+                out.set("expires_in", cfg_.mfa_challenge_ttl);
+                out.set("must_enroll", mustEnroll);
+                Poco::JSON::Array::Ptr marr = new Poco::JSON::Array();
+                for (const auto& m : methods) marr->add(m);
+                out.set("methods", marr);
+                std::ostringstream os; out.stringify(os);
+                return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
+            }
+        }
+
+        std::string token = mintJwt(id.user, id.tenant, {"pwd"});
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
+    }
+
+    // POST /v1/auth/2fa — complete (or drive) a second-factor challenge.
+    // Body: { "mfa_token": <the pending token from issueToken>,
+    //         "action": "verify" (default) | "send",
+    //         "method": "totp" | "email" | "recovery",
+    //         "code":   <required for action=verify> }
+    // "send" asks ldap_manager to email a one-time code; "verify" checks a code and,
+    // on success, mints the full session with amr=["pwd", <method>].
+    void verifyMfa(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        const std::string ip = clientIp(req);
+        const std::string body = readBody(req);
+        const std::string mfaToken = jsonField(body, "mfa_token");
+        std::string action = jsonField(body, "action");
+        if (action.empty()) action = "verify";
+        std::string vmethod = jsonField(body, "method");
+        if (vmethod.empty()) vmethod = "totp";
+        const std::string code = jsonField(body, "code");
+
+        // Validate the pending token: signature + exp, the mfa_pending marker, and
+        // the IP binding (a stolen challenge token can't be completed elsewhere).
+        Poco::JSON::Object::Ptr claims;
+        std::string err;
+        long now = static_cast<long>(std::time(nullptr));
+        if (mfaToken.empty() ||
+            !jwt::verify(mfaToken, cfg_.jwt_secret, now, claims, err) ||
+            !claims->optValue<bool>("mfa_pending", false)) {
+            return unauthorized(resp);
+        }
+        const std::string user = claims->optValue<std::string>("sub", std::string());
+        const std::string tenant = claims->optValue<std::string>("tenant", std::string());
+        const std::string boundIp = claims->optValue<std::string>("mip", std::string());
+        if (user.empty() || boundIp != ip) {
+            audit_->emitAuth("mfa_failure", "denied", user.empty() ? "<unknown>" : user,
+                             tenant, ip);
+            return unauthorized(resp);
+        }
+
+        if (action == "send") {
+            bool sent = (vmethod == "email") && mfaEmailChallenge(user, tenant, ip);
+            Poco::JSON::Object out;
+            out.set("sent", sent);
+            std::ostringstream os; out.stringify(os);
+            return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
+        }
+
+        // action == verify
+        if (!mfaVerify(user, tenant, vmethod, code, ip)) {
+            audit_->emitAuth("mfa_failure", "denied", user, tenant, ip);
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid or expired second factor"})");
+        }
+        if (!audit_->emitAuth("mfa_success", "ok", user, tenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
+        std::string token = mintJwt(user, tenant, {"pwd", vmethod});
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -1394,8 +1614,11 @@ private:
                             R"({"error":"audit log unavailable"})");
         }
         // mintJwt re-reads roles per tenant live (getRolesByTenant), so the new
-        // token reflects current group/role membership, not the old claims.
-        std::string token = mintJwt(id.user, activeTenant);
+        // token reflects current group/role membership, not the old claims. The
+        // amr is carried over so a 2FA-completed session doesn't silently downgrade
+        // to password-only on refresh (defaults to ["pwd"] for legacy tokens).
+        std::vector<std::string> amr = id.amr.empty() ? std::vector<std::string>{"pwd"} : id.amr;
+        std::string token = mintJwt(id.user, activeTenant, amr);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");

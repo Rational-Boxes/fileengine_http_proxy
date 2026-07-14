@@ -144,3 +144,87 @@ TEST(JwtSecurity, TokenWithoutExpIsCurrentlyAccepted) {
     EXPECT_TRUE(verify(tok, kSecret, kNow, claims, err))
         << "If exp is later made mandatory, update this expectation to EXPECT_FALSE.";
 }
+
+// ---------------------------------------------------------------------------
+// Two-factor auth token contract (PROPOSAL §4.6). These pin the security-visible
+// shape of the pre-auth `mfa_pending` challenge token and the `amr` claim, so a
+// refactor can't silently weaken the gate. The verify() layer treats these like
+// any other claims; the enforcement (resource gate rejects mfa_pending, IP
+// binding) is in http_server authenticate()/verifyMfa — see test_e2e_2fa.sh for
+// the end-to-end assertion. Here we ensure the claims survive a sign/verify
+// round-trip intact and are secret-bound (unforgeable).
+
+// A challenge token expressing the §4.6 contract: mfa_pending marker, IP binding
+// (mip), amr=["pwd"], and NO roles map — so even if the gate missed it, it
+// authorizes nothing.
+static std::string makeMfaPending(const std::string& secret, const std::string& ip, long exp) {
+    Poco::JSON::Object::Ptr c = new Poco::JSON::Object();
+    c->set("sub", "alice");
+    c->set("tenant", "acme");
+    c->set("exp", static_cast<Poco::Int64>(exp));
+    c->set("mfa_pending", true);
+    c->set("mip", ip);
+    Poco::JSON::Array::Ptr amr = new Poco::JSON::Array();
+    amr->add("pwd");
+    c->set("amr", amr);
+    return sign(c, secret);
+}
+
+TEST(MfaToken, PendingClaimsRoundTrip) {
+    std::string tok = makeMfaPending(kSecret, "203.0.113.9", kNow + 300);
+    Poco::JSON::Object::Ptr claims;
+    std::string err;
+    ASSERT_TRUE(verify(tok, kSecret, kNow, claims, err)) << err;
+    EXPECT_TRUE(claims->optValue<bool>("mfa_pending", false));
+    EXPECT_EQ(claims->optValue<std::string>("mip", ""), "203.0.113.9");
+    // No roles: a pending token grants access to nothing on its own.
+    EXPECT_FALSE(claims->has("roles"));
+    auto amr = claims->getArray("amr");
+    ASSERT_FALSE(amr.isNull());
+    ASSERT_EQ(amr->size(), 1u);
+    EXPECT_EQ(amr->getElement<std::string>(0), "pwd");
+}
+
+// The challenge token is secret-bound: an attacker can't forge one (e.g. to flip
+// mfa_pending off or rebind mip to their own IP) without the signing secret.
+TEST(MfaToken, PendingIsUnforgeableWithoutSecret) {
+    std::string tok = makeMfaPending("attacker-secret", "10.0.0.1", kNow + 300);
+    Poco::JSON::Object::Ptr claims;
+    std::string err;
+    EXPECT_FALSE(verify(tok, kSecret, kNow, claims, err));
+    EXPECT_EQ(err, "bad signature");
+}
+
+// Tampering the mip binding (to complete a stolen challenge from another IP)
+// breaks the signature — the binding cannot be edited in place.
+TEST(MfaToken, TamperedIpBindingRejected) {
+    std::string tok = makeMfaPending(kSecret, "203.0.113.9", kNow + 300);
+    size_t p1 = tok.find('.'), p2 = tok.find('.', tok.find('.') + 1);
+    tok[p1 + 1] = (tok[p1 + 1] == 'A') ? 'B' : 'A';  // corrupt payload
+    (void)p2;
+    Poco::JSON::Object::Ptr claims;
+    std::string err;
+    EXPECT_FALSE(verify(tok, kSecret, kNow, claims, err));
+}
+
+// A completed session records the second factor in amr (["pwd","otp"], etc.),
+// and that survives the round-trip so downstream can reason about it.
+TEST(MfaToken, CompletedAmrRoundTrip) {
+    Poco::JSON::Object::Ptr c = new Poco::JSON::Object();
+    c->set("sub", "alice");
+    c->set("tenant", "acme");
+    c->set("exp", static_cast<Poco::Int64>(kNow + 900));
+    Poco::JSON::Array::Ptr amr = new Poco::JSON::Array();
+    amr->add("pwd");
+    amr->add("otp");
+    c->set("amr", amr);
+    std::string tok = sign(c, kSecret);
+    Poco::JSON::Object::Ptr claims;
+    std::string err;
+    ASSERT_TRUE(verify(tok, kSecret, kNow, claims, err)) << err;
+    auto got = claims->getArray("amr");
+    ASSERT_FALSE(got.isNull());
+    ASSERT_EQ(got->size(), 2u);
+    EXPECT_EQ(got->getElement<std::string>(1), "otp");
+    EXPECT_FALSE(claims->optValue<bool>("mfa_pending", false));
+}

@@ -38,6 +38,11 @@ public:
     HttpResult postForm(const std::string& url, const std::string& form_body,
                         const std::map<std::string, std::string>& headers) const;
 
+    // POSTs an application/json body (server-to-server, e.g. ldap_manager's
+    // internal 2FA API which parses pydantic bodies).
+    HttpResult postJson(const std::string& url, const std::string& json_body,
+                        const std::map<std::string, std::string>& headers) const;
+
 private:
     HttpResult request(const std::string& method, const std::string& url,
                        const std::string& body, const std::string& content_type,
