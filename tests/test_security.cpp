@@ -14,10 +14,12 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
 
 #include <Poco/JSON/Object.h>
 
 #include "jwt.h"
+#include "client_ip.h"
 
 using httpbridge::jwt::sign;
 using httpbridge::jwt::verify;
@@ -227,4 +229,53 @@ TEST(MfaToken, CompletedAmrRoundTrip) {
     ASSERT_EQ(got->size(), 2u);
     EXPECT_EQ(got->getElement<std::string>(1), "otp");
     EXPECT_FALSE(claims->optValue<bool>("mfa_pending", false));
+}
+
+// ---------------------------------------------------------------------------
+// Trusted-proxy real-client-IP resolution (client_ip.h). These pin that the
+// hardened path cannot be fooled by a spoofed X-Forwarded-For, and that the dev
+// path is unchanged.
+
+using httpbridge::resolveClientIp;
+
+// Development (no trusted proxies): the first XFF hop is trusted; else the peer.
+TEST(ClientIp, DevTrustsFirstHopOrPeer) {
+    EXPECT_EQ(resolveClientIp("127.0.0.1", "203.0.113.9, 10.0.0.1", {}), "203.0.113.9");
+    EXPECT_EQ(resolveClientIp("198.51.100.7", "", {}), "198.51.100.7");
+}
+
+// Hardened: XFF from a trusted proxy peer -> the right-most NON-trusted hop is the
+// real client (proxies to its right are stripped, spoofed entries to its left are
+// ignored).
+TEST(ClientIp, HardenedReturnsRealClient) {
+    std::vector<std::string> trusted = {"10.0.0.0/8", "127.0.0.1"};
+    // peer is the proxy; XFF = "<client>, <proxy>"
+    EXPECT_EQ(resolveClientIp("10.0.0.5", "203.0.113.9, 10.0.0.5", trusted), "203.0.113.9");
+    // chained proxies: real client is left of the trusted chain
+    EXPECT_EQ(resolveClientIp("127.0.0.1", "203.0.113.9, 10.1.2.3, 10.0.0.5", trusted),
+              "203.0.113.9");
+}
+
+// Spoofing: a client injects a fake left-most XFF entry. The resolver must ignore
+// it and return the address the trusted proxy actually observed.
+TEST(ClientIp, HardenedIgnoresSpoofedLeftmost) {
+    std::vector<std::string> trusted = {"10.0.0.0/8"};
+    // Attacker sent "9.9.9.9"; the trusted proxy appended the real peer 203.0.113.9.
+    EXPECT_EQ(resolveClientIp("10.0.0.5", "9.9.9.9, 203.0.113.9, 10.0.0.5", trusted),
+              "203.0.113.9");
+}
+
+// A direct connection (peer is NOT a trusted proxy) cannot spoof via XFF at all —
+// the socket peer wins, the header is ignored.
+TEST(ClientIp, HardenedUntrustedPeerIgnoresXff) {
+    std::vector<std::string> trusted = {"10.0.0.0/8"};
+    EXPECT_EQ(resolveClientIp("203.0.113.50", "1.2.3.4", trusted), "203.0.113.50");
+}
+
+// CIDR + plain-IP matching sanity.
+TEST(ClientIp, CidrMatching) {
+    EXPECT_TRUE(httpbridge::ipInCidr("10.1.2.3", "10.0.0.0/8"));
+    EXPECT_FALSE(httpbridge::ipInCidr("11.1.2.3", "10.0.0.0/8"));
+    EXPECT_TRUE(httpbridge::ipInCidr("127.0.0.1", "127.0.0.1"));
+    EXPECT_FALSE(httpbridge::ipInCidr("garbage", "10.0.0.0/8"));  // fail-closed
 }

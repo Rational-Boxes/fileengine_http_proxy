@@ -25,6 +25,12 @@ struct Config {
     std::string monitoring_host = "127.0.0.1";
     int monitoring_port = 8091;
     std::vector<std::string> monitoring_allow_ips;  // optional client-IP allowlist for the monitor (security review L2)
+    // Trusted reverse-proxy IPs/CIDRs (FILEENGINE_TRUSTED_PROXIES). When set, the
+    // real client IP is resolved from X-Forwarded-For only via a trusted proxy peer
+    // (right-most untrusted hop), hardening the MFA IP binding + audit source_addr
+    // against XFF spoofing. Empty = development (trust the first XFF hop). See
+    // client_ip.h.
+    std::vector<std::string> trusted_proxies;
     // Bearer session tokens are signed HS256 JWTs. token_ttl is deliberately
     // SHORT: a token is re-minted periodically (POST /v1/auth/refresh) from live
     // LDAP, so role changes take effect within ~the refresh interval and a token

@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "jwt.h"
 #include "http_client.h"
+#include "client_ip.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -1563,12 +1564,12 @@ private:
     // Client IP for the audit trail: first X-Forwarded-For hop (the bridge sits
     // behind the nginx proxy), else the socket peer.
     std::string clientIp(HTTPServerRequest& req) {
-        std::string xff = req.get("X-Forwarded-For", "");
-        if (!xff.empty()) {
-            auto c = xff.find(',');
-            return webdav::trim(c == std::string::npos ? xff : xff.substr(0, c));
-        }
-        try { return req.clientAddress().host().toString(); } catch (...) { return ""; }
+        std::string peer;
+        try { peer = req.clientAddress().host().toString(); } catch (...) {}
+        // Trusted-proxy-aware resolution (client_ip.h). With FILEENGINE_TRUSTED_PROXIES
+        // unset this keeps the dev behavior (first XFF hop); set it in production so
+        // XFF can't be spoofed to forge the MFA IP binding / audit source.
+        return resolveClientIp(peer, req.get("X-Forwarded-For", ""), cfg_.trusted_proxies);
     }
 
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {

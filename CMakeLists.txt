@@ -128,6 +128,7 @@ target_include_directories(security_tests PRIVATE include)
 target_compile_features(security_tests PRIVATE cxx_std_17)
 target_link_libraries(security_tests
     Poco::JSON
+    Poco::Net         # Poco::Net::IPAddress for client_ip.h (trusted-proxy resolution)
     Poco::Crypto      # transitively links OpenSSL libcrypto for jwt.h's HMAC()
     Poco::Foundation
     Threads::Threads

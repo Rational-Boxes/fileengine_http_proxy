@@ -71,6 +71,15 @@ int main() {
             if (!t.empty()) cfg.monitoring_allow_ips.push_back(t);
         }
     }
+    {
+        // Trusted reverse-proxy IPs/CIDRs for real-client-IP resolution (production
+        // hardening). Empty = development (first X-Forwarded-For hop is trusted).
+        std::string proxies = webdav::getEnvOrDefault("FILEENGINE_TRUSTED_PROXIES", "");
+        for (auto& p : webdav::splitString(proxies, ',')) {
+            std::string t = webdav::trim(p);
+            if (!t.empty()) cfg.trusted_proxies.push_back(t);
+        }
+    }
     cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "900"));
     // Shared HS256 secret for signing/verifying bearer JWTs. Every service that
     // verifies these tokens must share this exact value.
