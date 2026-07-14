@@ -1460,6 +1460,48 @@ private:
         return r.ok && r.status == 200;
     }
 
+    // Grace enrollment (mandated-but-unenrolled user, during login). begin returns
+    // the setup blob (secret + otpauth uri) to pass through to the SPA.
+    HttpResult mfaEnrollBegin(const std::string& user, const std::string& tenant,
+                              const std::string& ip) {
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("uid", user);
+        body->set("tenant", tenant);
+        std::ostringstream bs; body->stringify(bs);
+        return client.postJson(cfg_.ldap_manager_url + "/internal/2fa/enroll-begin",
+                               bs.str(), mfaHeaders(ip));
+    }
+
+    // complete verifies the code against the pending secret + enables 2FA; on
+    // success `recoveryJson` receives the recovery_codes array (verbatim JSON).
+    bool mfaEnrollComplete(const std::string& user, const std::string& tenant,
+                           const std::string& code, const std::string& ip,
+                           std::string& recoveryJson) {
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("uid", user);
+        body->set("tenant", tenant);
+        body->set("code", code);
+        std::ostringstream bs; body->stringify(bs);
+        HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/2fa/enroll-complete",
+                                       bs.str(), mfaHeaders(ip));
+        if (!r.ok || r.status != 200) return false;
+        try {
+            Poco::JSON::Parser p;
+            auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+            if (!o->optValue<bool>("ok", false)) return false;
+            if (auto arr = o->getArray("recovery_codes")) {
+                std::ostringstream rs; arr->stringify(rs); recoveryJson = rs.str();
+            } else {
+                recoveryJson = "[]";
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     // A session that carries any of these amr values has satisfied a second factor
     // (or federated the check to an IdP) and may operate in any requiring tenant.
     // A password-only session (amr = ["pwd"]) has not.
@@ -1581,11 +1623,12 @@ private:
 
     // POST /v1/auth/2fa — complete (or drive) a second-factor challenge.
     // Body: { "mfa_token": <the pending token from issueToken>,
-    //         "action": "verify" (default) | "send",
+    //         "action": "verify" (default) | "send" | "enroll_begin" | "enroll_complete",
     //         "method": "totp" | "email" | "recovery",
-    //         "code":   <required for action=verify> }
-    // "send" asks ldap_manager to email a one-time code; "verify" checks a code and,
-    // on success, mints the full session with amr=["pwd", <method>].
+    //         "code":   <required for verify / enroll_complete> }
+    // "send" emails a one-time code; "verify" checks a code and mints the full
+    // session (amr=["pwd", <method>]); "enroll_begin"/"enroll_complete" drive grace
+    // enrollment for a mandated-but-unenrolled user, ending in a full session.
     void verifyMfa(HTTPServerRequest& req, HTTPServerResponse& resp) {
         const std::string ip = clientIp(req);
         const std::string body = readBody(req);
@@ -1621,6 +1664,33 @@ private:
             out.set("sent", sent);
             std::ostringstream os; out.stringify(os);
             return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
+        }
+
+        // Grace enrollment: begin returns the TOTP setup blob (QR/secret) to show.
+        if (action == "enroll_begin") {
+            HttpResult r = mfaEnrollBegin(user, tenant, ip);
+            if (!r.ok || r.status != 200) {
+                return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY,
+                                R"({"error":"could not start enrollment"})");
+            }
+            return sendJson(resp, HTTPResponse::HTTP_OK, r.body);  // pass through setup blob
+        }
+        // Grace enrollment: verify the code, enable 2FA, and issue the session.
+        if (action == "enroll_complete") {
+            std::string recoveryJson;
+            if (!mfaEnrollComplete(user, tenant, code, ip, recoveryJson)) {
+                audit_->emitAuth("mfa_failure", "denied", user, tenant, ip);
+                return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                                R"({"error":"invalid code"})");
+            }
+            if (!audit_->emitAuth("mfa_success", "ok", user, tenant, ip)) {
+                return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                                R"({"error":"audit log unavailable"})");
+            }
+            std::string token = mintJwt(user, tenant, {"pwd", "totp"});
+            return sendJson(resp, HTTPResponse::HTTP_OK,
+                     "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                     std::to_string(cfg_.token_ttl) + ",\"recovery_codes\":" + recoveryJson + "}");
         }
 
         // action == verify
