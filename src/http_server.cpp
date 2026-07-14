@@ -1391,8 +1391,11 @@ private:
 
     // POST /internal/2fa/required. Returns true on a clean 200 and fills the outs;
     // returns false on any transport/HTTP/parse failure (caller fails closed).
+    // `required` = challenge at login (enrolled OR tenant mandates); `tenantRequires`
+    // = the tenant's mandate alone (for the tenant-switch gate).
     bool mfaRequired(const std::string& user, const std::string& tenant,
-                     bool& required, bool& mustEnroll, std::vector<std::string>& methods) {
+                     bool& required, bool& mustEnroll, std::vector<std::string>& methods,
+                     bool& tenantRequires) {
         HttpClient client(5);
         Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
         body->set("uid", user);
@@ -1410,6 +1413,7 @@ private:
             auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
             required = o->optValue<bool>("required", true);
             mustEnroll = o->optValue<bool>("must_enroll", false);
+            tenantRequires = o->optValue<bool>("tenant_requires", required);
             methods.clear();
             if (auto arr = o->getArray("methods"))
                 for (size_t i = 0; i < arr->size(); ++i)
@@ -1478,11 +1482,13 @@ private:
             if (it != requiresCache_.end() && it->second.second > now)
                 return it->second.first;
         }
-        bool required = false, mustEnroll = false;
+        bool required = false, mustEnroll = false, tenantRequires = false;
         std::vector<std::string> methods;
-        // internal_required returns `required` == tenant_requires (policy only).
-        const bool ok = mfaRequired(user, tenant, required, mustEnroll, methods);
-        const bool requires = ok ? required : true;  // fail-closed
+        // The switch gate enforces the tenant's MANDATE (not per-user enrollment),
+        // so it reads tenant_requires — a password-only (un-enrolled) session
+        // entering a mandating tenant must re-login + enroll.
+        const bool ok = mfaRequired(user, tenant, required, mustEnroll, methods, tenantRequires);
+        const bool requires = ok ? tenantRequires : true;  // fail-closed
         {
             std::lock_guard<std::mutex> lk(requiresMu_);
             requiresCache_[tenant] = {requires, now + 30};
@@ -1544,9 +1550,9 @@ private:
         // this identity needs a second factor. Fail-closed: an unreachable identity
         // service means we cannot confirm the user is exempt, so we issue no session.
         if (cfg_.mfa_enabled) {
-            bool required = false, mustEnroll = false;
+            bool required = false, mustEnroll = false, tenantRequires = false;
             std::vector<std::string> methods;
-            if (!mfaRequired(id.user, id.tenant, required, mustEnroll, methods)) {
+            if (!mfaRequired(id.user, id.tenant, required, mustEnroll, methods, tenantRequires)) {
                 return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                                 R"({"error":"2FA service unavailable"})");
             }
