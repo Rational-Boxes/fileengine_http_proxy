@@ -45,8 +45,18 @@ public:
                                          const std::string& actor, const std::string& tenant,
                                          const std::string& source_addr, const std::string& scope);
 
+    // True iff auditing is turned on (FILEENGINE_AUDIT_ENABLED).
+    bool enabled() const { return opts_.enabled; }
+
+    // True iff the audit log is currently publishable: built WITH hiredis AND a
+    // Redis connection (auth/db + PING) succeeds. Returns false when built
+    // without hiredis. Used by the startup gate (A-i) and /readyz (A-ii) so that
+    // "enabled but unable to record" is loud rather than a silent fail-open.
+    bool healthy();
+
 private:
     bool publish(const std::string& payload);  // XADD; mutex-guarded
+    bool ensureConnectedLocked();              // mutex_ held; hiredis-only
 
     Options opts_;
     std::mutex mutex_;

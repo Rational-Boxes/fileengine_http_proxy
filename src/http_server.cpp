@@ -1475,11 +1475,18 @@ private:
         auth->add_roles("system_admin");
 
         auto r = grpc_->listDirectory(request);
-        if (r.success()) {
-            sendJson(resp, HTTPResponse::HTTP_OK, R"({"status":"ready"})");
+        const bool coreOk = r.success();
+        // A-ii: when auditing is enabled, surface its reachability so an audit
+        // outage drains this instance (audit is a hard dependency for logins).
+        const bool auditOk = !audit_->enabled() || audit_->healthy();
+        if (coreOk && auditOk) {
+            sendJson(resp, HTTPResponse::HTTP_OK, R"({"status":"ready","core":true,"audit":true})");
         } else {
-            sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
-                     std::string(R"({"status":"unavailable","error":")") + r.error() + R"("})");
+            std::string body = std::string(R"({"status":"unavailable","core":)") +
+                               (coreOk ? "true" : "false") + R"(,"audit":)" +
+                               (auditOk ? "true" : "false") +
+                               (coreOk ? "" : std::string(R"(,"error":")") + r.error() + R"(")") + "}";
+            sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE, body);
         }
     }
 

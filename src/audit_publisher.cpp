@@ -53,30 +53,52 @@ bool AuditPublisher::emitAuth(const std::string& action, const std::string& outc
     return publish(buildAuthEnvelope(action, outcome, actor, tenant, source_addr, scope));
 }
 
+#ifdef HTTPBRIDGE_HAS_HIREDIS
+// mutex_ must be held. Ensures ctx_ is a live, authenticated connection.
+bool AuditPublisher::ensureConnectedLocked() {
+    if (ctx_ && !ctx_->err) return true;
+    if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+    ctx_ = redisConnect(opts_.host.c_str(), opts_.port);
+    if (!ctx_ || ctx_->err) {
+        if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+        return false;
+    }
+    if (!opts_.password.empty()) {
+        auto* r = static_cast<redisReply*>(redisCommand(ctx_, "AUTH %s", opts_.password.c_str()));
+        bool ok = r && r->type != REDIS_REPLY_ERROR;
+        if (r) freeReplyObject(r);
+        if (!ok) { redisFree(ctx_); ctx_ = nullptr; return false; }
+    }
+    if (opts_.db != 0) {
+        auto* r = static_cast<redisReply*>(redisCommand(ctx_, "SELECT %d", opts_.db));
+        bool ok = r && r->type != REDIS_REPLY_ERROR;
+        if (r) freeReplyObject(r);
+        if (!ok) { redisFree(ctx_); ctx_ = nullptr; return false; }
+    }
+    return true;
+}
+#else
+bool AuditPublisher::ensureConnectedLocked() { return false; }
+#endif
+
+bool AuditPublisher::healthy() {
+#ifdef HTTPBRIDGE_HAS_HIREDIS
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ensureConnectedLocked()) return false;
+    auto* reply = static_cast<redisReply*>(redisCommand(ctx_, "PING"));
+    bool ok = reply && ctx_ && !ctx_->err && reply->type != REDIS_REPLY_ERROR;
+    if (reply) freeReplyObject(reply);
+    if (!ok && ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+    return ok;
+#else
+    return false;  // built without hiredis: cannot publish
+#endif
+}
+
 bool AuditPublisher::publish(const std::string& payload) {
 #ifdef HTTPBRIDGE_HAS_HIREDIS
     std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!ctx_ || ctx_->err) {
-        if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
-        ctx_ = redisConnect(opts_.host.c_str(), opts_.port);
-        if (!ctx_ || ctx_->err) {
-            if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
-            return false;
-        }
-        if (!opts_.password.empty()) {
-            auto* r = static_cast<redisReply*>(redisCommand(ctx_, "AUTH %s", opts_.password.c_str()));
-            bool ok = r && r->type != REDIS_REPLY_ERROR;
-            if (r) freeReplyObject(r);
-            if (!ok) { redisFree(ctx_); ctx_ = nullptr; return false; }
-        }
-        if (opts_.db != 0) {
-            auto* r = static_cast<redisReply*>(redisCommand(ctx_, "SELECT %d", opts_.db));
-            bool ok = r && r->type != REDIS_REPLY_ERROR;
-            if (r) freeReplyObject(r);
-            if (!ok) { redisFree(ctx_); ctx_ = nullptr; return false; }
-        }
-    }
+    if (!ensureConnectedLocked()) return false;
 
     auto* reply = static_cast<redisReply*>(redisCommand(
         ctx_, "XADD %s MAXLEN ~ %lld * payload %b",

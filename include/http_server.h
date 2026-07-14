@@ -65,6 +65,10 @@ public:
     void start();
     void stop();
 
+    // True unless auditing is enabled but the process cannot publish (built
+    // without hiredis, or Redis unreachable). Startup gate + probe helper (A-i).
+    bool auditReady() { return !audit_->enabled() || audit_->healthy(); }
+
 private:
     Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;

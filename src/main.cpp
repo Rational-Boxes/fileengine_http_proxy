@@ -115,6 +115,18 @@ int main() {
         std::stod(webdav::getEnvOrDefault("FILEENGINE_FAILOVER_COOLDOWN_S", "30")));
 
     httpbridge::HttpBridgeServer server(cfg, grpc, ldap);
+
+    // A-i: fail loudly rather than silently drop the audit guarantee. If auditing
+    // is enabled but this process cannot publish (built without hiredis, or Redis
+    // unreachable at boot), refuse to start — "enabled but unable to record" must
+    // not run as if it were auditing.
+    if (!server.auditReady()) {
+        webdav::errorLog("FATAL: FILEENGINE_AUDIT_ENABLED=true but the audit log is "
+                         "unavailable (built without hiredis, or Redis unreachable). Refusing to start.");
+        Poco::Net::uninitializeSSL();
+        return 1;
+    }
+
     server.start();
 
     std::signal(SIGINT, onSignal);
