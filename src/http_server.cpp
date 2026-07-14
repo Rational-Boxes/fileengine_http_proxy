@@ -327,7 +327,7 @@ private:
         // currently-valid token (authenticate() above), so it can't outlive a
         // revoked session beyond token_ttl.
         if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "refresh" && method == "POST")
-            return refreshToken(resp, id);
+            return refreshToken(req, resp, id);
 
         // Token introspection for downstream services (e.g. convert_search_ai):
         // validate the caller's bearer token and return the resolved identity, so
@@ -1160,11 +1160,19 @@ private:
 
         // Map the verified email to the LDAP identity so OAuth and Basic logins
         // resolve to the same uid/roles for gRPC ACL purposes.
+        const std::string ip = clientIp(req);
         webdav::UserInfo info = ldap_->getUserInfoByEmail(vid.email);
         if (!info.authenticated || info.user_id.empty()) {
+            audit_->emitAuth("login_failure", "denied", vid.email, st.tenant, ip);  // best-effort
             return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"no matching user"})");
         }
 
+        // Fail-closed audit (B): OAuth logins are recorded like Basic logins —
+        // do not issue a session we cannot audit (when auditing is enabled).
+        if (!audit_->emitAuth("login_success", "ok", info.user_id, st.tenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
         std::string token = mintJwt(info.user_id, st.tenant);
 
         // Token returned in the URL fragment (not the query) so it is not sent to
@@ -1358,10 +1366,36 @@ private:
 
     // Periodic re-mint: reaching here means the caller's current JWT already
     // verified. Re-resolve roles from LDAP and issue a fresh short-lived token, so
-    // LDAP role changes take effect within the client's refresh interval and a
-    // token that stops being refreshed (access revoked) expires within token_ttl.
-    void refreshToken(HTTPServerResponse& resp, const AuthIdentity& id) {
-        std::string token = mintJwt(id.user, id.tenant);
+    // Renew a session token. RE-VALIDATES the user against LDAP at refresh time
+    // (live), so a deactivated/removed account cannot extend its session, and the
+    // new token carries fresh, non-stale security claims (roles + tenants re-read
+    // from the directory, not copied from the old token). Access revoked in LDAP
+    // stops the very next refresh; an un-refreshed token expires within token_ttl.
+    void refreshToken(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        const std::string ip = clientIp(req);
+        // The user must still exist and belong to at least one tenant. In this
+        // directory model, deactivation = removal from the tenant's groups, so an
+        // empty tenant set means the account is gone/disabled.
+        auto tenants = ldap_->getTenantsForUser(id.user);
+        if (tenants.empty()) {
+            audit_->emitAuth("token_refresh", "denied", id.user, id.tenant, ip);  // best-effort
+            return unauthorized(resp);  // force re-login
+        }
+        // Keep the caller's active tenant if it is still valid; otherwise fall
+        // back to a tenant they still belong to (never stamp a stale tenant).
+        std::string activeTenant = id.tenant;
+        bool stillMember = false;
+        for (const auto& t : tenants) if (t == activeTenant) { stillMember = true; break; }
+        if (!stillMember) activeTenant = tenants.front();
+        // Fail-closed audit (B): never renew a session we cannot record (when
+        // auditing is enabled).
+        if (!audit_->emitAuth("token_refresh", "ok", id.user, activeTenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
+        // mintJwt re-reads roles per tenant live (getRolesByTenant), so the new
+        // token reflects current group/role membership, not the old claims.
+        std::string token = mintJwt(id.user, activeTenant);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -1369,8 +1403,20 @@ private:
 
     void revokeToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
         // Stateless JWTs: logout is client-side (drop the token); it expires within
-        // token_ttl. Kept for API compatibility.
-        (void)req;
+        // token_ttl. Kept for API compatibility. Record the logout best-effort for
+        // the audit trail (never blocks).
+        std::string h = req.get("Authorization", "");
+        if (h.compare(0, 7, "Bearer ") == 0) {
+            Poco::JSON::Object::Ptr claims;
+            std::string err;
+            long now = static_cast<long>(std::time(nullptr));
+            if (jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
+                audit_->emitAuth("logout", "ok",
+                                 claims->optValue<std::string>("sub", std::string()),
+                                 claims->optValue<std::string>("tenant", std::string()),
+                                 clientIp(req));
+            }
+        }
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
