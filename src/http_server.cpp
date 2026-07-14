@@ -1313,8 +1313,9 @@ private:
     // EVERY tenant they belong to ({tenant:[roles]}). `activeTenant` is recorded
     // as the token's default tenant context. Roles are resolved live from LDAP.
     // `amr` records the authentication methods that produced this session (RFC
-    // 8176): ["pwd"] for a password-only login, ["pwd","otp"|"email"|"recovery"]
-    // once a second factor has been verified.
+    // 8176-style): ["pwd"] for a password-only login, and once a second factor is
+    // verified the descriptive method name is appended —
+    // ["pwd","totp"|"email"|"recovery"] (or ["oauth"] for a federated login).
     std::string mintJwt(const std::string& user, const std::string& activeTenant,
                         const std::vector<std::string>& amr = {"pwd"}) {
         auto byTenant = ldap_->getRolesByTenant(user);

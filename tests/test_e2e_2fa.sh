@@ -95,8 +95,8 @@ if [ -n "$full" ]; then
     # amr should record the second factor. Decode the JWT payload (base64url).
     payload="$(printf '%s' "$full" | cut -d. -f2)"
     amr="$(python3 -c "import base64,json,sys;s=sys.argv[1];s+='='*(-len(s)%4);print(','.join(json.loads(base64.urlsafe_b64decode(s)).get('amr',[])))" "$payload" 2>/dev/null)"
-    case ",$amr," in *",otp,"*) printf '  \033[32m✓\033[0m session amr records otp (%s)\n' "$amr"; PASSN=$((PASSN+1));;
-                     *) printf '  \033[31m✗\033[0m session amr missing otp (%s)\n' "$amr"; FAILN=$((FAILN+1));; esac
+    case ",$amr," in *",totp,"*) printf '  \033[32m✓\033[0m session amr records the 2nd factor (%s)\n' "$amr"; PASSN=$((PASSN+1));;
+                     *) printf '  \033[31m✗\033[0m session amr missing the 2nd factor (%s)\n' "$amr"; FAILN=$((FAILN+1));; esac
 fi
 
 echo "=== step 5: negative — a wrong code is rejected ==="
