@@ -6,17 +6,48 @@
 # Usage: BASE=http://localhost:8090 \
 #        FE_USER=<login> FE_PASS=<password> [FE_EXPECT_USER=<resolved uid>] \
 #        ./tests/test_e2e.sh
-# Credentials/identity are configurable so the suite runs against any directory
-# (defaults match a testuser:password fixture).
+# FE_USER must be a tenant ADMIN (it creates roles/ACLs). Credentials/identity are
+# configurable so the suite runs against any directory.
+#
+# Optional (enable extra checks; otherwise those checks SKIP, not fail):
+#   FE_USER2/FE_PASS2  a NON-admin member of the same tenant — proves reachability
+#                      hiding applies to non-admins (admins are exempt by design).
+#   FE_TENANT2         a second tenant FE_USER also belongs to — proves the
+#                      X-Tenant override works for a member tenant (M3).
+#   FE_CORS_ORIGIN     the bridge's configured HTTP_CORS_ORIGIN (default
+#                      http://localhost:3000, the dev stack value).
+#   FE_MAX_BODY        the bridge's HTTP_MAX_BODY_BYTES; the oversize-body check
+#                      only runs when this is ≤ 16 MiB (else SKIP).
+#
+# Reflects the security-review behavior now in the bridge: `administrators` →
+# tenant_admin (H2, not system_admin); X-Tenant honored only for member tenants
+# (M3); 2FA challenge on login when MFA is enabled (PROPOSAL §4.6 — this suite
+# needs a non-enrolled FE_USER; 2FA itself is in test_e2e_2fa.sh).
 
 BASE="${BASE:-http://localhost:8090}"
 CRED="${FE_USER:-testuser}:${FE_PASS:-password}"
 WRONG="${FE_USER:-testuser}:wrongpass-nope"
 EXPECT_USER="${FE_EXPECT_USER:-${FE_USER:-testuser}}"
-CORS_ORIGIN="${FE_CORS_ORIGIN:-https://app.example.com}"   # must match the bridge's HTTP_CORS_ORIGIN
-PASS=0; FAIL=0; FAILED=()
-ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
-bad() { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
+# The primary FE_USER is a tenant administrator (member of the tenant's
+# `administrators` group → `tenant_admin`). A few checks below need identities the
+# admin can't provide:
+#   FE_USER2/FE_PASS2  — a NON-admin member of the same tenant (roles = [users]),
+#                        for the reachability-hiding check (admins are exempt).
+#   FE_TENANT2         — a SECOND tenant FE_USER also belongs to, for the X-Tenant
+#                        override check (M3 only lets you select a tenant you're in).
+# When unset, those specific checks SKIP rather than fail.
+USER2="${FE_USER2:-}"; PASS2="${FE_PASS2:-}"
+TENANT2="${FE_TENANT2:-}"
+# The bridge echoes its configured HTTP_CORS_ORIGIN verbatim; this must match it
+# (dev stack default is http://localhost:3000).
+CORS_ORIGIN="${FE_CORS_ORIGIN:-http://localhost:3000}"
+# The bridge's request-body cap (HTTP_MAX_BODY_BYTES). The oversize check only runs
+# when this is small enough to exercise cheaply; otherwise it SKIPs (see below).
+MAX_BODY="${FE_MAX_BODY:-104857600}"
+PASS=0; FAIL=0; SKIP=0; FAILED=()
+ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
+skip() { SKIP=$((SKIP+1)); printf '  \033[33m⊘ SKIP\033[0m %s\n' "$1"; }
 
 echo "=========================================================="
 echo " FileEngine HTTP bridge — E2E   base=$BASE"
@@ -36,17 +67,42 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/whoami")
 out=$(curl -s -u "$CRED" "$BASE/v1/whoami")
 grep -q "\"user\":\"$EXPECT_USER\"" <<<"$out" && ok "whoami authenticates testuser (LDAP)" || bad "whoami testuser" "$out"
 grep -q '"tenant":"default"' <<<"$out" && ok "default tenant (non-subdomain)" || bad "default tenant" "$out"
-grep -q 'system_admin' <<<"$out" && ok "administrators group -> system_admin role" || bad "system_admin role" "$out"
+# H2: a tenant's `administrators` group aliases to the tenant-scoped `tenant_admin`
+# role (NOT the global `system_admin`, which must be granted explicitly). This is
+# what keeps a tenant admin from crossing tenant boundaries.
+grep -q 'tenant_admin' <<<"$out" && ok "administrators group -> tenant_admin role (H2)" || bad "tenant_admin role" "$out"
+grep -q 'system_admin' <<<"$out" && bad "tenant admin must NOT be global system_admin (H2)" "$out" \
+    || ok "tenant admin is not global system_admin (H2)"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WRONG" "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "wrong password -> 401" || bad "wrong password -> 401" "got $code"
 
-out=$(curl -s -u "$CRED" -H 'X-Tenant: acme' "$BASE/v1/whoami")
-grep -q '"tenant":"acme"' <<<"$out" && ok "X-Tenant header overrides tenant" || bad "X-Tenant override" "$out"
+# X-Tenant selects the active tenant — but M3 only honors it for a tenant the user
+# is actually a member of. Positive case (a second member tenant):
+if [ -n "$TENANT2" ]; then
+    out=$(curl -s -u "$CRED" -H "X-Tenant: $TENANT2" "$BASE/v1/whoami")
+    grep -q "\"tenant\":\"$TENANT2\"" <<<"$out" && ok "X-Tenant overrides to a member tenant ($TENANT2)" || bad "X-Tenant override" "$out"
+else
+    skip "X-Tenant override to a member tenant (set FE_TENANT2 to a second tenant FE_USER belongs to)"
+fi
+# Negative case (M3): selecting a tenant the user is NOT a member of is refused,
+# never silently honored. A bogus tenant name is a guaranteed non-membership.
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "$CRED" -H 'X-Tenant: no-such-tenant-zzz' "$BASE/v1/whoami")
+[ "$code" = "403" ] && ok "X-Tenant to a non-member tenant -> 403 (M3)" || bad "M3 X-Tenant enforcement" "got $code"
 
 # ---- token auth ----
 echo "[token auth]"
 out=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
+# New feature (2FA, PROPOSAL §4.6): when the bridge runs with MFA_ENABLED and
+# FE_USER has 2FA enrolled, /v1/auth/token returns {mfa_required, mfa_token}
+# instead of a session — this suite drives the password path, so it needs a
+# NON-enrolled FE_USER. Detect + bail out clearly rather than cascading failures.
+if grep -q '"mfa_required":true' <<<"$out"; then
+    echo "  \033[33m⊘\033[0m FE_USER has 2FA enrolled; this suite needs a non-enrolled user (or MFA off)."
+    echo "     (2FA itself is covered by tests/test_e2e_2fa.sh.)"
+    echo " ABORTING token-dependent checks."
+    exit 0
+fi
 # The bearer token is a signed HS256 JWT (base64url segments, dot-separated).
 TOKEN=$(grep -oE '"token":"[^"]+"' <<<"$out" | sed 's/.*"token":"//;s/"//')
 [ -n "$TOKEN" ] && ok "POST /v1/auth/token issues token" || bad "issue token" "$out"
@@ -115,6 +171,14 @@ curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$LEAF/content" --data-bina
 # Sanity: the buried file is reachable before the delete.
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/content")
 { [ "$code" = "200" ]; } && ok "descendant readable before delete" || bad "pre-delete" "got $code"
+# And a NON-admin member could also read it before the delete (read-by-default) —
+# so any hiding after the delete is due to reachability, not a missing grant.
+if [ -n "$USER2" ] && [ -n "$PASS2" ]; then
+    U2=(-u "$USER2:$PASS2")
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${U2[@]}" "$BASE/v1/files/$LEAF/content")
+    [ "$code" = "200" ] && ok "non-admin: descendant readable before delete (baseline)" \
+        || bad "non-admin pre-delete baseline" "got $code (is FE_USER2 a member of the tenant?)"
+fi
 
 # A non-empty directory can now be soft-deleted directly (no recursive flag).
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/dirs/$RD")
@@ -126,14 +190,33 @@ out=$(curl -s "${A[@]}" "$BASE/v1/dirs/$ROOT")
 grep -q "${SUF}_del" <<<"$out" && bad "reachability" "deleted dir still listed at root" \
     || ok "deleted folder no longer listed at root"
 
-# ...and its DESCENDANTS are hidden everywhere by reachability, even by direct UID
-# (leak-proof — the child's own deleted flag is untouched, it's just unreachable).
+# ...and for a NON-ADMIN its DESCENDANTS are hidden everywhere by reachability,
+# even by direct UID (leak-proof — the child's own deleted flag is untouched, it's
+# just unreachable).
+#
+# This MUST be checked as a non-admin: a tenant/system admin is deliberately EXEMPT
+# from reachability hiding (AclManager admin bypass) so a superuser can inspect and
+# recover a deleted subtree. FE_USER is an admin, so it would (correctly) still see
+# the file — checking hiding as FE_USER would be meaningless.
+if [ -n "$USER2" ] && [ -n "$PASS2" ]; then
+    U2=(-u "$USER2:$PASS2")
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${U2[@]}" "$BASE/v1/files/$LEAF/content")
+    [ "$code" != "200" ] && ok "non-admin: descendant file hidden by direct UID ($code)" \
+        || bad "reachability LEAK" "buried file readable by a NON-admin under a deleted folder"
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${U2[@]}" "$BASE/v1/dirs/$RSUB")
+    [ "$code" != "200" ] && ok "non-admin: descendant subdir not listable ($code)" \
+        || bad "reachability LEAK" "subdir listable by a NON-admin under a deleted folder"
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${U2[@]}" "$BASE/v1/nodes/$LEAF")
+    [ "$code" != "200" ] && ok "non-admin: descendant stat hidden by direct UID ($code)" \
+        || bad "reachability LEAK" "stat readable by a NON-admin under a deleted folder"
+else
+    skip "reachability hiding for a NON-admin (set FE_USER2/FE_PASS2 to a non-admin member of the tenant)"
+fi
+# Admin exemption (intended, not a leak): the admin CAN still reach the deleted
+# subtree by direct UID — a superuser is never locked out of recovering it.
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/content")
-[ "$code" != "200" ] && ok "descendant file hidden by direct UID ($code)" \
-    || bad "reachability LEAK" "buried file still readable under deleted folder"
-code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/dirs/$RSUB")
-[ "$code" != "200" ] && ok "descendant subdir not listable ($code)" \
-    || bad "reachability LEAK" "subdir still listable under deleted folder"
+[ "$code" = "200" ] && ok "admin exemption: admin still reaches deleted subtree (recovery)" \
+    || bad "admin exemption" "admin unexpectedly blocked from a deleted subtree ($code)"
 
 # ---- streaming (large file) + Range ----
 echo "[streaming + range]"
@@ -272,20 +355,30 @@ curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
 
 # ---- hardening ----
 echo "[hardening]"
-# scoped CORS (configured origin, never *)
+# scoped CORS: the bridge echoes its configured HTTP_CORS_ORIGIN verbatim (never *).
+# CORS_ORIGIN must equal that configured value (see the header for the default).
 hdr=$(curl -s -D - -o /dev/null -X OPTIONS -H "Origin: $CORS_ORIGIN" "$BASE/v1/whoami")
 grep -qi "access-control-allow-origin: $CORS_ORIGIN" <<<"$hdr" && ok "CORS scoped origin header" || bad "CORS header" "$(grep -i access-control <<<"$hdr" | head -1)"
 ! grep -qi 'access-control-allow-origin: \*' <<<"$hdr" && ok "CORS is not wildcard" || bad "CORS wildcard"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/v1/whoami")
 [ "$code" = "204" ] && ok "OPTIONS preflight -> 204" || bad "preflight" "got $code"
-# body-size cap (config'd to 4 MiB for the test run)
-head -c 5242880 /dev/zero > /tmp/hb_toobig
-code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$ROOT/content" --data-binary @/tmp/hb_toobig)
-[ "$code" = "413" ] && ok "oversized body -> 413" || bad "body cap" "got $code"
-rm -f /tmp/hb_toobig
+# body-size cap (HTTP_MAX_BODY_BYTES). Exercising it means sending just over the
+# cap, so only do it when the cap is small enough to be cheap (the size cap is
+# enforced before routing, so an over-cap body is rejected with 413 regardless of
+# the target). The dev default is 100 MiB → SKIP unless the bridge is run with a
+# small HTTP_MAX_BODY_BYTES and FE_MAX_BODY is set to match.
+if [ "$MAX_BODY" -le 16777216 ]; then
+    over=$((MAX_BODY + 4096))
+    head -c "$over" /dev/zero > /tmp/hb_toobig
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$ROOT/content" --data-binary @/tmp/hb_toobig)
+    [ "$code" = "413" ] && ok "oversized body (> ${MAX_BODY}B) -> 413" || bad "body cap" "got $code (cap=$MAX_BODY)"
+    rm -f /tmp/hb_toobig
+else
+    skip "body-size cap (cap=${MAX_BODY}B too large to exercise cheaply; run the bridge with a small HTTP_MAX_BODY_BYTES and set FE_MAX_BODY)"
+fi
 
 echo "=========================================================="
-echo " RESULTS:  PASS=$PASS  FAIL=$FAIL"
+echo " RESULTS:  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
 [ "$FAIL" -gt 0 ] && { echo " Failed:"; printf '   - %s\n' "${FAILED[@]}"; }
 echo "=========================================================="
 [ "$FAIL" -eq 0 ]
