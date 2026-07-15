@@ -8,6 +8,7 @@
 #include <Poco/ThreadPool.h>
 
 #include "audit_publisher.h"
+#include "session_store.h"
 #include "grpc_client_wrapper.h"
 #include "ldap_authenticator.h"
 #include "oauth_provider.h"
@@ -67,6 +68,15 @@ struct Config {
     int redis_db = 0;
     std::string audit_stream = "fileengine:audit";
     long long audit_stream_maxlen = 1000000;
+
+    // WebDAV session-presence gate (PROPOSAL §14). When enabled, a full session
+    // mint (login / refresh) records the user's presence in Redis and logout
+    // removes it, so webdav_bridge can require a live Web-UI session for external
+    // WebDAV. Shares the same Redis broker as auditing. The per-tenant TTL is
+    // fetched from ldap_manager (/internal/webdav/session-ttl); this default is the
+    // fallback when that lookup is unavailable.
+    bool webdav_ip_binding_enabled = false;
+    int webdav_session_ttl_default = 43200;  // 12h fallback score window
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -94,6 +104,7 @@ private:
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
+    std::shared_ptr<SessionStore> sessions_;
     // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
     // it is destroyed *after* the server stops using it.
     std::unique_ptr<Poco::ThreadPool> pool_;

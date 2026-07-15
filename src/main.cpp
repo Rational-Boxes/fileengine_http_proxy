@@ -125,6 +125,14 @@ int main() {
     cfg.audit_stream = webdav::getEnvOrDefault("FILEENGINE_AUDIT_STREAM", "fileengine:audit");
     cfg.audit_stream_maxlen = std::stoll(webdav::getEnvOrDefault("FILEENGINE_AUDIT_STREAM_MAXLEN", "1000000"));
 
+    // WebDAV session-presence gate (PROPOSAL §14): when enabled, login/refresh
+    // record the user's Web-UI session in Redis and logout removes it.
+    {
+        std::string we = webdav::getEnvOrDefault("WEBDAV_IP_BINDING_ENABLED", "");
+        cfg.webdav_ip_binding_enabled = (we == "1" || we == "true" || we == "yes" || we == "on");
+    }
+    cfg.webdav_session_ttl_default = std::stoi(webdav::getEnvOrDefault("WEBDAV_IP_BIND_TTL_SECONDS", "43200"));
+
     auto grpc = std::make_shared<webdav::GRPCClientWrapper>(cfg.grpc_address);
     auto ldap = std::make_shared<webdav::LDAPAuthenticator>(
         webdav::getEnvOrDefault("FILEENGINE_LDAP_ENDPOINT", "ldap://localhost:1389"),

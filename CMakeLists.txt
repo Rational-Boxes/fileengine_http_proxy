@@ -58,6 +58,7 @@ add_executable(http_bridge
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
     src/audit_publisher.cpp
+    src/session_store.cpp
     src/utils.cpp
     ${PROTO_SRCS}
 )

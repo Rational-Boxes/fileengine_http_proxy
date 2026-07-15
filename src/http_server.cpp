@@ -236,9 +236,11 @@ public:
                    std::shared_ptr<TokenStore> tokens,
                    std::shared_ptr<OAuthProvider> oauth,
                    std::shared_ptr<OAuthStateStore> oauth_states,
-                   std::shared_ptr<AuditPublisher> audit)
+                   std::shared_ptr<AuditPublisher> audit,
+                   std::shared_ptr<SessionStore> sessions)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
-          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)) {}
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
+          sessions_(std::move(sessions)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -1188,7 +1190,9 @@ private:
         // Federated login: the second factor (if any) is enforced by the external
         // IdP, so the session records amr=["oauth"] and is not sent through the
         // bridge's own TOTP/email challenge.
-        std::string token = mintJwt(info.user_id, st.tenant, {"oauth"});
+        std::string jti;
+        std::string token = mintJwt(info.user_id, st.tenant, {"oauth"}, &jti);
+        recordSession(st.tenant, info.user_id, jti, ip);
 
         // Token returned in the URL fragment (not the query) so it is not sent to
         // the SPA's server or leaked via Referer. The SPA scrubs it from history.
@@ -1332,7 +1336,8 @@ private:
     // verified the descriptive method name is appended —
     // ["pwd","totp"|"email"|"recovery"] (or ["oauth"] for a federated login).
     std::string mintJwt(const std::string& user, const std::string& activeTenant,
-                        const std::vector<std::string>& amr = {"pwd"}) {
+                        const std::vector<std::string>& amr = {"pwd"},
+                        std::string* outJti = nullptr) {
         auto byTenant = ldap_->getRolesByTenant(user);
 
         Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
@@ -1343,7 +1348,9 @@ private:
         claims->set("tenant", activeTenant);
         claims->set("iat", static_cast<Poco::Int64>(now));
         claims->set("exp", static_cast<Poco::Int64>(now + cfg_.token_ttl));
-        claims->set("jti", randomCodeVerifier());
+        std::string jti = randomCodeVerifier();
+        if (outJti) *outJti = jti;
+        claims->set("jti", jti);
 
         Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
         for (const auto& kv : byTenant) {
@@ -1357,6 +1364,58 @@ private:
         for (const auto& m : amr) amrArr->add(m);
         claims->set("amr", amrArr);
         return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // ---- WebDAV session presence (PROPOSAL §14) ------------------------------
+    // The tenant's effective (clamped) session TTL, from ldap_manager, cached
+    // briefly. Falls back to the deployment default when the lookup is unavailable.
+    long sessionTtl(const std::string& tenant, const std::string& ip) {
+        long now = static_cast<long>(std::time(nullptr));
+        {
+            std::lock_guard<std::mutex> g(sessTtlMu_);
+            auto it = sessTtlCache_.find(tenant);
+            if (it != sessTtlCache_.end() && it->second.second > now) return it->second.first;
+        }
+        long ttl = cfg_.webdav_session_ttl_default;
+        if (!cfg_.ldap_manager_url.empty() && !cfg_.mfa_internal_secret.empty()) {
+            HttpClient client(3);
+            Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+            body->set("tenant", tenant);
+            std::ostringstream bs; body->stringify(bs);
+            HttpResult r = client.postJson(cfg_.ldap_manager_url + "/internal/webdav/session-ttl",
+                                           bs.str(), mfaHeaders(ip));
+            if (r.ok && r.status == 200) {
+                try {
+                    Poco::JSON::Parser p;
+                    auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+                    ttl = o->optValue<Poco::Int64>("ttl_seconds", static_cast<Poco::Int64>(ttl));
+                } catch (...) {}
+            }
+        }
+        {
+            std::lock_guard<std::mutex> g(sessTtlMu_);
+            sessTtlCache_[tenant] = {ttl, now + 60};  // 60s cache
+        }
+        return ttl;
+    }
+
+    // Record a live Web-UI session so webdav_bridge can gate external WebDAV on it.
+    // Best-effort — never blocks login/refresh (§14: a failed write just means the
+    // gate can't see this session until the next refresh).
+    void recordSession(const std::string& tenant, const std::string& uid,
+                       const std::string& jti, const std::string& ip) {
+        if (!sessions_ || !sessions_->enabled() || jti.empty()) return;
+        long score = static_cast<long>(std::time(nullptr)) + sessionTtl(tenant, ip);
+        sessions_->add(tenant, uid, jti + "|" + ip, score);
+    }
+
+    // Remove a session on logout. member = "{jti}|{ip}" with the CURRENT request IP;
+    // a mid-session egress-IP change means logout misses and the member ages out at
+    // its score instead (the §14 backstop).
+    void dropSession(const std::string& tenant, const std::string& uid,
+                     const std::string& jti, const std::string& ip) {
+        if (!sessions_ || !sessions_->enabled() || jti.empty()) return;
+        sessions_->remove(tenant, uid, jti + "|" + ip);
     }
 
     // Mint a short-lived, IP-bound pre-auth token issued after a password succeeds
@@ -1632,7 +1691,9 @@ private:
             }
         }
 
-        std::string token = mintJwt(id.user, id.tenant, {"pwd"});
+        std::string jti;
+        std::string token = mintJwt(id.user, id.tenant, {"pwd"}, &jti);
+        recordSession(id.tenant, id.user, jti, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -1704,7 +1765,9 @@ private:
                 return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                                 R"({"error":"audit log unavailable"})");
             }
-            std::string token = mintJwt(user, tenant, {"pwd", "totp"});
+            std::string jti;
+            std::string token = mintJwt(user, tenant, {"pwd", "totp"}, &jti);
+            recordSession(tenant, user, jti, ip);
             return sendJson(resp, HTTPResponse::HTTP_OK,
                      "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                      std::to_string(cfg_.token_ttl) + ",\"recovery_codes\":" + recoveryJson + "}");
@@ -1720,7 +1783,9 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"audit log unavailable"})");
         }
-        std::string token = mintJwt(user, tenant, {"pwd", vmethod});
+        std::string jti;
+        std::string token = mintJwt(user, tenant, {"pwd", vmethod}, &jti);
+        recordSession(tenant, user, jti, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -1760,26 +1825,33 @@ private:
         // amr is carried over so a 2FA-completed session doesn't silently downgrade
         // to password-only on refresh (defaults to ["pwd"] for legacy tokens).
         std::vector<std::string> amr = id.amr.empty() ? std::vector<std::string>{"pwd"} : id.amr;
-        std::string token = mintJwt(id.user, activeTenant, amr);
+        std::string jti;
+        std::string token = mintJwt(id.user, activeTenant, amr, &jti);
+        // Re-score the session under the new jti; the previous jti ages out at its
+        // score (the §14 backstop) — AuthIdentity doesn't carry it to ZREM here.
+        recordSession(activeTenant, id.user, jti, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
     }
 
     void revokeToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
-        // Stateless JWTs: logout is client-side (drop the token); it expires within
-        // token_ttl. Kept for API compatibility. Record the logout best-effort for
-        // the audit trail (never blocks).
+        // The JWT itself stays stateless (it still expires within token_ttl), but
+        // logout now actively cuts the WebDAV session-presence entry (PROPOSAL §14)
+        // so external WebDAV stops working immediately — and records the logout for
+        // the audit trail. Both are best-effort and never block the 204.
         std::string h = req.get("Authorization", "");
         if (h.compare(0, 7, "Bearer ") == 0) {
             Poco::JSON::Object::Ptr claims;
             std::string err;
             long now = static_cast<long>(std::time(nullptr));
             if (jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
-                audit_->emitAuth("logout", "ok",
-                                 claims->optValue<std::string>("sub", std::string()),
-                                 claims->optValue<std::string>("tenant", std::string()),
-                                 clientIp(req));
+                const std::string sub = claims->optValue<std::string>("sub", std::string());
+                const std::string tenant = claims->optValue<std::string>("tenant", std::string());
+                const std::string jti = claims->optValue<std::string>("jti", std::string());
+                const std::string ip = clientIp(req);
+                audit_->emitAuth("logout", "ok", sub, tenant, ip);
+                dropSession(tenant, sub, jti, ip);
             }
         }
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
@@ -1862,6 +1934,11 @@ private:
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
+    std::shared_ptr<SessionStore> sessions_;
+    // Per-tenant WebDAV session-TTL cache (tenant -> {ttl_seconds, expiry-epoch}),
+    // so the login/refresh path doesn't call ldap_manager on every request.
+    inline static std::mutex sessTtlMu_;
+    inline static std::map<std::string, std::pair<long, long>> sessTtlCache_;
     // Per-tenant "requires 2FA" cache (tenant -> {requires, expiry-epoch}), for the
     // tenant-switch enforcement gate. Short-lived; user-independent. `inline static`
     // so it is shared across the per-request handler instances (process-global).
@@ -1877,12 +1954,14 @@ public:
                    std::shared_ptr<TokenStore> tokens,
                    std::shared_ptr<OAuthProvider> oauth,
                    std::shared_ptr<OAuthStateStore> oauth_states,
-                   std::shared_ptr<AuditPublisher> audit)
+                   std::shared_ptr<AuditPublisher> audit,
+                   std::shared_ptr<SessionStore> sessions)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
-          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)) {}
+          oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
+          sessions_(std::move(sessions)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_);
     }
 
 private:
@@ -1893,6 +1972,7 @@ private:
     std::shared_ptr<OAuthProvider> oauth_;
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
+    std::shared_ptr<SessionStore> sessions_;
 };
 
 }  // namespace
@@ -1906,7 +1986,10 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
       oauth_states_(std::make_shared<OAuthStateStore>(cfg.oauth_state_ttl)),
       audit_(std::make_shared<AuditPublisher>(AuditPublisher::Options{
           cfg.audit_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
-          cfg.redis_db, cfg.audit_stream, cfg.audit_stream_maxlen})) {}
+          cfg.redis_db, cfg.audit_stream, cfg.audit_stream_maxlen})),
+      sessions_(std::make_shared<SessionStore>(SessionStore::Options{
+          cfg.webdav_ip_binding_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
+          cfg.redis_db, "webdav:session:"})) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -1997,7 +2080,7 @@ void HttpBridgeServer::start() {
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
     server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_), *pool_, socket, params);
+        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_), *pool_, socket, params);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");
