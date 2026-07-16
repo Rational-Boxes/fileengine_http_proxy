@@ -74,6 +74,7 @@ message AuthenticationContext {
     repeated string roles = 2;  // User roles for permissions
     string tenant = 3;          // Tenant identifier for multitenancy
     map<string, string> claims = 4; // Additional user claims for permissions
+    string source_addr = 5;         // client IP forwarded by the bridge (audit)
 }
 
 // Directory entry response

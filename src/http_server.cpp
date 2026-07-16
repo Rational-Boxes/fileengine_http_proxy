@@ -294,6 +294,7 @@ private:
         std::string tenant;
         std::vector<std::string> roles;
         std::vector<std::string> amr;   // auth methods from the verified token (RFC 8176)
+        std::string source_addr;        // resolved client IP, forwarded to the core for audit
     };
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
@@ -440,6 +441,7 @@ private:
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
         a->set_user(id.user);
         a->set_tenant(id.tenant);
+        a->set_source_addr(id.source_addr);  // -> core audit source_addr (§13)
         addRolesAliased(a, id.roles);
     }
 
@@ -1256,6 +1258,7 @@ private:
                 return false;
             }
             identityFromClaims(claims, activeTenant, out);
+            out.source_addr = clientIp(req);  // forwarded to the core for audit
             // Per-tenant 2FA enforcement on tenant switch (PROPOSAL §4.6): 2FA
             // enrollment is per-user, but the requirement to USE it is per-tenant.
             // A password-only session that becomes active in a tenant which
@@ -1275,6 +1278,7 @@ private:
             unauthorized(resp);
             return false;
         }
+        out.source_addr = clientIp(req);  // forwarded to the core for audit
         // M3: when the client explicitly overrides the tenant via X-Tenant (the
         // attacker-controlled vector), verify LDAP membership. Host/subdomain
         // routing is set by the trusted proxy and left as-is.
