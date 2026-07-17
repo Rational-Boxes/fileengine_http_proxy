@@ -571,11 +571,17 @@ private:
         auto r = grpc_->stat(rq);
         if (!r.success()) return mapError(resp, r.error());
         const auto& i = r.info();
+        // created_at/modified_at are ctime/mtime derived by the core from the
+        // file's version-name timestamps (DB columns as fallback) — the same
+        // values the directory listing reports, so a node's stat and its parent's
+        // listing agree. (Emitted as UNIX epoch seconds, matching entriesJson.)
         std::string body = "{\"uid\":\"" + jsonEscape(i.uid()) + "\",\"name\":\"" + jsonEscape(i.name()) +
                            "\",\"parent_uid\":\"" + jsonEscape(i.parent_uid()) + "\",\"type\":\"" + fileTypeName(i.type()) +
                            "\",\"size\":" + std::to_string(i.size()) + ",\"owner\":\"" + jsonEscape(i.owner()) +
                            "\",\"version\":\"" + jsonEscape(i.version()) +
-                           "\",\"rendition_count\":" + std::to_string(i.rendition_count()) +
+                           "\",\"created_at\":" + std::to_string(i.created_at()) +
+                           ",\"modified_at\":" + std::to_string(i.modified_at()) +
+                           ",\"rendition_count\":" + std::to_string(i.rendition_count()) +
                            ",\"has_renditions\":" + (i.rendition_count() > 0 ? "true" : "false") + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
