@@ -1241,7 +1241,7 @@ private:
             long now = static_cast<long>(std::time(nullptr));
             if (!jwt::verify(webdav::trim(h.substr(7)), cfg_.jwt_secret, now, claims, err)) {
                 webdav::debugLog("authenticate: JWT rejected: " + err);
-                unauthorized(resp);
+                unauthorized(req, resp);
                 return false;
             }
             // A pre-auth challenge token (issued before the 2FA step) carries no
@@ -1249,7 +1249,7 @@ private:
             // depth; it also has no roles, so it would authorize nothing anyway).
             if (claims->optValue<bool>("mfa_pending", false)) {
                 webdav::debugLog("authenticate: rejected mfa_pending token on a resource path");
-                unauthorized(resp);
+                unauthorized(req, resp);
                 return false;
             }
             // Per-request tenant selection: an X-Tenant header picks which tenant's
@@ -1281,7 +1281,7 @@ private:
             return true;
         }
         if (!authenticateBasic(req, out)) {
-            unauthorized(resp);
+            unauthorized(req, resp);
             return false;
         }
         out.source_addr = clientIp(req);  // forwarded to the core for audit
@@ -1333,8 +1333,19 @@ private:
         return true;
     }
 
-    void unauthorized(HTTPServerResponse& resp) {
-        resp.set("WWW-Authenticate", "Basic realm=\"FileEngine\"");
+    void unauthorized(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        // A browser reacts to `WWW-Authenticate: Basic` by taking over Basic auth
+        // itself — popping its native credentials dialog and re-sending a
+        // remembered (possibly wrong) password — which hijacks the SPA login: the
+        // user sees the browser prompt instead of our own "wrong password" error,
+        // and never reaches the 2FA step. Browsers set Sec-Fetch-*/Origin on every
+        // request, so only advertise the Basic challenge to genuine non-browser
+        // HTTP clients (curl/CLI) that rely on it; the SPA just reads the 401 JSON.
+        const bool fromBrowser = !req.get("Sec-Fetch-Mode", "").empty()
+                              || !req.get("Sec-Fetch-Site", "").empty()
+                              || !req.get("Origin", "").empty()
+                              || !req.get("X-Requested-With", "").empty();
+        if (!fromBrowser) resp.set("WWW-Authenticate", "Basic realm=\"FileEngine\"");
         sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":"authentication required"})");
     }
 
@@ -1650,7 +1661,7 @@ private:
             const std::string attempted = id.user.empty() ? "<unknown>" : id.user;
             const std::string tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
             audit_->emitAuth("login_failure", "denied", attempted, tenant, ip);
-            return unauthorized(resp);
+            return unauthorized(req, resp);
         }
         // Stamp a tenant the user actually belongs to. LDAP bind succeeds regardless
         // of tenant, and tenant resolution (X-Tenant / host / "default") can land on
@@ -1662,7 +1673,7 @@ private:
             auto tenants = ldap_->getTenantsForUser(id.user);
             if (tenants.empty()) {
                 audit_->emitAuth("login_failure", "denied", id.user, id.tenant, ip);
-                return unauthorized(resp);
+                return unauthorized(req, resp);
             }
             bool member = false;
             for (const auto& t : tenants) if (t == id.tenant) { member = true; break; }
@@ -1735,7 +1746,7 @@ private:
         if (mfaToken.empty() ||
             !jwt::verify(mfaToken, cfg_.jwt_secret, now, claims, err) ||
             !claims->optValue<bool>("mfa_pending", false)) {
-            return unauthorized(resp);
+            return unauthorized(req, resp);
         }
         const std::string user = claims->optValue<std::string>("sub", std::string());
         const std::string tenant = claims->optValue<std::string>("tenant", std::string());
@@ -1743,7 +1754,7 @@ private:
         if (user.empty() || boundIp != ip) {
             audit_->emitAuth("mfa_failure", "denied", user.empty() ? "<unknown>" : user,
                              tenant, ip);
-            return unauthorized(resp);
+            return unauthorized(req, resp);
         }
 
         if (action == "send") {
@@ -1816,7 +1827,7 @@ private:
         auto tenants = ldap_->getTenantsForUser(id.user);
         if (tenants.empty()) {
             audit_->emitAuth("token_refresh", "denied", id.user, id.tenant, ip);  // best-effort
-            return unauthorized(resp);  // force re-login
+            return unauthorized(req, resp);  // force re-login
         }
         // Keep the caller's active tenant if it is still valid; otherwise fall
         // back to a tenant they still belong to (never stamp a stale tenant).
