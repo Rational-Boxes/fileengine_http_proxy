@@ -22,6 +22,9 @@ struct OAuthProviderConfig {
     std::string emails_url;     // GitHub /user/emails (kind == GITHUB)
     std::string scopes;         // space-separated
     std::string redirect_uri;   // our callback, registered with the IdP
+    std::string issuer;         // OIDC issuer (discovery + id_token `iss` check)
+    std::string jwks_uri;       // OIDC JWKS endpoint (id_token signature keys)
+    bool verify_id_token = true;// OIDC: verify the signed id_token (JWKS + nonce)
 };
 
 // The verified identity the IdP attests to. We trust these fields because they
@@ -47,27 +50,41 @@ public:
     const OAuthProviderConfig* get(const std::string& name) const;
 
     // Assembles the IdP authorize URL (PKCE S256, given the precomputed
-    // challenge and the opaque state).
+    // challenge, the opaque state, and the OIDC `nonce` binding the id_token).
     std::string buildAuthorizeUrl(const OAuthProviderConfig& cfg,
                                   const std::string& state,
-                                  const std::string& code_challenge) const;
+                                  const std::string& code_challenge,
+                                  const std::string& nonce) const;
 
-    // Exchanges the authorization code for an access token (server-side, with the
-    // client secret + PKCE verifier). Returns false and sets `err` on failure.
+    // Exchanges the authorization code for an access token + id_token (server-side,
+    // with the client secret + PKCE verifier). `id_token` may be empty for a non-
+    // OIDC provider. Returns false and sets `err` on failure.
     bool exchangeCode(const OAuthProviderConfig& cfg, const std::string& code,
                       const std::string& code_verifier, std::string& access_token,
-                      std::string& err) const;
+                      std::string& id_token, std::string& err) const;
 
     // Resolves a verified identity from the access token (OIDC userinfo, or
     // GitHub /user + /user/emails). Returns false and sets `err` on failure.
     bool fetchIdentity(const OAuthProviderConfig& cfg, const std::string& access_token,
                        VerifiedIdentity& out, std::string& err) const;
 
+    // Verifies a signed OIDC id_token against the provider's JWKS (fetched + cached
+    // from `jwks_uri`) and the expected `nonce`, and maps its claims into a
+    // VerifiedIdentity. Returns false and sets `err` on any verification failure.
+    bool verifyIdToken(const OAuthProviderConfig& cfg, const std::string& id_token,
+                       const std::string& expected_nonce, VerifiedIdentity& out,
+                       std::string& err) const;
+
 private:
     bool fetchIdentityGithub(const OAuthProviderConfig& cfg, const std::string& access_token,
                              VerifiedIdentity& out, std::string& err) const;
+    // Fills any unset endpoints/jwks_uri from the IdP's OIDC discovery document.
+    bool discoverEndpoints(OAuthProviderConfig& cfg, std::string& err);
+    // JWKS JSON for `jwks_uri`, cached; `force` bypasses the cache (key rotation).
+    std::string fetchJwks(const std::string& jwks_uri, bool force, std::string& err) const;
 
     std::map<std::string, OAuthProviderConfig> providers_;
+    mutable std::map<std::string, std::string> jwks_cache_;  // jwks_uri -> JSON
     HttpClient http_;
 };
 

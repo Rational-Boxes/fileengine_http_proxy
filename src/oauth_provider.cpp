@@ -1,4 +1,5 @@
 #include "oauth_provider.h"
+#include "oidc_verify.h"
 #include "utils.h"
 
 #include <Poco/JSON/Parser.h>
@@ -65,18 +66,43 @@ OAuthProvider OAuthProvider::fromEnv(const std::string& redirect_base) {
         cfg.token_url = providerEnv(name, "TOKEN_URL");
         cfg.userinfo_url = providerEnv(name, "USERINFO_URL");
         cfg.emails_url = providerEnv(name, "EMAILS_URL");
+        cfg.issuer = providerEnv(name, "ISSUER");
+        cfg.jwks_uri = providerEnv(name, "JWKS_URI");
         cfg.scopes = providerEnv(name, "SCOPES",
                                  cfg.kind == OAuthProviderConfig::GITHUB ? "read:user user:email"
                                                                          : "openid email profile");
         cfg.redirect_uri = redirect_base + "/v1/auth/oauth/" + name + "/callback";
+        // id_token verification defaults ON for OIDC, OFF for GitHub (no id_token);
+        // OAUTH_<P>_VERIFY_ID_TOKEN=false opts out (falls back to userinfo trust).
+        std::string vit = providerEnv(name, "VERIFY_ID_TOKEN", "true");
+        for (char& c : vit) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        cfg.verify_id_token = (cfg.kind == OAuthProviderConfig::OIDC) &&
+                              (vit == "true" || vit == "1" || vit == "yes" || vit == "on");
+
+        // OIDC discovery: when an ISSUER is configured, auto-fill any endpoints /
+        // jwks_uri not explicitly set from the IdP's .well-known document.
+        if (cfg.kind == OAuthProviderConfig::OIDC && !cfg.issuer.empty()) {
+            std::string derr;
+            if (!self.discoverEndpoints(cfg, derr)) {
+                webdav::warnLog("OAuthProvider: OIDC discovery failed for '" + name +
+                                "': " + derr + " — falling back to explicit URLs");
+            }
+        }
 
         if (cfg.client_id.empty() || cfg.auth_url.empty() || cfg.token_url.empty()) {
             webdav::warnLog("OAuthProvider: skipping provider '" + name +
-                            "' — missing CLIENT_ID/AUTH_URL/TOKEN_URL");
+                            "' — missing CLIENT_ID/AUTH_URL/TOKEN_URL (set them or an ISSUER for discovery)");
             continue;
         }
+        if (cfg.verify_id_token && cfg.jwks_uri.empty()) {
+            webdav::warnLog("OAuthProvider: provider '" + name +
+                            "' has no jwks_uri — disabling id_token verification (set OAUTH_" +
+                            name + "_JWKS_URI or an ISSUER for discovery)");
+            cfg.verify_id_token = false;
+        }
         webdav::infoLog("OAuthProvider: configured provider '" + name + "' (" +
-                        (cfg.kind == OAuthProviderConfig::GITHUB ? "github" : "oidc") + ")");
+                        (cfg.kind == OAuthProviderConfig::GITHUB ? "github" : "oidc") +
+                        (cfg.verify_id_token ? ", id_token verified" : "") + ")");
         self.providers_[name] = std::move(cfg);
     }
     return self;
@@ -89,9 +115,10 @@ const OAuthProviderConfig* OAuthProvider::get(const std::string& name) const {
 
 std::string OAuthProvider::buildAuthorizeUrl(const OAuthProviderConfig& cfg,
                                              const std::string& state,
-                                             const std::string& code_challenge) const {
+                                             const std::string& code_challenge,
+                                             const std::string& nonce) const {
     std::string sep = cfg.auth_url.find('?') == std::string::npos ? "?" : "&";
-    return cfg.auth_url + sep +
+    std::string url = cfg.auth_url + sep +
            "response_type=code" +
            "&client_id=" + webdav::urlEncode(cfg.client_id) +
            "&redirect_uri=" + webdav::urlEncode(cfg.redirect_uri) +
@@ -99,11 +126,13 @@ std::string OAuthProvider::buildAuthorizeUrl(const OAuthProviderConfig& cfg,
            "&state=" + webdav::urlEncode(state) +
            "&code_challenge=" + webdav::urlEncode(code_challenge) +
            "&code_challenge_method=S256";
+    if (!nonce.empty()) url += "&nonce=" + webdav::urlEncode(nonce);
+    return url;
 }
 
 bool OAuthProvider::exchangeCode(const OAuthProviderConfig& cfg, const std::string& code,
                                  const std::string& code_verifier, std::string& access_token,
-                                 std::string& err) const {
+                                 std::string& id_token, std::string& err) const {
     std::string form =
         "grant_type=authorization_code"
         "&code=" + webdav::urlEncode(code) +
@@ -126,6 +155,7 @@ bool OAuthProvider::exchangeCode(const OAuthProviderConfig& cfg, const std::stri
         Poco::JSON::Parser p;
         auto obj = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
         access_token = strField(obj, "access_token");
+        id_token = strField(obj, "id_token");  // present for OIDC
     } catch (...) {
         err = "token response was not valid JSON";
         return false;
@@ -225,6 +255,72 @@ bool OAuthProvider::fetchIdentityGithub(const OAuthProviderConfig& cfg,
         return false;
     }
     return true;
+}
+
+bool OAuthProvider::discoverEndpoints(OAuthProviderConfig& cfg, std::string& err) {
+    std::string sep = cfg.issuer.back() == '/' ? "" : "/";
+    std::string url = cfg.issuer + sep + ".well-known/openid-configuration";
+    HttpResult r = http_.get(url, {});
+    if (!r.ok || r.status < 200 || r.status >= 300) {
+        err = "discovery unreachable (" + (r.ok ? "HTTP " + std::to_string(r.status) : r.error) + ")";
+        return false;
+    }
+    try {
+        Poco::JSON::Parser p;
+        auto obj = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+        // Only fill what wasn't explicitly configured (explicit env wins).
+        if (cfg.auth_url.empty()) cfg.auth_url = strField(obj, "authorization_endpoint");
+        if (cfg.token_url.empty()) cfg.token_url = strField(obj, "token_endpoint");
+        if (cfg.userinfo_url.empty()) cfg.userinfo_url = strField(obj, "userinfo_endpoint");
+        if (cfg.jwks_uri.empty()) cfg.jwks_uri = strField(obj, "jwks_uri");
+        // The discovery `issuer` is authoritative for the id_token `iss` check.
+        std::string disc_iss = strField(obj, "issuer");
+        if (!disc_iss.empty()) cfg.issuer = disc_iss;
+    } catch (...) {
+        err = "discovery document was not valid JSON";
+        return false;
+    }
+    return true;
+}
+
+std::string OAuthProvider::fetchJwks(const std::string& jwks_uri, bool force,
+                                     std::string& err) const {
+    if (!force) {
+        auto it = jwks_cache_.find(jwks_uri);
+        if (it != jwks_cache_.end()) return it->second;
+    }
+    HttpResult r = http_.get(jwks_uri, {});
+    if (!r.ok || r.status < 200 || r.status >= 300) {
+        err = "jwks unreachable (" + (r.ok ? "HTTP " + std::to_string(r.status) : r.error) + ")";
+        return "";
+    }
+    jwks_cache_[jwks_uri] = r.body;
+    return r.body;
+}
+
+bool OAuthProvider::verifyIdToken(const OAuthProviderConfig& cfg, const std::string& id_token,
+                                  const std::string& expected_nonce, VerifiedIdentity& out,
+                                  std::string& err) const {
+    if (cfg.jwks_uri.empty()) {
+        err = "no jwks_uri configured for id_token verification";
+        return false;
+    }
+    IdTokenClaims claims;
+    // Try with the cached JWKS; on a key-id miss (rotation), refetch once.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string jwks = fetchJwks(cfg.jwks_uri, attempt == 1, err);
+        if (jwks.empty()) return false;
+        if (httpbridge::verifyIdToken(id_token, cfg.issuer, cfg.client_id, expected_nonce,
+                                      jwks, claims, err)) {
+            out.subject = claims.subject;
+            out.email = claims.email;
+            out.email_verified = claims.email_verified;
+            return true;
+        }
+        // Only a missing signing key is worth refetching for; other errors are final.
+        if (err.find("no matching JWKS key") == std::string::npos) return false;
+    }
+    return false;
 }
 
 }  // namespace httpbridge
