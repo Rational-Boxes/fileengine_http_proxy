@@ -1131,15 +1131,19 @@ private:
 
         std::string verifier = randomCodeVerifier();
         std::string challenge = pkceChallengeS256(verifier);
+        // OIDC nonce: bind the id_token to this login (verified in the callback).
+        std::string nonce = randomCodeVerifier();
 
         OAuthState st;
         st.provider = provider;
         st.code_verifier = verifier;
+        st.nonce = nonce;
         st.tenant = resolveTenant(req);
         st.return_to = return_to;
         std::string state = oauth_states_->create(std::move(st));
 
-        resp.redirect(oauth_->buildAuthorizeUrl(*cfg, state, challenge), HTTPResponse::HTTP_FOUND);
+        resp.redirect(oauth_->buildAuthorizeUrl(*cfg, state, challenge, nonce),
+                      HTTPResponse::HTTP_FOUND);
     }
 
     void oauthCallback(HTTPServerRequest& req, HTTPServerResponse& resp, const std::string& provider) {
@@ -1165,14 +1169,36 @@ private:
         const OAuthProviderConfig* cfg = oauth_->get(provider);
         if (!cfg) return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"unknown provider"})");
 
-        std::string access_token, err;
-        if (!oauth_->exchangeCode(*cfg, code, st.code_verifier, access_token, err)) {
+        std::string access_token, id_token, err;
+        if (!oauth_->exchangeCode(*cfg, code, st.code_verifier, access_token, id_token, err)) {
             webdav::warnLog("oauth: code exchange failed for '" + provider + "': " + err);
             return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"token exchange failed"})");
         }
 
         VerifiedIdentity vid;
-        if (!oauth_->fetchIdentity(*cfg, access_token, vid, err)) {
+        if (cfg->verify_id_token) {
+            // Authoritative: verify the signed id_token (JWKS signature + iss + aud +
+            // exp + our nonce). The subject/email come from the verified token; if
+            // the IdP omits email from the id_token, complement it from userinfo.
+            if (id_token.empty()) {
+                webdav::warnLog("oauth: provider '" + provider + "' returned no id_token");
+                return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY,
+                                R"({"error":"provider returned no id_token"})");
+            }
+            if (!oauth_->verifyIdToken(*cfg, id_token, st.nonce, vid, err)) {
+                webdav::warnLog("oauth: id_token verification failed for '" + provider + "': " + err);
+                return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY,
+                                R"({"error":"id_token verification failed"})");
+            }
+            if (vid.email.empty()) {
+                VerifiedIdentity u;
+                std::string uerr;
+                if (oauth_->fetchIdentity(*cfg, access_token, u, uerr)) {
+                    vid.email = u.email;
+                    vid.email_verified = vid.email_verified || u.email_verified;
+                }
+            }
+        } else if (!oauth_->fetchIdentity(*cfg, access_token, vid, err)) {
             webdav::warnLog("oauth: identity fetch failed for '" + provider + "': " + err);
             return sendJson(resp, HTTPResponse::HTTP_BAD_GATEWAY, R"({"error":"identity lookup failed"})");
         }

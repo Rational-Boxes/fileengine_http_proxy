@@ -16,6 +16,7 @@ namespace httpbridge {
 struct OAuthState {
     std::string provider;       // which provider this state was minted for
     std::string code_verifier;  // PKCE verifier (never leaves the server)
+    std::string nonce;          // OIDC nonce, verified against the id_token
     std::string tenant;         // resolved at authorize-time from the host
     std::string return_to;      // validated SPA callback URL
     std::chrono::steady_clock::time_point expiry;

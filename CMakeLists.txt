@@ -55,6 +55,7 @@ add_executable(http_bridge
     src/http_server.cpp
     src/http_client.cpp
     src/oauth_provider.cpp
+    src/oidc_verify.cpp
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
     src/audit_publisher.cpp
@@ -136,3 +137,16 @@ target_link_libraries(security_tests
     GTest::gtest
 )
 add_test(NAME security_tests COMMAND security_tests)
+
+# --- OIDC id_token (RS256 / JWKS) verification suite ---
+add_executable(oidc_tests tests/test_main.cpp tests/test_oidc_verify.cpp src/oidc_verify.cpp)
+target_include_directories(oidc_tests PRIVATE include)
+target_compile_features(oidc_tests PRIVATE cxx_std_17)
+target_link_libraries(oidc_tests
+    Poco::JSON
+    Poco::Crypto      # OpenSSL EVP/RSA for id_token signature verification
+    Poco::Foundation
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME oidc_tests COMMAND oidc_tests)
