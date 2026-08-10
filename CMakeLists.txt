@@ -151,3 +151,16 @@ target_link_libraries(oidc_tests
     GTest::gtest
 )
 add_test(NAME oidc_tests COMMAND oidc_tests)
+
+# --- integration-assertion (RFC 7523; RS256/ES256 vs imported PEM key) suite ---
+add_executable(assertion_tests tests/test_main.cpp tests/test_assertion_verify.cpp src/assertion_verify.cpp)
+target_include_directories(assertion_tests PRIVATE include)
+target_compile_features(assertion_tests PRIVATE cxx_std_17)
+target_link_libraries(assertion_tests
+    Poco::JSON
+    Poco::Crypto      # OpenSSL EVP/RSA/ECDSA for assertion signature verification
+    Poco::Foundation
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME assertion_tests COMMAND assertion_tests)
