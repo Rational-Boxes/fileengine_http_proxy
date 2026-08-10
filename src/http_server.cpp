@@ -21,6 +21,7 @@
 #include "cors.h"
 #include "assertion_verify.h"
 #include "replay_guard.h"
+#include "integration_status.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -384,6 +385,7 @@ private:
 
         // Top-level admin / role resources (no uid in the path).
         const std::string res0 = segs.size() >= 2 ? segs[1] : "";
+        if (res0 == "integrations" && segs.size() == 2 && method == "GET") return listIntegrations(resp, id);
         if (res0 == "tenants" && segs.size() == 2 && method == "GET") return listTenants(resp, id);
         if (res0 == "storage" && segs.size() == 2 && method == "GET")  return storageUsage(resp, id);
         if (res0 == "sync" && segs.size() == 2 && method == "POST")    return triggerSync(resp, id);
@@ -975,6 +977,22 @@ private:
             if (r == "administrators" || r == "tenant_admin" || r == "system_admin") return true;
         sendJson(resp, HTTPResponse::HTTP_FORBIDDEN, R"({"error":"admin role required"})");
         return false;
+    }
+
+    // Read-only, non-secret status of the configured commercial integration (§14.2),
+    // for the admin Integrations panel. Admin-gated; never returns key material. The
+    // list holds the single deployment integration when (partially) configured, else
+    // is empty.
+    void listIntegrations(HTTPServerResponse& resp, const AuthIdentity& id) {
+        if (!requireTenantAdmin(id, resp)) return;
+        const bool key_present = !cfg_.integration_public_key.empty();
+        std::string body = "{\"integrations\":[";
+        if (!cfg_.integration_issuer.empty() || key_present) {
+            body += integrationStatusJson(cfg_.integration_issuer, cfg_.integration_audience,
+                                          key_present, cfg_.integration_allowed_ips);
+        }
+        body += "]}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
     void createRole(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {

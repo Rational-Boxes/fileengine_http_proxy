@@ -110,6 +110,7 @@ add_executable(http_tests
     tests/test_utils.cpp
     tests/test_cors.cpp
     tests/test_replay_guard.cpp
+    tests/test_integration_status.cpp
     src/utils.cpp
 )
 target_include_directories(http_tests PRIVATE include)
