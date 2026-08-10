@@ -107,6 +107,7 @@ find_package(GTest REQUIRED)
 add_executable(http_tests
     tests/test_main.cpp
     tests/test_utils.cpp
+    tests/test_cors.cpp
     src/utils.cpp
 )
 target_include_directories(http_tests PRIVATE include)

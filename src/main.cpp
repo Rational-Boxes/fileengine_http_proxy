@@ -106,6 +106,14 @@ int main() {
     }
     cfg.max_body_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_BODY_BYTES", "104857600"));
     cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
+    // Multi-origin allow-list (a bespoke deployment may embed FileEngine in several
+    // host origins). HTTP_CORS_ORIGINS is a CSV; the legacy single HTTP_CORS_ORIGIN
+    // is folded in for back-compat. Exact match only, never "*".
+    for (auto& o : webdav::splitString(webdav::getEnvOrDefault("HTTP_CORS_ORIGINS", ""), ',')) {
+        const std::string t = webdav::trim(o);
+        if (!t.empty()) cfg.cors_origins.push_back(t);
+    }
+    if (!cfg.cors_origin.empty()) cfg.cors_origins.push_back(cfg.cors_origin);
     cfg.grpc_address = webdav::getEnvOrDefault("FILEENGINE_GRPC_HOST", "localhost") + ":" +
                        webdav::getEnvOrDefault("FILEENGINE_GRPC_PORT", "50051");
     cfg.oauth_redirect_base = webdav::getEnvOrDefault("OAUTH_REDIRECT_BASE", "");

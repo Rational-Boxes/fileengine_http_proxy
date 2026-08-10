@@ -18,6 +18,7 @@
 #include "jwt.h"
 #include "http_client.h"
 #include "client_ip.h"
+#include "cors.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -263,12 +264,18 @@ public:
         const std::string& uri = req.getURI();
         std::string path = uri.substr(0, uri.find('?'));  // query stripped from logs
 
-        // CORS scoped to a configured origin (never "*"); answer preflight here.
-        if (!cfg_.cors_origin.empty()) {
-            resp.set("Access-Control-Allow-Origin", cfg_.cors_origin);
-            resp.set("Vary", "Origin");
-            resp.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Tenant");
-            resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        // CORS scoped to the configured allow-list (never "*"); the request's Origin
+        // is echoed back only on an exact match. Preflight is answered here.
+        if (!cfg_.cors_origins.empty()) {
+            const std::string allow = webdav::matchCorsOrigin(cfg_.cors_origins, req.get("Origin", ""));
+            if (!allow.empty()) {
+                resp.set("Access-Control-Allow-Origin", allow);
+                resp.set("Vary", "Origin");
+                resp.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Tenant");
+                resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            }
+            // Preflight always terminates here; a disallowed Origin simply gets no
+            // Access-Control-Allow-Origin, so the browser blocks the real request.
             if (method == "OPTIONS") {
                 sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
                 return accessLog(method, path, resp, start);

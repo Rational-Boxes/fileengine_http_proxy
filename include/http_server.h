@@ -55,7 +55,8 @@ struct Config {
     std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
     std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
-    std::string cors_origin;                   // empty => no CORS header
+    std::string cors_origin;                   // legacy single origin (HTTP_CORS_ORIGIN)
+    std::vector<std::string> cors_origins;     // allow-list (HTTP_CORS_ORIGINS CSV + the legacy one); exact match, never "*"
     std::string grpc_address = "localhost:50051";
 
     // OAuth2 / OIDC login (BFF). Empty oauth_redirect_base disables OAuth routes.
