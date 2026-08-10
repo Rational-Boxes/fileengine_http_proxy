@@ -56,6 +56,7 @@ add_executable(http_bridge
     src/http_client.cpp
     src/oauth_provider.cpp
     src/oidc_verify.cpp
+    src/assertion_verify.cpp
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
     src/audit_publisher.cpp
@@ -108,6 +109,7 @@ add_executable(http_tests
     tests/test_main.cpp
     tests/test_utils.cpp
     tests/test_cors.cpp
+    tests/test_replay_guard.cpp
     src/utils.cpp
 )
 target_include_directories(http_tests PRIVATE include)

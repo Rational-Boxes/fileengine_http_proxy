@@ -64,6 +64,15 @@ struct Config {
     std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
     int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
 
+    // Commercial-integration token exchange (RFC 7523; §14.2). ONE integration per
+    // bespoke deployment: FileEngine imports only the integration's PUBLIC key.
+    // Empty integration_issuer or integration_public_key disables POST
+    // /v1/auth/exchange (route returns 404).
+    std::string integration_issuer;            // expected assertion `iss` (the integration id)
+    std::string integration_public_key;        // imported RS256/ES256 PUBLIC key (PEM, inline)
+    std::string integration_audience;          // expected assertion `aud` (the exchange endpoint id)
+    std::vector<std::string> integration_allowed_ips;  // optional client-IP allow-list (empty = disabled); echoed as `aip`
+
     // Two-factor auth orchestration (PROPOSAL §4.6). When mfa_enabled, a
     // password-verified login that ldap_manager reports as MFA-required receives a
     // short-lived, IP-bound `mfa_pending` challenge token instead of a full

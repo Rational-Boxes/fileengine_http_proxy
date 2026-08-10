@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -119,6 +120,33 @@ int main() {
     cfg.oauth_redirect_base = webdav::getEnvOrDefault("OAUTH_REDIRECT_BASE", "");
     cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
     cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
+
+    // Commercial-integration token exchange (§14.2). The public key may be supplied
+    // inline (INTEGRATION_PUBLIC_KEY) or via a file path (INTEGRATION_PUBLIC_KEY_FILE).
+    cfg.integration_issuer = webdav::getEnvOrDefault("INTEGRATION_ISSUER", "");
+    cfg.integration_audience = webdav::getEnvOrDefault(
+        "INTEGRATION_AUDIENCE",
+        cfg.oauth_redirect_base.empty() ? "" : cfg.oauth_redirect_base + "/v1/auth/exchange");
+    cfg.integration_public_key = webdav::getEnvOrDefault("INTEGRATION_PUBLIC_KEY", "");
+    if (cfg.integration_public_key.empty()) {
+        const std::string keyPath = webdav::getEnvOrDefault("INTEGRATION_PUBLIC_KEY_FILE", "");
+        if (!keyPath.empty()) {
+            std::ifstream kf(keyPath);
+            if (kf) {
+                std::stringstream ss; ss << kf.rdbuf();
+                cfg.integration_public_key = ss.str();
+            } else {
+                webdav::errorLog("WARNING: INTEGRATION_PUBLIC_KEY_FILE set but unreadable: " + keyPath);
+            }
+        }
+    }
+    for (auto& ip : webdav::splitString(webdav::getEnvOrDefault("INTEGRATION_ALLOWED_IPS", ""), ',')) {
+        const std::string t = webdav::trim(ip);
+        if (!t.empty()) cfg.integration_allowed_ips.push_back(t);
+    }
+    if (!cfg.integration_issuer.empty() && !cfg.integration_public_key.empty()) {
+        webdav::errorLog("Integration token exchange ENABLED for issuer '" + cfg.integration_issuer + "'");
+    }
 
     // Two-factor auth orchestration (PROPOSAL §4.6). Disabled unless MFA_ENABLED
     // and the ldap_manager internal API URL + shared secret are configured.
