@@ -72,6 +72,8 @@ struct Config {
     std::string integration_public_key;        // imported RS256/ES256 PUBLIC key (PEM, inline)
     std::string integration_audience;          // expected assertion `aud` (the exchange endpoint id)
     std::vector<std::string> integration_allowed_ips;  // optional client-IP allow-list (empty = disabled); echoed as `aip`
+    bool integration_allow_service = false;            // permit non-delegated token_type:service exchanges
+    std::vector<std::string> integration_service_roles;  // roles a service token carries (NOT from LDAP)
 
     // Two-factor auth orchestration (PROPOSAL §4.6). When mfa_enabled, a
     // password-verified login that ldap_manager reports as MFA-required receives a

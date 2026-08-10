@@ -144,6 +144,12 @@ int main() {
         const std::string t = webdav::trim(ip);
         if (!t.empty()) cfg.integration_allowed_ips.push_back(t);
     }
+    cfg.integration_allow_service =
+        webdav::getEnvOrDefault("INTEGRATION_ALLOW_SERVICE", "false") == "true";
+    for (auto& r : webdav::splitString(webdav::getEnvOrDefault("INTEGRATION_SERVICE_ROLES", ""), ',')) {
+        const std::string t = webdav::trim(r);
+        if (!t.empty()) cfg.integration_service_roles.push_back(t);
+    }
     if (!cfg.integration_issuer.empty() && !cfg.integration_public_key.empty()) {
         webdav::errorLog("Integration token exchange ENABLED for issuer '" + cfg.integration_issuer + "'");
     }

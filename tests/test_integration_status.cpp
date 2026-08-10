@@ -32,6 +32,11 @@ TEST(IntegrationStatus, AllowlistEchoedAndFlagged) {
     EXPECT_NE(j.find("\"198.51.100.0/24\""), std::string::npos);
 }
 
+TEST(IntegrationStatus, AllowServiceReflected) {
+    EXPECT_NE(integrationStatusJson("i", "a", true, {}, true).find("\"allow_service\":true"), std::string::npos);
+    EXPECT_NE(integrationStatusJson("i", "a", true, {}).find("\"allow_service\":false"), std::string::npos);
+}
+
 TEST(IntegrationStatus, NeverContainsKeyMaterial) {
     // The builder takes only a bool for the key; there is no path for PEM bytes to leak.
     auto j = integrationStatusJson("i", "a", true, {});

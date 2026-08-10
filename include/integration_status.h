@@ -35,7 +35,8 @@ inline std::string jsonEscapeStatus(const std::string& s) {
 inline std::string integrationStatusJson(const std::string& issuer,
                                          const std::string& audience,
                                          bool key_present,
-                                         const std::vector<std::string>& allowed_ips) {
+                                         const std::vector<std::string>& allowed_ips,
+                                         bool allow_service = false) {
     const bool enabled = !issuer.empty() && key_present;
     std::string ips;
     for (std::size_t i = 0; i < allowed_ips.size(); ++i) {
@@ -49,6 +50,7 @@ inline std::string integrationStatusJson(const std::string& issuer,
     out += ",\"key_present\":"; out += key_present ? "true" : "false";
     out += ",\"allowed_ips\":[" + ips + "]";
     out += ",\"ip_allowlist_enforced\":"; out += allowed_ips.empty() ? "false" : "true";
+    out += ",\"allow_service\":"; out += allow_service ? "true" : "false";
     out += "}";
     return out;
 }

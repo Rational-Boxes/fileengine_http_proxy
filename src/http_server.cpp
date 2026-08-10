@@ -22,6 +22,7 @@
 #include "assertion_verify.h"
 #include "replay_guard.h"
 #include "integration_status.h"
+#include "service_claims.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -989,7 +990,8 @@ private:
         std::string body = "{\"integrations\":[";
         if (!cfg_.integration_issuer.empty() || key_present) {
             body += integrationStatusJson(cfg_.integration_issuer, cfg_.integration_audience,
-                                          key_present, cfg_.integration_allowed_ips);
+                                          key_present, cfg_.integration_allowed_ips,
+                                          cfg_.integration_allow_service);
         }
         body += "]}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
@@ -1467,6 +1469,18 @@ private:
         return jwt::sign(claims, cfg_.jwt_secret);
     }
 
+    // Mint an integration-SERVICE token (§14.2 non-delegated path). Roles come from
+    // deployment config, NOT LDAP (the service principal is not an LDAP user); the token
+    // is marked svc:true and IP-bound via `aip`. See service_claims.h.
+    std::string mintServiceJwt(const std::string& subject, const std::string& tenant,
+                               const std::string& aip, const std::string& scope) {
+        long now = static_cast<long>(std::time(nullptr));
+        auto claims = buildServiceClaims(cfg_.jwt_issuer, subject, tenant,
+                                         cfg_.integration_service_roles, aip, scope,
+                                         randomCodeVerifier(), now, cfg_.token_ttl);
+        return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
     // ---- WebDAV session presence (PROPOSAL §14) ------------------------------
     // The tenant's effective (clamped) session TTL, from ldap_manager, cached
     // briefly. Falls back to the deployment default when the lookup is unavailable.
@@ -1791,11 +1805,30 @@ private:
                             R"({"error":"invalid_grant","error_description":"assertion replay"})");
         }
 
-        // Only delegated-user tokens for now: the integration vouches for `sub`.
         const std::string tokType = claims.token_type.empty() ? "delegated" : claims.token_type;
+
+        // Service-principal path (§14.2 non-delegated): the integration acts as itself.
+        // Roles are the deployment's CONFIGURED service roles (no LDAP), and the token is
+        // marked svc:true. Enabled only when INTEGRATION_ALLOW_SERVICE is set.
+        if (tokType == "service") {
+            if (!cfg_.integration_allow_service)
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                R"({"error":"unsupported_token_type","error_description":"service tokens not enabled"})");
+            const std::string tenant = claims.tenant;
+            if (tenant.empty())
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                R"({"error":"invalid_grant","error_description":"service token requires a tenant claim"})");
+            if (!audit_->emitAuth("integration_exchange", "ok", claims.subject, tenant, ip))
+                return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                                R"({"error":"audit log unavailable"})");
+            std::string token = mintServiceJwt(claims.subject, tenant, ip, claims.scope);
+            return sendJson(resp, HTTPResponse::HTTP_OK,
+                            "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                            std::to_string(cfg_.token_ttl) + "}");
+        }
         if (tokType != "delegated")
             return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
-                            R"({"error":"unsupported_token_type","error_description":"only delegated"})");
+                            R"({"error":"unsupported_token_type","error_description":"delegated or service"})");
 
         // The delegated user must exist and belong to a tenant (mirror issueToken).
         auto tenants = ldap_->getTenantsForUser(claims.subject);
