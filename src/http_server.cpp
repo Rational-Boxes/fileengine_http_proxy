@@ -18,12 +18,19 @@
 #include "jwt.h"
 #include "http_client.h"
 #include "client_ip.h"
+#include "cors.h"
+#include "assertion_verify.h"
+#include "replay_guard.h"
+#include "integration_status.h"
+#include "service_claims.h"
+#include "sso_handoff.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/HTTPServerRequest.h>
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/HTTPServerParams.h>
+#include <Poco/Net/HTMLForm.h>
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Base64Decoder.h>
 #include <Poco/StreamCopier.h>
@@ -263,12 +270,18 @@ public:
         const std::string& uri = req.getURI();
         std::string path = uri.substr(0, uri.find('?'));  // query stripped from logs
 
-        // CORS scoped to a configured origin (never "*"); answer preflight here.
-        if (!cfg_.cors_origin.empty()) {
-            resp.set("Access-Control-Allow-Origin", cfg_.cors_origin);
-            resp.set("Vary", "Origin");
-            resp.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Tenant");
-            resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        // CORS scoped to the configured allow-list (never "*"); the request's Origin
+        // is echoed back only on an exact match. Preflight is answered here.
+        if (!cfg_.cors_origins.empty()) {
+            const std::string allow = webdav::matchCorsOrigin(cfg_.cors_origins, req.get("Origin", ""));
+            if (!allow.empty()) {
+                resp.set("Access-Control-Allow-Origin", allow);
+                resp.set("Vary", "Origin");
+                resp.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Tenant");
+                resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            }
+            // Preflight always terminates here; a disallowed Origin simply gets no
+            // Access-Control-Allow-Origin, so the browser blocks the real request.
             if (method == "OPTIONS") {
                 sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
                 return accessLog(method, path, resp, start);
@@ -324,6 +337,20 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
 
+        // Commercial-integration token exchange (RFC 7523; §14.2). Pre-auth: the
+        // caller authenticates with a signed assertion, not a bearer token.
+        if (path == "/v1/auth/exchange") {
+            if (method == "POST") return authExchange(req, resp);
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
+        // Deep-link SSO redeem (§5.5). Pre-auth: the caller presents a one-time
+        // hand-off code (not a bearer token) and gets a fresh session in return.
+        if (path == "/v1/auth/sso/redeem") {
+            if (method == "POST") return ssoRedeem(req, resp);
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
         // Second-factor completion. Pre-auth: the caller holds only the short-lived
         // mfa_pending token from issueToken, not a full session, so it is handled
         // before the general authenticate().
@@ -359,6 +386,11 @@ private:
         if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "refresh" && method == "POST")
             return refreshToken(req, resp, id);
 
+        // Deep-link SSO hand-off (§5.5): the authenticated caller mints a one-time code
+        // that the official SPA can redeem for a session (POST /v1/auth/sso/handoff).
+        if (segs.size() == 4 && segs[1] == "auth" && segs[2] == "sso" && segs[3] == "handoff" && method == "POST")
+            return ssoHandoff(req, resp, id);
+
         // Token introspection for downstream services (e.g. convert_search_ai):
         // validate the caller's bearer token and return the resolved identity, so
         // one bridge-issued token (LDAP or OAuth) authenticates across services.
@@ -367,6 +399,7 @@ private:
 
         // Top-level admin / role resources (no uid in the path).
         const std::string res0 = segs.size() >= 2 ? segs[1] : "";
+        if (res0 == "integrations" && segs.size() == 2 && method == "GET") return listIntegrations(resp, id);
         if (res0 == "tenants" && segs.size() == 2 && method == "GET") return listTenants(resp, id);
         if (res0 == "storage" && segs.size() == 2 && method == "GET")  return storageUsage(resp, id);
         if (res0 == "sync" && segs.size() == 2 && method == "POST")    return triggerSync(resp, id);
@@ -960,6 +993,23 @@ private:
         return false;
     }
 
+    // Read-only, non-secret status of the configured commercial integration (§14.2),
+    // for the admin Integrations panel. Admin-gated; never returns key material. The
+    // list holds the single deployment integration when (partially) configured, else
+    // is empty.
+    void listIntegrations(HTTPServerResponse& resp, const AuthIdentity& id) {
+        if (!requireTenantAdmin(id, resp)) return;
+        const bool key_present = !cfg_.integration_public_key.empty();
+        std::string body = "{\"integrations\":[";
+        if (!cfg_.integration_issuer.empty() || key_present) {
+            body += integrationStatusJson(cfg_.integration_issuer, cfg_.integration_audience,
+                                          key_present, cfg_.integration_allowed_ips,
+                                          cfg_.integration_allow_service);
+        }
+        body += "]}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
+    }
+
     void createRole(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
         if (!requireTenantAdmin(id, resp)) return;
         std::string role = jsonField(readBody(req), "role");
@@ -1399,7 +1449,8 @@ private:
     // ["pwd","totp"|"email"|"recovery"] (or ["oauth"] for a federated login).
     std::string mintJwt(const std::string& user, const std::string& activeTenant,
                         const std::vector<std::string>& amr = {"pwd"},
-                        std::string* outJti = nullptr) {
+                        std::string* outJti = nullptr,
+                        const std::string& aip = "") {
         auto byTenant = ldap_->getRolesByTenant(user);
 
         Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
@@ -1413,6 +1464,9 @@ private:
         std::string jti = randomCodeVerifier();
         if (outJti) *outJti = jti;
         claims->set("jti", jti);
+        // `aip` binds a token minted via integration exchange to the integration's
+        // caller IP (defense-in-depth alongside the assertion's IP allow-list).
+        if (!aip.empty()) claims->set("aip", aip);
 
         Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
         for (const auto& kv : byTenant) {
@@ -1426,6 +1480,91 @@ private:
         for (const auto& m : amr) amrArr->add(m);
         claims->set("amr", amrArr);
         return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // Mint an integration-SERVICE token (§14.2 non-delegated path). Roles come from
+    // deployment config, NOT LDAP (the service principal is not an LDAP user); the token
+    // is marked svc:true and IP-bound via `aip`. See service_claims.h.
+    std::string mintServiceJwt(const std::string& subject, const std::string& tenant,
+                               const std::string& aip, const std::string& scope) {
+        long now = static_cast<long>(std::time(nullptr));
+        auto claims = buildServiceClaims(cfg_.jwt_issuer, subject, tenant,
+                                         cfg_.integration_service_roles, aip, scope,
+                                         randomCodeVerifier(), now, cfg_.token_ttl);
+        return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // ---- Deep-link SSO hand-off (§5.5) ---------------------------------------
+    // The authenticated caller mints a short-lived, single-use code carrying only its
+    // own sub/tenant. The SPA the user is deep-linked into redeems it for a session.
+    void ssoHandoff(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        const std::string ip = clientIp(req);
+        const long now = static_cast<long>(std::time(nullptr));
+        auto claims = buildHandoffClaims(cfg_.jwt_issuer, id.user, id.tenant,
+                                         randomCodeVerifier(), now, cfg_.sso_handoff_ttl,
+                                         id.amr);   // carry the session's 2FA strength across
+        std::string code = jwt::sign(claims, cfg_.jwt_secret);
+        audit_->emitAuth("sso_handoff", "ok", id.user, id.tenant, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"code\":\"" + code + "\",\"expires_in\":" + std::to_string(cfg_.sso_handoff_ttl) + "}");
+    }
+
+    // Redeem a one-time hand-off code for a fresh session (pre-auth). Verifies the
+    // signature + expiry, checks it is a hand-off code, rejects a replayed jti, then
+    // mints a session for the SAME user/tenant (roles resolved live from LDAP).
+    void ssoRedeem(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        const std::string ip = clientIp(req);
+        std::string code;
+        if (req.getContentType().find("application/json") != std::string::npos) {
+            code = jsonField(readBody(req), "code");
+        } else {
+            try { Poco::Net::HTMLForm form(req, req.stream()); code = form.get("code", ""); }
+            catch (...) { return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"invalid_request"})"); }
+        }
+        if (code.empty())
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            R"({"error":"invalid_request","error_description":"missing code"})");
+
+        const long now = static_cast<long>(std::time(nullptr));
+        Poco::JSON::Object::Ptr claims;
+        std::string err;
+        if (!jwt::verify(code, cfg_.jwt_secret, now, claims, err))
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"invalid or expired code"})");
+        if (claims->optValue<std::string>("sso", std::string()) != "handoff")
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"not a hand-off code"})");
+        const std::string jti = claims->optValue<std::string>("jti", std::string());
+        const long exp = static_cast<long>(claims->optValue<Poco::Int64>("exp", 0));
+        if (!sso_replay_.accept(jti, exp, now))
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"code already redeemed"})");
+
+        const std::string user = claims->optValue<std::string>("sub", std::string());
+        const std::string tenant = claims->optValue<std::string>("tenant", std::string());
+        if (user.empty())
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":"invalid_grant"})");
+        if (!audit_->emitAuth("sso_redeem", "ok", user, tenant, ip))
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE, R"({"error":"audit log unavailable"})");
+
+        // Preserve the hand-off code's auth methods (RFC 8176) so the new session
+        // inherits the originating session's 2FA strength; `sso` records the transport.
+        std::vector<std::string> amr{"sso"};
+        if (claims->has("amr")) {
+            try {
+                auto arr = claims->getArray("amr");
+                if (arr)
+                    for (std::size_t i = 0; i < arr->size(); ++i)
+                        amr.push_back(arr->getElement<std::string>(static_cast<unsigned>(i)));
+            } catch (...) {
+            }
+        }
+        std::string jtiOut;
+        std::string token = mintJwt(user, tenant, amr, &jtiOut, ip);
+        recordSession(tenant, user, jtiOut, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
     }
 
     // ---- WebDAV session presence (PROPOSAL §14) ------------------------------
@@ -1691,6 +1830,120 @@ private:
         // unset this keeps the dev behavior (first XFF hop); set it in production so
         // XFF can't be spoofed to forge the MFA IP binding / audit source.
         return resolveClientIp(peer, req.get("X-Forwarded-For", ""), cfg_.trusted_proxies);
+    }
+
+    // Commercial-integration token exchange (RFC 7523; §14.2). An external SaaS
+    // authenticates with a short-lived assertion signed by the integration's private
+    // key; FileEngine verifies it against the imported public key and mints a real,
+    // IP-bound session token for the delegated end-user (roles resolved live from
+    // LDAP). One integration per deployment; disabled unless configured.
+    void authExchange(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        if (cfg_.integration_issuer.empty() || cfg_.integration_public_key.empty())
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+
+        const std::string ip = clientIp(req);
+
+        // Body: grant_type + assertion (form-encoded per RFC 7523, or JSON).
+        std::string grant_type, assertion;
+        if (req.getContentType().find("application/json") != std::string::npos) {
+            const std::string body = readBody(req);
+            grant_type = jsonField(body, "grant_type");
+            assertion = jsonField(body, "assertion");
+        } else {
+            try {
+                Poco::Net::HTMLForm form(req, req.stream());
+                grant_type = form.get("grant_type", "");
+                assertion = form.get("assertion", "");
+            } catch (...) {
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"invalid_request"})");
+            }
+        }
+
+        if (grant_type != "urn:ietf:params:oauth:grant-type:jwt-bearer")
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"unsupported_grant_type"})");
+        if (assertion.empty())
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            R"({"error":"invalid_request","error_description":"missing assertion"})");
+
+        // IP allow-list (defense-in-depth): reject before spending crypto when the
+        // caller is outside the configured set.
+        if (!cfg_.integration_allowed_ips.empty() && !isTrustedProxy(ip, cfg_.integration_allowed_ips)) {
+            audit_->emitAuth("integration_exchange", "denied", cfg_.integration_issuer, "", ip);
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                            R"({"error":"unauthorized_client","error_description":"ip not allowed"})");
+        }
+
+        IntegrationClaims claims;
+        std::string err;
+        if (!verifyIntegrationAssertion(assertion, cfg_.integration_issuer, cfg_.integration_audience,
+                                        cfg_.integration_public_key, claims, err)) {
+            audit_->emitAuth("integration_exchange", "denied", cfg_.integration_issuer, "", ip);
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            std::string("{\"error\":\"invalid_grant\",\"error_description\":\"") +
+                                jsonEscape(err) + "\"}");
+        }
+
+        // Single-use assertion: reject a replayed jti within the assertion's lifetime.
+        const long now = static_cast<long>(std::time(nullptr));
+        if (!replay_.accept(claims.jti, claims.expires_at, now)) {
+            audit_->emitAuth("integration_exchange", "denied", cfg_.integration_issuer, claims.tenant, ip);
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"assertion replay"})");
+        }
+
+        const std::string tokType = claims.token_type.empty() ? "delegated" : claims.token_type;
+
+        // Service-principal path (§14.2 non-delegated): the integration acts as itself.
+        // Roles are the deployment's CONFIGURED service roles (no LDAP), and the token is
+        // marked svc:true. Enabled only when INTEGRATION_ALLOW_SERVICE is set.
+        if (tokType == "service") {
+            if (!cfg_.integration_allow_service)
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                R"({"error":"unsupported_token_type","error_description":"service tokens not enabled"})");
+            const std::string tenant = claims.tenant;
+            if (tenant.empty())
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                R"({"error":"invalid_grant","error_description":"service token requires a tenant claim"})");
+            if (!audit_->emitAuth("integration_exchange", "ok", claims.subject, tenant, ip))
+                return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                                R"({"error":"audit log unavailable"})");
+            std::string token = mintServiceJwt(claims.subject, tenant, ip, claims.scope);
+            return sendJson(resp, HTTPResponse::HTTP_OK,
+                            "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                            std::to_string(cfg_.token_ttl) + "}");
+        }
+        if (tokType != "delegated")
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            R"({"error":"unsupported_token_type","error_description":"delegated or service"})");
+
+        // The delegated user must exist and belong to a tenant (mirror issueToken).
+        auto tenants = ldap_->getTenantsForUser(claims.subject);
+        if (tenants.empty()) {
+            audit_->emitAuth("integration_exchange", "denied", claims.subject, claims.tenant, ip);
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"unknown delegated user"})");
+        }
+        std::string tenant = claims.tenant;
+        bool member = false;
+        for (const auto& t : tenants) if (t == tenant) { member = true; break; }
+        if (tenant.empty() || !member) tenant = tenants.front();
+
+        // Fail-closed write-ahead: do not issue a session we cannot audit.
+        if (!audit_->emitAuth("integration_exchange", "ok", claims.subject, tenant, ip))
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+
+        // Carry the integration's asserted auth methods into the session (RFC 8176), so
+        // a user the integration already 2FA'd against the shared directory does not get
+        // re-challenged downstream. `integration` is always recorded as the exchange method.
+        std::vector<std::string> amr = claims.amr;
+        amr.push_back("integration");
+        std::string jti;
+        std::string token = mintJwt(claims.subject, tenant, amr, &jti, ip);
+        recordSession(tenant, claims.subject, jti, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
     }
 
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
@@ -2006,6 +2259,12 @@ private:
     // so it is shared across the per-request handler instances (process-global).
     inline static std::mutex requiresMu_;
     inline static std::map<std::string, std::pair<bool, long>> requiresCache_;
+    // Single-use guard for integration-assertion `jti` (replay rejection for the
+    // token-exchange endpoint). `inline static` so it is shared process-wide across
+    // the per-request handler instances; ReplayGuard is internally thread-safe.
+    inline static ReplayGuard replay_;
+    // Single-use guard for SSO hand-off code `jti` (§5.5) — a code is redeemable once.
+    inline static ReplayGuard sso_replay_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {

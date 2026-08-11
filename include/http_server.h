@@ -55,13 +55,29 @@ struct Config {
     std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
     std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
-    std::string cors_origin;                   // empty => no CORS header
+    std::string cors_origin;                   // legacy single origin (HTTP_CORS_ORIGIN)
+    std::vector<std::string> cors_origins;     // allow-list (HTTP_CORS_ORIGINS CSV + the legacy one); exact match, never "*"
     std::string grpc_address = "localhost:50051";
 
     // OAuth2 / OIDC login (BFF). Empty oauth_redirect_base disables OAuth routes.
     std::string oauth_redirect_base;        // public base URL of the bridge
     std::string oauth_return_allowlist;     // CSV of permitted SPA return-URL prefixes
     int oauth_state_ttl = 300;              // pending-authorization lifetime (s)
+
+    // Commercial-integration token exchange (RFC 7523; §14.2). ONE integration per
+    // bespoke deployment: FileEngine imports only the integration's PUBLIC key.
+    // Empty integration_issuer or integration_public_key disables POST
+    // /v1/auth/exchange (route returns 404).
+    std::string integration_issuer;            // expected assertion `iss` (the integration id)
+    std::string integration_public_key;        // imported RS256/ES256 PUBLIC key (PEM, inline)
+    std::string integration_audience;          // expected assertion `aud` (the exchange endpoint id)
+    std::vector<std::string> integration_allowed_ips;  // optional client-IP allow-list (empty = disabled); echoed as `aip`
+    bool integration_allow_service = false;            // permit non-delegated token_type:service exchanges
+    std::vector<std::string> integration_service_roles;  // roles a service token carries (NOT from LDAP)
+
+    // Deep-link SSO hand-off (§5.5): a host with a live session mints a short-lived,
+    // single-use code; the SPA redeems it for a fresh session. TTL kept SHORT.
+    int sso_handoff_ttl = 60;                          // hand-off code lifetime (s)
 
     // Two-factor auth orchestration (PROPOSAL §4.6). When mfa_enabled, a
     // password-verified login that ldap_manager reports as MFA-required receives a

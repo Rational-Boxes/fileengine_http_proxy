@@ -56,6 +56,7 @@ add_executable(http_bridge
     src/http_client.cpp
     src/oauth_provider.cpp
     src/oidc_verify.cpp
+    src/assertion_verify.cpp
     src/grpc_client_wrapper.cpp
     src/ldap_authenticator.cpp
     src/audit_publisher.cpp
@@ -107,6 +108,9 @@ find_package(GTest REQUIRED)
 add_executable(http_tests
     tests/test_main.cpp
     tests/test_utils.cpp
+    tests/test_cors.cpp
+    tests/test_replay_guard.cpp
+    tests/test_integration_status.cpp
     src/utils.cpp
 )
 target_include_directories(http_tests PRIVATE include)
@@ -125,7 +129,7 @@ add_test(NAME failover_tests COMMAND failover_tests)
 
 # --- security regression suite over the header-only HS256 JWT (jwt.h) ---
 # Header-only: links only Poco (JSON/Foundation) + OpenSSL (HMAC) + GTest.
-add_executable(security_tests tests/test_main.cpp tests/test_security.cpp)
+add_executable(security_tests tests/test_main.cpp tests/test_security.cpp tests/test_service_claims.cpp tests/test_sso_handoff.cpp)
 target_include_directories(security_tests PRIVATE include)
 target_compile_features(security_tests PRIVATE cxx_std_17)
 target_link_libraries(security_tests
@@ -150,3 +154,16 @@ target_link_libraries(oidc_tests
     GTest::gtest
 )
 add_test(NAME oidc_tests COMMAND oidc_tests)
+
+# --- integration-assertion (RFC 7523; RS256/ES256 vs imported PEM key) suite ---
+add_executable(assertion_tests tests/test_main.cpp tests/test_assertion_verify.cpp src/assertion_verify.cpp)
+target_include_directories(assertion_tests PRIVATE include)
+target_compile_features(assertion_tests PRIVATE cxx_std_17)
+target_link_libraries(assertion_tests
+    Poco::JSON
+    Poco::Crypto      # OpenSSL EVP/RSA/ECDSA for assertion signature verification
+    Poco::Foundation
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME assertion_tests COMMAND assertion_tests)
