@@ -23,6 +23,7 @@
 #include "replay_guard.h"
 #include "integration_status.h"
 #include "service_claims.h"
+#include "sso_handoff.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -343,6 +344,13 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
 
+        // Deep-link SSO redeem (§5.5). Pre-auth: the caller presents a one-time
+        // hand-off code (not a bearer token) and gets a fresh session in return.
+        if (path == "/v1/auth/sso/redeem") {
+            if (method == "POST") return ssoRedeem(req, resp);
+            return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+        }
+
         // Second-factor completion. Pre-auth: the caller holds only the short-lived
         // mfa_pending token from issueToken, not a full session, so it is handled
         // before the general authenticate().
@@ -377,6 +385,11 @@ private:
         // revoked session beyond token_ttl.
         if (segs.size() == 3 && segs[1] == "auth" && segs[2] == "refresh" && method == "POST")
             return refreshToken(req, resp, id);
+
+        // Deep-link SSO hand-off (§5.5): the authenticated caller mints a one-time code
+        // that the official SPA can redeem for a session (POST /v1/auth/sso/handoff).
+        if (segs.size() == 4 && segs[1] == "auth" && segs[2] == "sso" && segs[3] == "handoff" && method == "POST")
+            return ssoHandoff(req, resp, id);
 
         // Token introspection for downstream services (e.g. convert_search_ai):
         // validate the caller's bearer token and return the resolved identity, so
@@ -1481,6 +1494,66 @@ private:
         return jwt::sign(claims, cfg_.jwt_secret);
     }
 
+    // ---- Deep-link SSO hand-off (§5.5) ---------------------------------------
+    // The authenticated caller mints a short-lived, single-use code carrying only its
+    // own sub/tenant. The SPA the user is deep-linked into redeems it for a session.
+    void ssoHandoff(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
+        const std::string ip = clientIp(req);
+        const long now = static_cast<long>(std::time(nullptr));
+        auto claims = buildHandoffClaims(cfg_.jwt_issuer, id.user, id.tenant,
+                                         randomCodeVerifier(), now, cfg_.sso_handoff_ttl);
+        std::string code = jwt::sign(claims, cfg_.jwt_secret);
+        audit_->emitAuth("sso_handoff", "ok", id.user, id.tenant, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"code\":\"" + code + "\",\"expires_in\":" + std::to_string(cfg_.sso_handoff_ttl) + "}");
+    }
+
+    // Redeem a one-time hand-off code for a fresh session (pre-auth). Verifies the
+    // signature + expiry, checks it is a hand-off code, rejects a replayed jti, then
+    // mints a session for the SAME user/tenant (roles resolved live from LDAP).
+    void ssoRedeem(HTTPServerRequest& req, HTTPServerResponse& resp) {
+        const std::string ip = clientIp(req);
+        std::string code;
+        if (req.getContentType().find("application/json") != std::string::npos) {
+            code = jsonField(readBody(req), "code");
+        } else {
+            try { Poco::Net::HTMLForm form(req, req.stream()); code = form.get("code", ""); }
+            catch (...) { return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"invalid_request"})"); }
+        }
+        if (code.empty())
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            R"({"error":"invalid_request","error_description":"missing code"})");
+
+        const long now = static_cast<long>(std::time(nullptr));
+        Poco::JSON::Object::Ptr claims;
+        std::string err;
+        if (!jwt::verify(code, cfg_.jwt_secret, now, claims, err))
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"invalid or expired code"})");
+        if (claims->optValue<std::string>("sso", std::string()) != "handoff")
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"not a hand-off code"})");
+        const std::string jti = claims->optValue<std::string>("jti", std::string());
+        const long exp = static_cast<long>(claims->optValue<Poco::Int64>("exp", 0));
+        if (!sso_replay_.accept(jti, exp, now))
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED,
+                            R"({"error":"invalid_grant","error_description":"code already redeemed"})");
+
+        const std::string user = claims->optValue<std::string>("sub", std::string());
+        const std::string tenant = claims->optValue<std::string>("tenant", std::string());
+        if (user.empty())
+            return sendJson(resp, HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":"invalid_grant"})");
+        if (!audit_->emitAuth("sso_redeem", "ok", user, tenant, ip))
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE, R"({"error":"audit log unavailable"})");
+
+        std::string jtiOut;
+        std::string token = mintJwt(user, tenant, {"sso"}, &jtiOut, ip);
+        recordSession(tenant, user, jtiOut, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
+    }
+
     // ---- WebDAV session presence (PROPOSAL §14) ------------------------------
     // The tenant's effective (clamped) session TTL, from ldap_manager, cached
     // briefly. Falls back to the deployment default when the lookup is unavailable.
@@ -2172,6 +2245,8 @@ private:
     // token-exchange endpoint). `inline static` so it is shared process-wide across
     // the per-request handler instances; ReplayGuard is internally thread-safe.
     inline static ReplayGuard replay_;
+    // Single-use guard for SSO hand-off code `jti` (§5.5) — a code is redeemable once.
+    inline static ReplayGuard sso_replay_;
 };
 
 class HandlerFactory : public HTTPRequestHandlerFactory {

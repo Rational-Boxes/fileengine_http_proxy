@@ -129,7 +129,7 @@ add_test(NAME failover_tests COMMAND failover_tests)
 
 # --- security regression suite over the header-only HS256 JWT (jwt.h) ---
 # Header-only: links only Poco (JSON/Foundation) + OpenSSL (HMAC) + GTest.
-add_executable(security_tests tests/test_main.cpp tests/test_security.cpp tests/test_service_claims.cpp)
+add_executable(security_tests tests/test_main.cpp tests/test_security.cpp tests/test_service_claims.cpp tests/test_sso_handoff.cpp)
 target_include_directories(security_tests PRIVATE include)
 target_compile_features(security_tests PRIVATE cxx_std_17)
 target_link_libraries(security_tests

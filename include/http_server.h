@@ -75,6 +75,10 @@ struct Config {
     bool integration_allow_service = false;            // permit non-delegated token_type:service exchanges
     std::vector<std::string> integration_service_roles;  // roles a service token carries (NOT from LDAP)
 
+    // Deep-link SSO hand-off (§5.5): a host with a live session mints a short-lived,
+    // single-use code; the SPA redeems it for a fresh session. TTL kept SHORT.
+    int sso_handoff_ttl = 60;                          // hand-off code lifetime (s)
+
     // Two-factor auth orchestration (PROPOSAL §4.6). When mfa_enabled, a
     // password-verified login that ldap_manager reports as MFA-required receives a
     // short-lived, IP-bound `mfa_pending` challenge token instead of a full

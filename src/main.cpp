@@ -144,6 +144,7 @@ int main() {
         const std::string t = webdav::trim(ip);
         if (!t.empty()) cfg.integration_allowed_ips.push_back(t);
     }
+    cfg.sso_handoff_ttl = std::stoi(webdav::getEnvOrDefault("SSO_HANDOFF_TTL_SECONDS", "60"));
     cfg.integration_allow_service =
         webdav::getEnvOrDefault("INTEGRATION_ALLOW_SERVICE", "false") == "true";
     for (auto& r : webdav::splitString(webdav::getEnvOrDefault("INTEGRATION_SERVICE_ROLES", ""), ',')) {
