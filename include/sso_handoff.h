@@ -8,14 +8,17 @@
 // can never escalate. Header-only + Poco::JSON so the claim shape is unit-testable.
 #include <ctime>
 #include <string>
+#include <vector>
 
+#include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 
 namespace httpbridge {
 
 inline Poco::JSON::Object::Ptr buildHandoffClaims(
     const std::string& issuer, const std::string& subject, const std::string& tenant,
-    const std::string& jti, long now, long ttl) {
+    const std::string& jti, long now, long ttl,
+    const std::vector<std::string>& amr = {}) {
     Poco::JSON::Object::Ptr c = new Poco::JSON::Object();
     c->set("iss", issuer);
     c->set("sub", subject);
@@ -24,6 +27,11 @@ inline Poco::JSON::Object::Ptr buildHandoffClaims(
     c->set("iat", static_cast<Poco::Int64>(now));
     c->set("exp", static_cast<Poco::Int64>(now + ttl));
     c->set("jti", jti);
+    // Carry the originating session's auth methods so the redeemed SPA session inherits
+    // the same 2FA strength — the hand-off preserves the trust, not just the identity.
+    Poco::JSON::Array::Ptr amrArr = new Poco::JSON::Array();
+    for (const auto& m : amr) amrArr->add(m);
+    c->set("amr", amrArr);
     return c;
 }
 

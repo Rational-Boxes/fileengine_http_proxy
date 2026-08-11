@@ -17,6 +17,7 @@
 #define HTTP_BRIDGE_ASSERTION_VERIFY_H
 
 #include <string>
+#include <vector>
 
 namespace httpbridge {
 
@@ -30,6 +31,8 @@ struct IntegrationClaims {
     std::string scope;       // custom `scope` claim (optional; space-delimited)
     std::string jti;         // `jti` — unique id, for replay rejection by the caller
     std::string token_type;  // custom `token_type` claim: "delegated" | "service" (optional)
+    std::vector<std::string> amr;  // `amr` — auth methods the integration asserts (RFC 8176),
+                                   //  e.g. ["pwd","otp"]; propagates the integration's 2FA trust
     long expires_at = 0;     // `exp` (unix epoch) — echoed for the caller's bookkeeping
 };
 

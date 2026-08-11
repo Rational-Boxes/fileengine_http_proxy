@@ -38,6 +38,23 @@ TEST(SsoHandoff, SignsAndVerifies_ThenExpires) {
     EXPECT_FALSE(httpbridge::jwt::verify(code, SECRET, 1100, out, err));         // expired (>= exp)
 }
 
+TEST(SsoHandoff, CarriesAmrForTwoFactorTrust) {
+    auto c = buildHandoffClaims("iss", "alice@acme", "acme", "jti-a", 1000, 60, {"pwd", "otp"});
+    std::ostringstream os; c->stringify(os);
+    auto j = parse(os.str());
+    auto arr = j->getArray("amr");
+    ASSERT_FALSE(arr.isNull());
+    ASSERT_EQ(arr->size(), 2u);
+    EXPECT_EQ(arr->getElement<std::string>(0), "pwd");
+    EXPECT_EQ(arr->getElement<std::string>(1), "otp");
+}
+
+TEST(SsoHandoff, AmrEmptyByDefault) {
+    auto c = buildHandoffClaims("iss", "u", "t", "j", 1000, 60);
+    std::ostringstream os; c->stringify(os);
+    EXPECT_EQ(parse(os.str())->getArray("amr")->size(), 0u);
+}
+
 TEST(SsoHandoff, WrongSecretRejected) {
     auto c = buildHandoffClaims("iss", "u", "t", "j", 1000, 60);
     std::string code = httpbridge::jwt::sign(c, SECRET);

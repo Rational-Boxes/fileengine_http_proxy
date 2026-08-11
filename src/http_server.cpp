@@ -1501,7 +1501,8 @@ private:
         const std::string ip = clientIp(req);
         const long now = static_cast<long>(std::time(nullptr));
         auto claims = buildHandoffClaims(cfg_.jwt_issuer, id.user, id.tenant,
-                                         randomCodeVerifier(), now, cfg_.sso_handoff_ttl);
+                                         randomCodeVerifier(), now, cfg_.sso_handoff_ttl,
+                                         id.amr);   // carry the session's 2FA strength across
         std::string code = jwt::sign(claims, cfg_.jwt_secret);
         audit_->emitAuth("sso_handoff", "ok", id.user, id.tenant, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
@@ -1546,8 +1547,20 @@ private:
         if (!audit_->emitAuth("sso_redeem", "ok", user, tenant, ip))
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE, R"({"error":"audit log unavailable"})");
 
+        // Preserve the hand-off code's auth methods (RFC 8176) so the new session
+        // inherits the originating session's 2FA strength; `sso` records the transport.
+        std::vector<std::string> amr{"sso"};
+        if (claims->has("amr")) {
+            try {
+                auto arr = claims->getArray("amr");
+                if (arr)
+                    for (std::size_t i = 0; i < arr->size(); ++i)
+                        amr.push_back(arr->getElement<std::string>(static_cast<unsigned>(i)));
+            } catch (...) {
+            }
+        }
         std::string jtiOut;
-        std::string token = mintJwt(user, tenant, {"sso"}, &jtiOut, ip);
+        std::string token = mintJwt(user, tenant, amr, &jtiOut, ip);
         recordSession(tenant, user, jtiOut, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
@@ -1920,8 +1933,13 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"audit log unavailable"})");
 
+        // Carry the integration's asserted auth methods into the session (RFC 8176), so
+        // a user the integration already 2FA'd against the shared directory does not get
+        // re-challenged downstream. `integration` is always recorded as the exchange method.
+        std::vector<std::string> amr = claims.amr;
+        amr.push_back("integration");
         std::string jti;
-        std::string token = mintJwt(claims.subject, tenant, {"integration"}, &jti, ip);
+        std::string token = mintJwt(claims.subject, tenant, amr, &jti, ip);
         recordSession(tenant, claims.subject, jti, ip);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"access_token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +

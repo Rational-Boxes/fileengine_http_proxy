@@ -222,6 +222,19 @@ bool verifyIntegrationAssertion(const std::string& assertion,
     out.jti = strField(claims, "jti");
     out.token_type = strField(claims, "token_type");
     out.expires_at = exp;
+    // `amr` (RFC 8176): the auth methods the integration asserts for this user (e.g.
+    // ["pwd","otp"]). Propagated into the minted session so an integration that already
+    // 2FA'd the user against the shared directory carries that trust forward.
+    out.amr.clear();
+    if (claims->has("amr")) {
+        try {
+            auto arr = claims->getArray("amr");
+            if (arr)
+                for (std::size_t i = 0; i < arr->size(); ++i)
+                    out.amr.push_back(arr->getElement<std::string>(static_cast<unsigned>(i)));
+        } catch (...) {
+        }
+    }
     return true;
 }
 

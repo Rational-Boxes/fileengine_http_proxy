@@ -43,6 +43,26 @@ const char* ISS = "acme-integration";
 const char* AUD = "https://files.example.com/v1/auth/exchange";
 const long PAST = 1700000100;  // just after iat, far before exp
 
+// A separate keypair whose assertion carries amr:["pwd","otp"] (2FA-trust propagation).
+static const char* AMR_PUB_PEM =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAm7NKjFnx1VnJ7FnkqLy5\n"
+    "DY2OjuY6K8DFfrlvF4414DdKeTwyywXDmd3F+6/8LK1urEv7cep1eqdrjOeKQF4w\n"
+    "thOVNbfcN4nSmV8q+b3rPjWibVklPyjMimG1PEB+AB76atBsK9KDzvcuvNC8AcnV\n"
+    "KwHRuAozjXPDbm20x2aTWn1L09KHEhMKttEjECzXxjFy5lXRuJe+Be4fWcCWc+gw\n"
+    "O7GMzcbYJxEuwoIYwkrViKXryZBB7GCn3qhXonGTR14xTVu8TAemZaVMJyNKK2D+\n"
+    "Cgipii8RLLB4sD1J7bsrykayMt0+RtlX3Bq+yszhF8JNxARcv6HuR0OZ1qnMa6hS\n"
+    "EwIDAQAB\n"
+    "-----END PUBLIC KEY-----\n";
+static const char* AMR_ASSERTION =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhY21lLWludGVncmF0aW9uIiwic3ViIjoiYWxpY2VAYWNtZSIsImF"
+    "1ZCI6Imh0dHBzOi8vZmlsZXMuZXhhbXBsZS5jb20vdjEvYXV0aC9leGNoYW5nZSIsImV4cCI6MjAwMDAwMDAwMCwiaWF0IjoxNzA"
+    "wMDAwMDAwLCJqdGkiOiJhbXItMSIsInRlbmFudCI6ImFjbWUiLCJ0b2tlbl90eXBlIjoiZGVsZWdhdGVkIiwiYW1yIjpbInB3ZCI"
+    "sIm90cCJdfQ.TJzSxrE3queR7UGrvWTNc7CVhHIvyuBD9aUmN7V8taTOPijmlHsgfBOUJEjh0N-9MZeOGv2cx4MyTajxHQ1ogRQf"
+    "uR7-GqDIESQ-5R5SVUuK9M632fto2ogYVbtSLA3grH7kXAbgfZ6-bu9DopLvFh8O8Ik3UlLABNt4pevYbq6CZzHMRt5yrwWQouub"
+    "P3Wg7qf6b9RNPFQFXKKepCbRxw5KJRGN8nZTdE4d9hO2llI1tfnbMOlwuIJbtgewxw8XfYOGMOyuHkeMN9AluWm-Y0SWJItJAf2H"
+    "nd3u8O5jmdvTuvIJCySNH1RNcM2XmJgsLGYvl7rUIxu2KrTNAeXWjg";
+
 }  // namespace
 
 TEST(AssertionVerify, RS256HappyPath) {
@@ -124,4 +144,18 @@ TEST(AssertionVerify, NoneAlgRejected) {
 TEST(AssertionVerify, EmptyPemRejected) {
     IntegrationClaims c; std::string err;
     EXPECT_FALSE(verifyIntegrationAssertion(RS256_ASSERTION, ISS, AUD, "", c, err, PAST));
+}
+
+TEST(AssertionVerify, ExtractsAmrForTwoFactorTrust) {
+    IntegrationClaims c; std::string err;
+    ASSERT_TRUE(verifyIntegrationAssertion(AMR_ASSERTION, ISS, AUD, AMR_PUB_PEM, c, err, PAST)) << err;
+    ASSERT_EQ(c.amr.size(), 2u);
+    EXPECT_EQ(c.amr[0], "pwd");
+    EXPECT_EQ(c.amr[1], "otp");   // a 2FA method -> propagates the integration's 2FA trust
+}
+
+TEST(AssertionVerify, AmrDefaultsEmptyWhenAbsent) {
+    IntegrationClaims c; std::string err;
+    ASSERT_TRUE(verifyIntegrationAssertion(RS256_ASSERTION, ISS, AUD, RSA_PUB_PEM, c, err, PAST)) << err;
+    EXPECT_TRUE(c.amr.empty());
 }
