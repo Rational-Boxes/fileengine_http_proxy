@@ -2294,7 +2294,10 @@ private:
 class OverloadHandler : public HTTPRequestHandler {
 public:
     void handleRequest(HTTPServerRequest&, HTTPServerResponse& resp) override {
-        resp.setStatus(HTTPResponse::HTTP_SERVICE_UNAVAILABLE);
+        // setStatusAndReason, not setStatus: Poco's setStatus(HTTPStatus) sets the
+        // code and leaves the reason phrase alone, which produced "503 OK" on the
+        // wire — a status line that reads as a contradiction in any log or proxy.
+        resp.setStatusAndReason(HTTPResponse::HTTP_SERVICE_UNAVAILABLE);
         resp.setContentType("application/json");
         // Retry-After is the half of this that makes a client behave well: it
         // says "come back", not "give up".
