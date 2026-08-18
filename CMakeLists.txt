@@ -187,4 +187,4 @@ add_test(NAME assertion_tests COMMAND assertion_tests)
 add_test(NAME load_stress
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/load_stress.py
                  --target http --requests 200 --concurrency 32)
-set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600)
+set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600 SKIP_RETURN_CODE 77)

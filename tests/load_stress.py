@@ -74,7 +74,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BRIDGE = os.environ.get("BRIDGE_URL", "http://localhost:8090")
 WEBDAV = os.environ.get("WEBDAV_URL", "http://localhost:8088")
 USER = os.environ.get("FE_USER", "testuser@rationalboxes.com")
-PASSWORD = os.environ.get("FE_PASSWORD", "P@ssword1234567890*")
+#: REQUIRED, with no fallback. A hardcoded test password is still a credential in
+#: git, and this repository has removed exactly this pattern before (frontend
+#: dac1c4f, "e2e: require FE_PASS, drop hardcoded test-password fallback") — it
+#: was reintroduced here by accident. Missing means SKIP, not fail: a developer
+#: without the credential should not see a red build for it.
+PASSWORD = os.environ.get("FE_PASSWORD", "")
 TENANT = os.environ.get("FE_TENANT", "default")
 
 #: WebDAV refuses the LDAP directory password by design (the service-credential
@@ -434,6 +439,11 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=4.0,
                     help="seconds to let things quiesce before judging the resting state")
     args = ap.parse_args()
+
+    if not PASSWORD:
+        print("FE_PASSWORD is not set (the LDAP test-user password). Set it in the "
+              "environment to run this; skipping.", file=sys.stderr)
+        return 77   # ctest SKIP_RETURN_CODE
 
     monitor = MONITORS[args.target]
     print(f"→ {args.target}: {args.requests} requests, {args.concurrency} concurrent, "
