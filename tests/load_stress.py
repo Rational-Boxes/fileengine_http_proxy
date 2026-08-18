@@ -82,6 +82,17 @@ TENANT = os.environ.get("FE_TENANT", "default")
 #: authenticated traffic — without it the run still loads the accept loop and the
 #: credential-verification path, which is where a soft-lock would show, but it
 #: cannot exercise file operations.
+#:
+#: Mint one on the server:
+#:
+#:     python -m ldap_manager.cli credential create \
+#:         --user <uid> --scopes webdav --json
+#:
+#: WebDAV ALSO applies an IP-binding session gate (WEBDAV_IP_BINDING_ENABLED),
+#: which expects a Redis session key written at browser login. A valid credential
+#: alone still gets 401 from a machine with no session — add the test host to
+#: WEBDAV_IP_BIND_TRUSTED_CIDRS (127.0.0.0/8 for a local run) so the gate lets it
+#: through. That gate, not an ACL, is what a surprise 401 here almost always is.
 WEBDAV_KEY = os.environ.get("WEBDAV_KEY", "")
 WEBDAV_SECRET = os.environ.get("WEBDAV_SECRET", "")
 
