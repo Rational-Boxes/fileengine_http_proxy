@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include <atomic>
 #include "monitor_metrics.h"
 #include "http_server.h"
 #include "utils.h"
@@ -2280,6 +2281,30 @@ private:
     inline static ReplayGuard sso_replay_;
 };
 
+// (definition for HandlerFactory::shed_total_ appears after the class)
+
+// Answers 503 when the server is past its capacity, so an overloaded bridge
+// tells the client so rather than closing the socket on it.
+//
+// Poco drops connections at the TCP level once its accept queue is full, before
+// any handler exists — a client then sees a reset and cannot tell overload from
+// a broken network, and a proxy in between reports a gateway error rather than
+// backpressure. The queue is now deep enough that connections are ACCEPTED, and
+// this sheds the excess with a status code the moment a worker looks at it.
+class OverloadHandler : public HTTPRequestHandler {
+public:
+    void handleRequest(HTTPServerRequest&, HTTPServerResponse& resp) override {
+        resp.setStatus(HTTPResponse::HTTP_SERVICE_UNAVAILABLE);
+        resp.setContentType("application/json");
+        // Retry-After is the half of this that makes a client behave well: it
+        // says "come back", not "give up".
+        resp.set("Retry-After", "1");
+        const std::string body = R"({"error":"overloaded","detail":"server is at capacity, retry shortly"})";
+        resp.setContentLength(static_cast<std::streamsize>(body.size()));
+        resp.send() << body;
+    }
+};
+
 class HandlerFactory : public HTTPRequestHandlerFactory {
 public:
     HandlerFactory(Config cfg,
@@ -2294,11 +2319,33 @@ public:
           oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
           sessions_(std::move(sessions)) {}
 
-    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
+    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& req) override {
+        // Shed before doing any work, but never the monitoring paths: an
+        // overloaded server is exactly when its health has to stay readable.
+        if (server_ && shed_above_ > 0 &&
+            server_->queuedConnections() > shed_above_ &&
+            req.getURI().rfind("/healthz", 0) != 0 &&
+            req.getURI().rfind("/readyz", 0) != 0 &&
+            req.getURI().rfind("/metrics", 0) != 0) {
+            shed_total_.fetch_add(1);
+            return new OverloadHandler();
+        }
         return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_);
     }
 
+    // Set once the server exists (the factory is built first, to be handed to it).
+    void set_server(Poco::Net::HTTPServer* s, int shed_above) {
+        server_ = s;
+        shed_above_ = shed_above;
+    }
+
+    static std::uint64_t shed_total() { return shed_total_.load(); }
+
 private:
+    Poco::Net::HTTPServer* server_ = nullptr;   // not owned; set after construction
+    int shed_above_ = 0;                        // queued connections tolerated before shedding
+    static std::atomic<std::uint64_t> shed_total_;
+
     Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
@@ -2423,12 +2470,21 @@ private:
 };
 }  // namespace
 
+std::atomic<std::uint64_t> HandlerFactory::shed_total_{0};
+
 void HttpBridgeServer::start() {
     const int threads = cfg_.thread_pool > 0 ? cfg_.thread_pool : 16;
 
     auto params = new Poco::Net::HTTPServerParams;
     params->setMaxThreads(threads);
-    params->setMaxQueued(threads * 8);
+    // A DEEP accept queue on purpose. Poco drops connections at the TCP level
+    // once this is full — before any handler runs — so a shallow queue means an
+    // overloaded bridge resets clients instead of answering them. With room to
+    // accept, the factory above sheds the excess with 503 + Retry-After, which a
+    // client and a load balancer can both act on. HTTP_MAX_QUEUED overrides it.
+    const int max_queued = std::stoi(
+        webdav::getEnvOrDefault("HTTP_MAX_QUEUED", std::to_string(threads * 64)));
+    params->setMaxQueued(max_queued);
     params->setKeepAlive(true);
 
     // Use a *dedicated* pool sized to `threads` rather than Poco's shared
@@ -2441,8 +2497,14 @@ void HttpBridgeServer::start() {
     Poco::Net::ServerSocket socket(
         Poco::Net::SocketAddress(cfg_.http_host, static_cast<Poco::UInt16>(cfg_.http_port)));
 
-    server_ = std::make_unique<Poco::Net::HTTPServer>(
-        new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_), *pool_, socket, params);
+    // Held so the factory can ask the server how deep its queue is; the server
+    // owns the factory, so this pointer stays valid for the server's lifetime.
+    auto* factory = new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_);
+    server_ = std::make_unique<Poco::Net::HTTPServer>(factory, *pool_, socket, params);
+    // Start shedding once the backlog is several times the worker count: enough
+    // headroom that an ordinary burst still queues and succeeds, low enough that
+    // clients hear about a genuine overload quickly instead of waiting.
+    factory->set_server(server_.get(), threads * 4);
     server_->start();
     webdav::infoLog("HTTP bridge listening on " + cfg_.http_host + ":" + std::to_string(cfg_.http_port) +
                     " (threads=" + std::to_string(cfg_.thread_pool) + ")");
