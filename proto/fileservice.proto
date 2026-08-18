@@ -295,10 +295,23 @@ message ListVersionsRequest {
     AuthenticationContext auth = 2;     // Authentication information
 }
 
+// One stored version of a file.
+//
+// Added because `versions` carried only timestamps, so no caller could learn WHO
+// uploaded a given version — the data was already being read out of the versions
+// table for other queries, just never returned here.
+message VersionEntry {
+    string version_timestamp = 1;       // The version's identifier (a timestamp)
+    string revised_by = 2;              // The user who uploaded it; empty if unrecorded
+}
+
 message ListVersionsResponse {
     bool success = 1;
     string error = 2;
+    // DEPRECATED in favour of `entries`, and still populated so existing clients
+    // keep working. Same order and count as `entries`.
     repeated string versions = 3;       // List of version timestamps
+    repeated VersionEntry entries = 4;  // Timestamp + uploader, newest first
 }
 
 message GetVersionRequest {
@@ -409,7 +422,7 @@ enum AclEffect {
 
 message GrantPermissionRequest {
     string resource_uid = 1;            // Resource UUID to grant permission on
-    string principal = 2;               // User or group name
+    string principal = 2;               // user id | "role:<name>" | "claim:<k=v>" | "everyone"
     Permission permission = 3;          // Permission to grant
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // ALLOW (default) or DENY
@@ -424,7 +437,7 @@ message GetResourceAclsRequest {
 
 message AclEntryMessage {
     string principal = 1;               // bare principal (role/claim prefixes stripped at store time)
-    int32 type = 2;                     // PrincipalType: 0 user, 1 role, 2 group, 3 other, 4 claim
+    int32 type = 2;                     // PrincipalType: 0 user, 1 role, 2 reserved(unused), 3 other, 4 claim
     int32 permissions = 3;              // permission bitmask
     int32 effect = 4;                   // 0 = ALLOW, 1 = DENY
 }
@@ -442,7 +455,7 @@ message GrantPermissionResponse {
 
 message RevokePermissionRequest {
     string resource_uid = 1;            // Resource UUID to revoke permission from
-    string principal = 2;               // User or group name
+    string principal = 2;               // user id | "role:<name>" | "claim:<k=v>" | "everyone"
     Permission permission = 3;          // Permission to revoke
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // Which row to revoke from: ALLOW (default) or DENY

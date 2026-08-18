@@ -745,8 +745,20 @@ private:
         fillAuth(rq.mutable_auth(), id);
         auto r = grpc_->listVersions(rq);
         if (!r.success()) return mapError(resp, r.error());
+        // `versions` stays a plain array of timestamps so existing clients are
+        // unaffected; `entries` adds the uploader beside each one. The core
+        // returns both in the same order, newest first.
         std::vector<std::string> v(r.versions().begin(), r.versions().end());
-        sendJson(resp, HTTPResponse::HTTP_OK, "{\"versions\":" + jsonArray(v) + "}");
+        std::string entries = "[";
+        for (int i = 0; i < r.entries_size(); ++i) {
+            if (i) entries += ",";
+            const auto& e = r.entries(i);
+            entries += "{\"version\":\"" + jsonEscape(e.version_timestamp()) +
+                       "\",\"revised_by\":\"" + jsonEscape(e.revised_by()) + "\"}";
+        }
+        entries += "]";
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"versions\":" + jsonArray(v) + ",\"entries\":" + entries + "}");
     }
 
     void getVersion(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& ts) {
