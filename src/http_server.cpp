@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include "monitor_metrics.h"
 #include "http_server.h"
 #include "utils.h"
 #include "jwt.h"
@@ -2366,6 +2367,34 @@ public:
             sendJson(resp, HTTPResponse::HTTP_OK,
                      std::string("{") + poolFields(*pool_, maxQueued_) +
                      ",\"saturated\":" + (hasCapacity ? "false" : "true") + "}");
+        } else if (path == "/metrics") {
+            // The same numbers as /poolz, in the exposition format scrapers and
+            // load-balancer autoscalers read natively. /poolz stays as it is:
+            // machines read this one, people read that one.
+            fileengine_monitor::Writer w(service_);
+            w.gauge("fileengine_build_info", "Build identity; the value is always 1", 1);
+            fileengine_monitor::process_metrics(w);
+            const int cap = pool_->capacity();
+            const int used = pool_->used();
+            w.gauge("fileengine_worker_pool_capacity", "Worker threads this bridge may use", cap);
+            w.gauge("fileengine_worker_pool_used", "Worker threads serving a request right now", used);
+            w.gauge("fileengine_worker_pool_available", "Worker threads free to take a request",
+                    pool_->available());
+            w.gauge("fileengine_worker_pool_max_queued",
+                    "Requests that may queue once every worker is busy", maxQueued_);
+            // The saturation signal to shed load on. /readyz already returns 503
+            // at 1.0 so a load balancer drains this instance.
+            w.gauge("fileengine_worker_pool_utilization",
+                    "used / capacity, as a ratio. The saturation signal for load shedding",
+                    cap > 0 ? static_cast<double>(used) / cap : 0.0);
+            w.gauge("fileengine_worker_pool_saturated",
+                    "1 when no worker is free; /readyz returns 503 in this state",
+                    hasCapacity ? 0 : 1);
+            const std::string body = w.str();
+            resp.setStatus(HTTPResponse::HTTP_OK);
+            resp.setContentType(fileengine_monitor::content_type());
+            resp.setContentLength(static_cast<std::streamsize>(body.size()));
+            resp.send() << body;
         } else {
             sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
