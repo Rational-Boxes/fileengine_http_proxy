@@ -52,6 +52,10 @@ struct Config {
     // LDAP, so role changes take effect within ~the refresh interval and a token
     // that stops being refreshed (access revoked) expires quickly.
     int token_ttl = 900;                     // JWT lifetime (s)
+    // Download tickets ride in a URL, so they are scoped to one file uid and
+    // live for seconds — long enough for the browser to follow a navigation,
+    // far too short to be worth harvesting from a log. See mintDownloadTicket.
+    int download_ticket_ttl = 30;            // download ticket lifetime (s)
     std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
     std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
