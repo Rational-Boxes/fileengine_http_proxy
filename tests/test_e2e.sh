@@ -222,12 +222,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/co
 echo "[streaming + range]"
 SD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_stream\"}" | uidof)
 BF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$SD/files" -d '{"name":"big.bin"}' | uidof)
-# 2 MiB of deterministic data
-head -c 2097152 /dev/zero | tr '\0' 'A' > /tmp/hb_big.bin
+# 12 MiB of deterministic data.
+#
+# The size is the point, and it used to be 2 MiB — which is BELOW every chunk
+# boundary in the stack, so the tests named "streaming upload/download" passed
+# just as happily against a fully-buffered implementation. 12 MiB clears all
+# three: the clients' 4 MiB MAX_WIRE_CHUNK, grpc-js's 4 MiB default receive
+# limit, and the core's 1 MiB emit bound — so a regression to buffering, or a
+# single oversized gRPC message, actually fails here.
+BIG=12582912
+head -c "$BIG" /dev/zero | tr '\0' 'A' > /tmp/hb_big.bin
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$BF/content" --data-binary @/tmp/hb_big.bin)
-{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "PUT 2MiB (streaming upload) -> 2xx" || bad "stream upload" "got $code"
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "PUT 12MiB (streaming upload, > chunk bound) -> 2xx" || bad "stream upload" "got $code"
 curl -s "${A[@]}" "$BASE/v1/files/$BF/content" -o /tmp/hb_big_dl.bin
-[ "$(wc -c </tmp/hb_big_dl.bin)" = "2097152" ] && ok "GET 2MiB (streaming download) full size" || bad "stream download size" "$(wc -c </tmp/hb_big_dl.bin)"
+[ "$(wc -c </tmp/hb_big_dl.bin)" = "$BIG" ] && ok "GET 12MiB (streaming download) full size" || bad "stream download size" "$(wc -c </tmp/hb_big_dl.bin)"
 cmp -s /tmp/hb_big.bin /tmp/hb_big_dl.bin && ok "streamed content matches" || bad "stream content mismatch"
 # Range request: bytes 0-9 (10 bytes)
 code=$(curl -s -o /tmp/hb_range -w '%{http_code}' "${A[@]}" -H 'Range: bytes=0-9' "$BASE/v1/files/$BF/content")
