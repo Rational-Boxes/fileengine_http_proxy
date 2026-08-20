@@ -763,18 +763,41 @@ private:
                  "{\"versions\":" + jsonArray(v) + ",\"entries\":" + entries + "}");
     }
 
+    // GET a specific version's content. Streams, like getContent: the unary
+    // GetVersion RPC materialises the whole version on both sides and is
+    // refused outright past the per-message cap, so a large historical version
+    // was simply unreadable through this route. StreamFileDownload carries the
+    // version on GetFileRequest, so the same server-streaming path serves any
+    // revision.
     void getVersion(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& ts) {
-        fileengine_rpc::GetVersionRequest rq;
+        fileengine_rpc::GetFileRequest rq;
         rq.set_uid(uid);
         rq.set_version_timestamp(ts);
         fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->getVersion(rq);
-        if (!r.success()) return mapError(resp, r.error());
-        resp.setStatus(HTTPResponse::HTTP_OK);
-        resp.setContentType("application/octet-stream");
-        const std::string& data = r.data();
-        resp.setContentLength(static_cast<std::streamsize>(data.size()));
-        resp.send().write(data.data(), static_cast<std::streamsize>(data.size()));
+
+        std::ostream* os = nullptr;
+        bool headerSent = false;
+        auto result = grpc_->streamFileDownload(rq, [&](const std::string& chunk) -> bool {
+            if (!headerSent) {
+                resp.setStatus(HTTPResponse::HTTP_OK);
+                resp.setContentType("application/octet-stream");
+                os = &resp.send();
+                headerSent = true;
+            }
+            os->write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            return os->good();
+        });
+
+        if (!result.success) {
+            if (!headerSent) return mapError(resp, result.error);
+            return;  // already streaming; the status cannot be changed mid-body
+        }
+        if (!headerSent) {  // an empty version still needs a well-formed reply
+            resp.setStatus(HTTPResponse::HTTP_OK);
+            resp.setContentType("application/octet-stream");
+            resp.setContentLength(0);
+            resp.send();
+        }
     }
 
     void restoreVersion(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
