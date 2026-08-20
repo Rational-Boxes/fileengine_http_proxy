@@ -375,6 +375,23 @@ private:
             }
         }
 
+        // A ticketed content GET. Pre-auth because a browser NAVIGATION cannot
+        // set an Authorization header — which is the whole reason the ticket
+        // exists. Narrow on purpose: GET only, the content sub-resource only,
+        // and identityFromDownloadTicket refuses any ticket not minted for this
+        // exact uid, so this is not a general query-string auth channel.
+        {
+            auto s2 = pathSegments(path);
+            if (method == "GET" && s2.size() == 4 && s2[1] == "files" && s2[3] == "content"
+                && req.get("Authorization", "").empty()) {
+                AuthIdentity tid;
+                if (identityFromDownloadTicket(req, s2[2], tid))
+                    return getContent(req, resp, tid, s2[2]);
+                // No valid ticket: fall through to the normal gate, which emits
+                // the ordinary 401 rather than anything ticket-specific.
+            }
+        }
+
         AuthIdentity id;
         if (!authenticate(req, resp, id)) return;  // authenticate() emitted 401/403
 
@@ -439,6 +456,11 @@ private:
                 } else if (segs.size() == 4) {
                     if (sub == "content" && method == "PUT")    return putContent(req, resp, id, uid);
                     if (sub == "content" && method == "GET")    return getContent(req, resp, id, uid);
+                    // Mint a URL-carryable credential for THIS file, so the SPA
+                    // can download by navigation and let the browser stream to
+                    // disk rather than buffering the whole file in a Blob.
+                    if (sub == "download-ticket" && method == "POST")
+                        return downloadTicket(resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
                     if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
@@ -763,18 +785,41 @@ private:
                  "{\"versions\":" + jsonArray(v) + ",\"entries\":" + entries + "}");
     }
 
+    // GET a specific version's content. Streams, like getContent: the unary
+    // GetVersion RPC materialises the whole version on both sides and is
+    // refused outright past the per-message cap, so a large historical version
+    // was simply unreadable through this route. StreamFileDownload carries the
+    // version on GetFileRequest, so the same server-streaming path serves any
+    // revision.
     void getVersion(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& ts) {
-        fileengine_rpc::GetVersionRequest rq;
+        fileengine_rpc::GetFileRequest rq;
         rq.set_uid(uid);
         rq.set_version_timestamp(ts);
         fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->getVersion(rq);
-        if (!r.success()) return mapError(resp, r.error());
-        resp.setStatus(HTTPResponse::HTTP_OK);
-        resp.setContentType("application/octet-stream");
-        const std::string& data = r.data();
-        resp.setContentLength(static_cast<std::streamsize>(data.size()));
-        resp.send().write(data.data(), static_cast<std::streamsize>(data.size()));
+
+        std::ostream* os = nullptr;
+        bool headerSent = false;
+        auto result = grpc_->streamFileDownload(rq, [&](const std::string& chunk) -> bool {
+            if (!headerSent) {
+                resp.setStatus(HTTPResponse::HTTP_OK);
+                resp.setContentType("application/octet-stream");
+                os = &resp.send();
+                headerSent = true;
+            }
+            os->write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            return os->good();
+        });
+
+        if (!result.success) {
+            if (!headerSent) return mapError(resp, result.error);
+            return;  // already streaming; the status cannot be changed mid-body
+        }
+        if (!headerSent) {  // an empty version still needs a well-formed reply
+            resp.setStatus(HTTPResponse::HTTP_OK);
+            resp.setContentType("application/octet-stream");
+            resp.setContentLength(0);
+            resp.send();
+        }
     }
 
     void restoreVersion(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
@@ -1357,6 +1402,17 @@ private:
                 unauthorized(req, resp);
                 return false;
             }
+            // A download ticket travels in a URL — browser history, referrers,
+            // proxy logs. It is scoped to one file and lives for seconds, and
+            // this is what keeps it that way: presented as a bearer it opens
+            // NOTHING. Same shape as the mfa_pending guard above, and for the
+            // same reason: a credential minted for one narrow purpose must not
+            // be accepted for a broader one.
+            if (claims->optValue<std::string>("typ", std::string()) == "download") {
+                webdav::debugLog("authenticate: rejected a download ticket used as a bearer");
+                unauthorized(req, resp);
+                return false;
+            }
             // Per-request tenant selection: an X-Tenant header picks which tenant's
             // roles apply (from the token's {tenant:[roles]} map); otherwise the
             // token's default `tenant` claim is used.
@@ -1494,6 +1550,76 @@ private:
         for (const auto& m : amr) amrArr->add(m);
         claims->set("amr", amrArr);
         return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    // ---- download tickets -----------------------------------------------
+    // A browser navigation cannot set an Authorization header, so a streaming
+    // download (one that lands straight on disk instead of being buffered into
+    // a Blob by XHR) needs its credential in the URL. This mints one that is
+    // deliberately almost useless if it leaks:
+    //
+    //   * scoped to ONE file uid (`dl`) — it opens nothing else;
+    //   * seconds-long `exp`;
+    //   * marked `typ: "download"`, and authenticate() REFUSES that marker, so
+    //     a leaked download URL can never be replayed as a session.
+    //
+    // It carries the caller's own identity and roles, so it is not an
+    // escalation — it is a time-boxed, narrowed re-presentation of authority
+    // the caller already had. The core still enforces READ on the actual
+    // download, exactly as it would for the bearer path.
+    std::string mintDownloadTicket(const AuthIdentity& id, const std::string& uid) {
+        long now = static_cast<long>(std::time(nullptr));
+        Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
+        claims->set("iss", cfg_.jwt_issuer);
+        claims->set("sub", id.user);
+        claims->set("tenant", id.tenant);
+        claims->set("iat", static_cast<Poco::Int64>(now));
+        claims->set("exp", static_cast<Poco::Int64>(now + cfg_.download_ticket_ttl));
+        claims->set("typ", std::string("download"));
+        claims->set("dl", uid);
+        Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
+        Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
+        for (const auto& r : id.roles) arr->add(r);
+        rolesObj->set(id.tenant, arr);
+        claims->set("roles", rolesObj);
+        return jwt::sign(claims, cfg_.jwt_secret);
+    }
+
+    void downloadTicket(HTTPServerResponse& resp, const AuthIdentity& id,
+                        const std::string& uid) {
+        const std::string t = mintDownloadTicket(id, uid);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"ticket\":\"" + t + "\",\"expires_in\":" +
+                 std::to_string(cfg_.download_ticket_ttl) + "}");
+    }
+
+    // Resolve a `?ticket=` into an identity, but ONLY for the uid it names.
+    bool identityFromDownloadTicket(HTTPServerRequest& req, const std::string& uid,
+                                    AuthIdentity& out) {
+        Poco::URI::QueryParameters qp;
+        try { qp = Poco::URI(req.getURI()).getQueryParameters(); }
+        catch (...) { return false; }
+        std::string ticket;
+        for (const auto& kv : qp) if (kv.first == "ticket") ticket = kv.second;
+        if (ticket.empty()) return false;
+
+        Poco::JSON::Object::Ptr claims;
+        std::string err;
+        long now = static_cast<long>(std::time(nullptr));
+        if (!jwt::verify(ticket, cfg_.jwt_secret, now, claims, err)) {
+            webdav::debugLog("download ticket rejected: " + err);
+            return false;
+        }
+        if (claims->optValue<std::string>("typ", std::string()) != "download") return false;
+        // The scoping check. Without it the ticket is a general bearer that
+        // merely happens to travel in a query string.
+        if (claims->optValue<std::string>("dl", std::string()) != uid) {
+            webdav::debugLog("download ticket presented for the wrong uid");
+            return false;
+        }
+        identityFromClaims(claims, claims->optValue<std::string>("tenant", std::string()), out);
+        out.source_addr = clientIp(req);
+        return true;
     }
 
     // Mint an integration-SERVICE token (§14.2 non-delegated path). Roles come from

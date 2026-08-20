@@ -222,17 +222,67 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/co
 echo "[streaming + range]"
 SD=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$ROOT" -d "{\"name\":\"${SUF}_stream\"}" | uidof)
 BF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$SD/files" -d '{"name":"big.bin"}' | uidof)
-# 2 MiB of deterministic data
-head -c 2097152 /dev/zero | tr '\0' 'A' > /tmp/hb_big.bin
+# 12 MiB of deterministic data.
+#
+# The size is the point, and it used to be 2 MiB — which is BELOW every chunk
+# boundary in the stack, so the tests named "streaming upload/download" passed
+# just as happily against a fully-buffered implementation. 12 MiB clears all
+# three: the clients' 4 MiB MAX_WIRE_CHUNK, grpc-js's 4 MiB default receive
+# limit, and the core's 1 MiB emit bound — so a regression to buffering, or a
+# single oversized gRPC message, actually fails here.
+BIG=12582912
+head -c "$BIG" /dev/zero | tr '\0' 'A' > /tmp/hb_big.bin
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X PUT "$BASE/v1/files/$BF/content" --data-binary @/tmp/hb_big.bin)
-{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "PUT 2MiB (streaming upload) -> 2xx" || bad "stream upload" "got $code"
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "PUT 12MiB (streaming upload, > chunk bound) -> 2xx" || bad "stream upload" "got $code"
 curl -s "${A[@]}" "$BASE/v1/files/$BF/content" -o /tmp/hb_big_dl.bin
-[ "$(wc -c </tmp/hb_big_dl.bin)" = "2097152" ] && ok "GET 2MiB (streaming download) full size" || bad "stream download size" "$(wc -c </tmp/hb_big_dl.bin)"
+[ "$(wc -c </tmp/hb_big_dl.bin)" = "$BIG" ] && ok "GET 12MiB (streaming download) full size" || bad "stream download size" "$(wc -c </tmp/hb_big_dl.bin)"
 cmp -s /tmp/hb_big.bin /tmp/hb_big_dl.bin && ok "streamed content matches" || bad "stream content mismatch"
 # Range request: bytes 0-9 (10 bytes)
 code=$(curl -s -o /tmp/hb_range -w '%{http_code}' "${A[@]}" -H 'Range: bytes=0-9' "$BASE/v1/files/$BF/content")
 [ "$code" = "206" ] && ok "Range request -> 206" || bad "range status" "got $code"
 [ "$(wc -c </tmp/hb_range)" = "10" ] && ok "Range returns requested 10 bytes" || bad "range size" "$(wc -c </tmp/hb_range)"
+# ---- download tickets ----
+# A browser NAVIGATION cannot set an Authorization header, so a download that
+# streams straight to disk (rather than being buffered into a Blob by XHR) needs
+# its credential in the URL. Everything below is about keeping that credential
+# almost worthless if it leaks into history, a referrer, or a proxy log.
+echo "[download tickets]"
+TKT=$(curl -s "${A[@]}" -X POST "$BASE/v1/files/$BF/download-ticket" | sed -n 's/.*"ticket":"\([^"]*\)".*/\1/p')
+[ -n "$TKT" ] && ok "mint a download ticket" || bad "mint ticket" "empty"
+
+# 1. It works, with no Authorization header at all.
+code=$(curl -s -o /tmp/hb_tkt.bin -w '%{http_code}' "$BASE/v1/files/$BF/content?ticket=$TKT")
+[ "$code" = "200" ] && ok "ticketed GET needs no Authorization header" || bad "ticketed GET" "got $code"
+[ "$(wc -c </tmp/hb_tkt.bin)" = "$BIG" ] && ok "ticketed GET streams the whole 12MiB" || bad "ticketed size" "$(wc -c </tmp/hb_tkt.bin)"
+
+# 2. It is NOT a session. This is what stops a leaked download URL from
+#    becoming an account: presented as a bearer, it opens nothing.
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TKT" "$BASE/v1/dirs/$ROOT")
+[ "$code" = "401" ] && ok "a ticket replayed as a Bearer token is refused" || bad "ticket-as-bearer" "got $code"
+
+# 3. It is scoped to ONE file. Without this the ticket is a general credential
+#    that merely happens to travel in a query string.
+OF=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$SD/files" -d '{"name":"other.bin"}' | uidof)
+curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/files/$OF/content" --data-binary 'other file contents'
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/files/$OF/content?ticket=$TKT")
+[ "$code" = "401" ] && ok "a ticket for one file does not open another" || bad "ticket scoping" "got $code"
+
+# 4. Garbage is refused (and the refusal says nothing ticket-specific).
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/files/$BF/content?ticket=not-a-jwt")
+[ "$code" = "401" ] && ok "a malformed ticket is refused" || bad "bad ticket" "got $code"
+
+# 5. It expires. Only run when the TTL is short enough to wait out; the default
+#    is 30s, which is too long to spend in an E2E run.
+TTL="${FE_TICKET_TTL:-30}"
+if [ "$TTL" -le 5 ]; then
+  sleep $((TTL + 2))
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/files/$BF/content?ticket=$TKT")
+  [ "$code" = "401" ] && ok "an expired ticket is refused" || bad "ticket expiry" "got $code"
+else
+  skip "ticket expiry (set DOWNLOAD_TICKET_TTL_SECONDS<=5 on the bridge and FE_TICKET_TTL to match)"
+fi
+rm -f /tmp/hb_tkt.bin
+
 curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$SD"   # cleanup
 rm -f /tmp/hb_big.bin /tmp/hb_big_dl.bin /tmp/hb_range
 
