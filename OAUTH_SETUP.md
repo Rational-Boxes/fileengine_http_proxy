@@ -44,9 +44,10 @@ Two things every provider needs from you:
 
 | Variable | Example | Meaning |
 |---|---|---|
-| `OAUTH_REDIRECT_BASE` | `https://files.example.com` | Public base URL of **this bridge**. Empty disables OAuth. |
-| `OAUTH_RETURN_ALLOWLIST` | `https://app.example.com/,http://localhost:3000/` | CSV of allowed SPA return-URL prefixes, matched with a boundary guard; no wildcards. A `return_to` not matching one is rejected (anti open-redirect). **Grows with tenant subdomains** — see [Multi-tenant deployments](#multi-tenant-deployments-one-idp-app-many-subdomains). Never shorten an entry to a bare scheme. |
-| `OAUTH_PROVIDERS` | `google,github,microsoft` | CSV of enabled providers; each needs an `OAUTH_<NAME>_*` block. |
+| `OAUTH_REDIRECT_BASE` | `https://login.example.com/api` | Public base URL of **this bridge** — the ONE handshake URL shared by every provider (see [One handshake URL](#one-handshake-url-every-provider)). Empty disables OAuth. |
+| `OAUTH_RETURN_ALLOWLIST` | `https://login.example.com/` | CSV of allowed return-URL prefixes, matched with a boundary guard; no wildcards. A `return_to` not matching one is rejected (anti open-redirect). With the shared sign-in origin this is **one entry**, not one per tenant. Never shorten an entry to a bare scheme — see [Multi-tenant deployments](#multi-tenant-deployments-one-idp-app-many-subdomains). |
+| `LOGIN_SUBDOMAIN` | `login` | DNS label of the shared sign-in origin. **Reserved** — a tenant may never carry this name. No hyphen. |
+| `OAUTH_PROVIDERS` | `google,microsoft,linkedin` | CSV of enabled providers. Google, Microsoft and LinkedIn need only a client id and secret — their endpoints are built in. Empty disables federated login, and the login screen then shows no provider buttons. |
 | `OAUTH_STATE_TTL_SECONDS` | `300` | How long a started login may sit before the callback must arrive. |
 
 Per provider (`<P>` = the upper-cased name from `OAUTH_PROVIDERS`):
@@ -228,6 +229,34 @@ OAUTH_OKTA_SCOPES=openid email profile
 
 ---
 
+## One handshake URL, every provider
+
+There is a single configurable base URL for the whole OAuth handshake, shared by
+every provider. Only the last path segment differs:
+
+```
+OAUTH_REDIRECT_BASE=https://login.example.com/api      # ONE setting
+
+  https://login.example.com/api/v1/auth/oauth/google/callback
+  https://login.example.com/api/v1/auth/oauth/microsoft/callback
+  https://login.example.com/api/v1/auth/oauth/linkedin/callback
+```
+
+So adding a provider is: register that one URL with the IdP, set its client id
+and secret, add its name to `OAUTH_PROVIDERS`. Nothing else — no new host, no
+DNS, no certificate, no allowlist entry, and no SPA rebuild (the login screen
+asks the bridge which providers exist).
+
+In the unified stack the base defaults to
+`https://<LOGIN_SUBDOMAIN>.<BASE_DOMAIN>/api` and rarely needs setting. Pointing
+it at the sign-in origin is deliberate: nginx path-proxies `/api` on every host,
+so any of them *could* serve the callback — but using the sign-in origin is what
+keeps this at one URL instead of one per tenant.
+
+`OAUTH_RETURN_ALLOWLIST` defaults to that same origin, for the same reason.
+
+---
+
 ## Multi-tenant deployments (one IdP app, many subdomains)
 
 FileEngine resolves the tenant from the host subdomain, so the login screen
@@ -265,12 +294,23 @@ and carried through the signed state to the callback:
 So a user who starts on `acme.example.com` lands back there with an `acme` token.
 Nothing about adding a tenant touches the IdP configuration.
 
-### The one thing that DOES grow per tenant
+### The allowlist, and why the shared origin keeps it at one entry
 
-`OAUTH_RETURN_ALLOWLIST` — the check that stops `return_to` becoming an open
-redirect. Every tenant origin you intend to support must be listed:
+`OAUTH_RETURN_ALLOWLIST` is the check that stops `return_to` becoming an open
+redirect. **With the shared sign-in origin it holds a single entry**, because
+every flow returns there and the session is then handed on to whichever
+workspace the user chose:
 
 ```bash
+OAUTH_RETURN_ALLOWLIST=https://login.example.com/
+```
+
+Only if you bypass the sign-in origin — returning users directly to their tenant
+— does this grow, and then every tenant origin must be listed and the bridge
+restarted whenever one is added:
+
+```bash
+# the arrangement the shared origin exists to avoid
 OAUTH_RETURN_ALLOWLIST=https://acme.example.com/,https://someco.example.com/
 ```
 
@@ -291,9 +331,9 @@ syntax. A prefix matches only when it ends at an origin or path boundary, so:
 > scheme**, turning the allowlist into an open redirect. It reads like "allow
 > HTTPS" and means "allow anywhere". Always list full origins.
 
-Because there is no wildcard, adding a tenant subdomain means editing this
-variable and restarting the bridge. If tenants are provisioned often, generate
-the value from the tenant list rather than maintaining it by hand.
+There is no wildcard syntax, which is precisely why the shared origin matters:
+without it, adding a tenant means editing this variable and restarting the
+bridge.
 
 ### Restricting WHICH accounts may sign in
 
