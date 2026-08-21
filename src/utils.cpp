@@ -131,11 +131,58 @@ std::string lowered(const std::string& in) {
 }
 }  // namespace
 
-void setLoginLabel(const std::string& label) {
+bool setLoginLabel(const std::string& label, std::string* error) {
     // Empty restores the default rather than disabling the reservation: an
     // empty label would make every hostname's leading label compare equal to
     // it and reserve the entire namespace.
-    g_login_label = label.empty() ? "login" : lowered(label);
+    if (label.empty()) {
+        g_login_label = "login";
+        return true;
+    }
+
+    // Validated rather than trusted, because the failure is SILENT and it fails
+    // OPEN. isReservedTenantLabel compares a host's leading label against this
+    // string; a label that no hostname can ever equal reserves nothing, so the
+    // sign-in origin quietly becomes an ordinary tenant and signed-out users
+    // are bounced to a host that does not resolve. Neither symptom names the
+    // cause. A trailing inline comment in a .env file is enough to cause it —
+    // values there run to end of line — which is how this was found.
+    const std::string l = lowered(label);
+
+    if (l.size() > 63) {
+        if (error) *error = "longer than the 63-character DNS label limit";
+        return false;
+    }
+    // No hyphen, and this is stricter than DNS on purpose. extractTenantFromHostname
+    // splits the leading label on '-' and keeps the first segment — the
+    // "<tenant>-<interface>" convention that makes "acme-drive" resolve to tenant
+    // "acme". So a hyphenated sign-in label such as "acme-login" would resolve to
+    // the TENANT "acme" and double as a tenant host. It is reservable as a whole
+    // label only when hyphen-free.
+    if (l.find('-') != std::string::npos) {
+        if (error) {
+            *error = "contains '-', which is parsed as the <tenant>-<interface> "
+                     "separator and would resolve to a tenant instead of being reserved";
+        }
+        return false;
+    }
+    if (l.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789") != std::string::npos) {
+        if (error) {
+            *error = "is not a bare DNS label (letters and digits only) — note that a "
+                     ".env value runs to end of line, so an inline '# comment' "
+                     "becomes part of it";
+        }
+        return false;
+    }
+    // An all-numeric leading label is how extractTenantFromHostname recognises an
+    // IPv4 literal. Reserving one would overload that heuristic.
+    if (l.find_first_not_of("0123456789") == std::string::npos) {
+        if (error) *error = "is all digits, which collides with the IPv4-literal check";
+        return false;
+    }
+
+    g_login_label = l;
+    return true;
 }
 
 std::string loginLabel() { return g_login_label; }

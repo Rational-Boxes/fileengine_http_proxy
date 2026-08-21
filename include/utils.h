@@ -58,7 +58,14 @@ bool isReservedTenantLabel(const std::string& label);
 // Set the sign-in label at startup (LOGIN_SUBDOMAIN). Configurable because a
 // deployment may be unable to reserve "login" on its domain — on a shared host
 // like ngrok.io it is very likely already taken. Empty restores the default.
-void setLoginLabel(const std::string& label);
+//
+// Returns false and leaves the previous label in place if `label` is not a
+// hyphen-free bare DNS label, writing a reason to `error` when non-null. The
+// caller is expected to treat that as fatal: an unmatchable label reserves
+// nothing, so the sign-in origin silently degrades into an ordinary tenant.
+// Hyphens are rejected because the leading label is split on '-' to separate
+// "<tenant>-<interface>" (see extractTenantFromHostname).
+bool setLoginLabel(const std::string& label, std::string* error = nullptr);
 std::string loginLabel();
 
 // True if `url` matches any non-empty, comma-separated prefix in `allowlist`

@@ -100,6 +100,79 @@ TEST(ReservedTenantLabel, TheLabelIsConfigurable) {
     setLoginLabel("login");   // restore for the tests that follow
 }
 
+// --- LOGIN_SUBDOMAIN validation ------------------------------------------
+// The reservation is a string comparison against a host's leading label, so a
+// label no hostname can equal reserves NOTHING and the failure is silent. These
+// pin that a bad value is refused instead of adopted.
+
+TEST(LoginLabelValidation, RejectsAnInlineCommentFromDotEnv) {
+    // The real incident: a .env value runs to end of line, so
+    //   LOGIN_SUBDOMAIN=filenginelogin        # ngrok
+    // set the label to "filenginelogin          # ngrok". No host equals that,
+    // so filenginelogin.ngrok.io stopped being reserved and resolved as an
+    // ordinary tenant — an unauthenticated fail-OPEN from a plausible typo.
+    setLoginLabel("login");
+    std::string why;
+    EXPECT_FALSE(setLoginLabel("filenginelogin        # ngrok", &why));
+    EXPECT_FALSE(why.empty());
+    // The previous label must survive a rejection; adopting a broken one is the
+    // outcome being prevented.
+    EXPECT_EQ(loginLabel(), "login");
+    EXPECT_TRUE(isReservedTenantLabel("login"));
+}
+
+TEST(LoginLabelValidation, RejectsAHyphenatedLabel) {
+    // Stricter than DNS deliberately. The leading label is split on '-' to
+    // separate "<tenant>-<interface>", so "filenginetest-login" would resolve
+    // to the TENANT "filenginetest" and the sign-in origin would double as a
+    // tenant host.
+    setLoginLabel("login");
+    std::string why;
+    EXPECT_FALSE(setLoginLabel("filenginetest-login", &why));
+    EXPECT_NE(why.find('-'), std::string::npos);   // the reason names the cause
+    EXPECT_EQ(loginLabel(), "login");
+    // Demonstrate the breakage the rule prevents, so the rule is not mistaken
+    // for arbitrary strictness: had it been accepted, this host would resolve
+    // to a tenant.
+    EXPECT_EQ(extractTenantFromHostname("filenginetest-login.ngrok.io"), "filenginetest");
+}
+
+TEST(LoginLabelValidation, AcceptsAnArbitraryHyphenFreeLabel) {
+    // The point of the setting: "login" is often unreservable on a shared
+    // domain, so any bare label must work.
+    std::string why;
+    EXPECT_TRUE(setLoginLabel("filenginelogin", &why));
+    EXPECT_EQ(loginLabel(), "filenginelogin");
+    EXPECT_TRUE(isReservedTenantLabel("filenginelogin"));
+    EXPECT_EQ(extractTenantFromHostname("filenginelogin.ngrok.io"), "");
+    // ...while ordinary tenants on the same domain are untouched.
+    EXPECT_EQ(extractTenantFromHostname("filenginetest.ngrok.io"), "filenginetest");
+    setLoginLabel("login");
+}
+
+TEST(LoginLabelValidation, RejectsOtherUnmatchableShapes) {
+    setLoginLabel("login");
+    EXPECT_FALSE(setLoginLabel("has space"));
+    EXPECT_FALSE(setLoginLabel("under_score"));       // legal in an env var, not in DNS
+    EXPECT_FALSE(setLoginLabel("dotted.label"));      // a label, not a hostname
+    EXPECT_FALSE(setLoginLabel("trailing "));
+    EXPECT_FALSE(setLoginLabel(std::string(64, 'a')));  // over the 63-char DNS limit
+    EXPECT_FALSE(setLoginLabel("123"));               // collides with the IPv4 check
+    EXPECT_EQ(loginLabel(), "login");                 // none of them took
+    EXPECT_EQ(std::string(63, 'a').size(), 63u);
+    EXPECT_TRUE(setLoginLabel(std::string(63, 'a')));   // exactly at the limit is fine
+    setLoginLabel("login");
+}
+
+TEST(LoginLabelValidation, EmptyStillRestoresTheDefault) {
+    // Unchanged behaviour, pinned: empty must not be treated as "invalid, keep
+    // the old one" — it is how a deployment asks for the default back.
+    setLoginLabel("signin");
+    std::string why;
+    EXPECT_TRUE(setLoginLabel("", &why));
+    EXPECT_EQ(loginLabel(), "login");
+}
+
 TEST(ReservedTenantLabel, LoginAndWwwAreNeverTenants) {
     EXPECT_TRUE(isReservedTenantLabel("login"));
     EXPECT_TRUE(isReservedTenantLabel("www"));

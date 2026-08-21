@@ -123,7 +123,21 @@ int main() {
     // The shared sign-in origin's DNS label. Reserved from tenancy, and served
     // to the SPA so a prebuilt image learns it at run time rather than at build.
     cfg.login_subdomain = webdav::getEnvOrDefault("LOGIN_SUBDOMAIN", "login");
-    webdav::setLoginLabel(cfg.login_subdomain);
+    {
+        // Fatal rather than a warning. A label no hostname can equal reserves
+        // nothing, so the sign-in origin would resolve as an ordinary tenant
+        // while signed-out users are bounced to a host that does not exist —
+        // and neither symptom points at this setting. Refusing to start says it
+        // once, at the only moment anyone is looking.
+        std::string why;
+        if (!webdav::setLoginLabel(cfg.login_subdomain, &why)) {
+            webdav::errorLog("FATAL: LOGIN_SUBDOMAIN \"" + cfg.login_subdomain + "\" " + why);
+            return 1;
+        }
+        // Report what was actually adopted, so the value in the log is the one
+        // in force rather than the one someone believes they set.
+        cfg.login_subdomain = webdav::loginLabel();
+    }
     cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
     cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
 
