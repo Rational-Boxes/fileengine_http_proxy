@@ -14,6 +14,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "oauth_provider.h"
+
+#include <map>
 #include "oidc_verify.h"
 #include "utils.h"
 
@@ -62,6 +64,68 @@ std::string strField(const Poco::JSON::Object::Ptr& obj, const std::string& key)
 
 }  // namespace
 
+// Well-known endpoints, so an operator supplies only a client id and secret.
+//
+// Every value here is still overridable per provider (OAUTH_<P>_AUTH_URL and
+// friends): these are defaults, not a closed list, and the bridge remains a
+// generic OIDC client. They exist because typing five URLs by hand is five
+// chances to get one subtly wrong, and the failure lands on a login screen.
+namespace {
+
+struct WellKnown {
+    const char* auth_url;
+    const char* token_url;
+    const char* userinfo_url;
+    const char* jwks_uri;
+    const char* issuer;
+    const char* scopes;
+};
+
+// `{tenant}` is substituted with OAUTH_MICROSOFT_TENANT (default "common").
+const std::map<std::string, WellKnown>& wellKnownProviders() {
+    static const std::map<std::string, WellKnown> kMap = {
+        {"google", {
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            "https://www.googleapis.com/oauth2/v3/certs",
+            "https://accounts.google.com",
+            "openid email profile"}},
+        {"microsoft", {
+            "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+            "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+            "https://graph.microsoft.com/oidc/userinfo",
+            "https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys",
+            // Deliberately EMPTY for the multi-tenant endpoints. With
+            // tenant=common the id_token's `iss` names the user's OWN tenant
+            // GUID, not "common", so a fixed issuer string would reject every
+            // legitimate login. Pin OAUTH_MICROSOFT_ISSUER when using a single
+            // tenant, where the check is both possible and worth having.
+            "",
+            "openid email profile"}},
+        {"linkedin", {
+            "https://www.linkedin.com/oauth/v2/authorization",
+            "https://www.linkedin.com/oauth/v2/accessToken",
+            "https://api.linkedin.com/v2/userinfo",
+            "https://www.linkedin.com/oauth/openid/jwks",
+            "https://www.linkedin.com/oauth",
+            // LinkedIn's OIDC product ("Sign In with LinkedIn using OpenID
+            // Connect"). The older r_liteprofile / r_emailaddress scopes belong
+            // to the retired product and do NOT return an id_token.
+            "openid profile email"}},
+    };
+    return kMap;
+}
+
+std::string substituteTenant(std::string url, const std::string& tenant) {
+    const std::string needle = "{tenant}";
+    for (size_t at = url.find(needle); at != std::string::npos; at = url.find(needle))
+        url.replace(at, needle.size(), tenant);
+    return url;
+}
+
+}  // namespace
+
 OAuthProvider OAuthProvider::fromEnv(const std::string& redirect_base) {
     OAuthProvider self;
     std::string list = webdav::getEnvOrDefault("OAUTH_PROVIDERS", "");
@@ -86,6 +150,29 @@ OAuthProvider OAuthProvider::fromEnv(const std::string& redirect_base) {
         cfg.scopes = providerEnv(name, "SCOPES",
                                  cfg.kind == OAuthProviderConfig::GITHUB ? "read:user user:email"
                                                                          : "openid email profile");
+
+        // Fill anything still blank from the well-known table. Explicit env
+        // always wins, so a deployment can point "microsoft" at a private
+        // endpoint without losing the rest of the defaults.
+        {
+            std::string lname = name;
+            for (char& c : lname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            const auto& known = wellKnownProviders();
+            auto it = known.find(lname);
+            if (it != known.end()) {
+                const std::string tenant = providerEnv(name, "TENANT", "common");
+                auto fill = [&](std::string& field, const char* def) {
+                    if (field.empty() && def && *def) field = substituteTenant(def, tenant);
+                };
+                fill(cfg.auth_url, it->second.auth_url);
+                fill(cfg.token_url, it->second.token_url);
+                fill(cfg.userinfo_url, it->second.userinfo_url);
+                fill(cfg.jwks_uri, it->second.jwks_uri);
+                fill(cfg.issuer, it->second.issuer);
+                if (providerEnv(name, "SCOPES").empty())
+                    cfg.scopes = it->second.scopes;
+            }
+        }
         cfg.redirect_uri = redirect_base + "/v1/auth/oauth/" + name + "/callback";
         // id_token verification defaults ON for OIDC, OFF for GitHub (no id_token);
         // OAUTH_<P>_VERIFY_ID_TOKEN=false opts out (falls back to userinfo trust).
@@ -121,6 +208,21 @@ OAuthProvider OAuthProvider::fromEnv(const std::string& redirect_base) {
         self.providers_[name] = std::move(cfg);
     }
     return self;
+}
+
+std::vector<std::string> OAuthProvider::usableNames() const {
+    std::vector<std::string> out;
+    for (const auto& kv : providers_) {
+        const auto& c = kv.second;
+        // A provider is offered only if a sign-in could actually succeed.
+        // Listing one in OAUTH_PROVIDERS without a client id or secret is a
+        // half-finished config, and surfacing it puts a button on the login
+        // screen whose only outcome is an error.
+        if (c.client_id.empty() || c.client_secret.empty()) continue;
+        if (c.auth_url.empty() || c.token_url.empty()) continue;
+        out.push_back(kv.first);
+    }
+    return out;
 }
 
 const OAuthProviderConfig* OAuthProvider::get(const std::string& name) const {

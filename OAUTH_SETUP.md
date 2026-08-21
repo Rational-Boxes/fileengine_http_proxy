@@ -128,17 +128,25 @@ OAUTH_GITHUB_SCOPES=read:user user:email
 4. Copy the **Application (client) ID**. Decide the tenant segment in the URLs:
    `common` (any Microsoft account), `organizations`, or your specific tenant GUID.
 
+The endpoints are built in, so the minimum is three lines:
+
 ```bash
-OAUTH_MICROSOFT_KIND=oidc
 OAUTH_MICROSOFT_CLIENT_ID=00000000-0000-0000-0000-000000000000
 OAUTH_MICROSOFT_CLIENT_SECRET=********
-OAUTH_MICROSOFT_AUTH_URL=https://login.microsoftonline.com/common/oauth2/v2.0/authorize
-OAUTH_MICROSOFT_TOKEN_URL=https://login.microsoftonline.com/common/oauth2/v2.0/token
-OAUTH_MICROSOFT_USERINFO_URL=https://graph.microsoft.com/oidc/userinfo
-OAUTH_MICROSOFT_SCOPES=openid email profile
+OAUTH_MICROSOFT_TENANT=common      # or your tenant GUID; default: common
 ```
 
-> Replace `common` with your tenant GUID to restrict logins to your organization.
+`OAUTH_MICROSOFT_TENANT` is substituted into the authorize, token and JWKS URLs.
+Set it to your tenant GUID to restrict logins to your organization. Any of
+`AUTH_URL`, `TOKEN_URL`, `USERINFO_URL`, `JWKS_URI`, `ISSUER` or `SCOPES` can
+still be set explicitly and will override the built-in value.
+
+> **Why no `ISSUER` by default.** With `tenant=common` the `id_token`'s `iss`
+> claim names the user's OWN tenant GUID, not `common` — so a fixed issuer
+> string would reject every legitimate login. The check is therefore left off
+> for the multi-tenant endpoints. If you have pinned a single tenant GUID, set
+> `OAUTH_MICROSOFT_ISSUER=https://login.microsoftonline.com/<guid>/v2.0`, where
+> the check is both possible and worth having.
 
 ---
 
@@ -152,15 +160,16 @@ Use **"Sign In with LinkedIn using OpenID Connect"**.
    `<OAUTH_REDIRECT_BASE>/v1/auth/oauth/linkedin/callback`.
 4. Copy the **Client ID** and **Client Secret**.
 
+The endpoints are built in, so the minimum is two lines:
+
 ```bash
-OAUTH_LINKEDIN_KIND=oidc
 OAUTH_LINKEDIN_CLIENT_ID=********
 OAUTH_LINKEDIN_CLIENT_SECRET=********
-OAUTH_LINKEDIN_AUTH_URL=https://www.linkedin.com/oauth/v2/authorization
-OAUTH_LINKEDIN_TOKEN_URL=https://www.linkedin.com/oauth/v2/accessToken
-OAUTH_LINKEDIN_USERINFO_URL=https://api.linkedin.com/v2/userinfo
-OAUTH_LINKEDIN_SCOPES=openid email profile
 ```
+
+> The built-in scopes are `openid profile email` — the OIDC product. The older
+> `r_liteprofile` / `r_emailaddress` scopes belong to the retired Sign In
+> product and return no `id_token`, so do not set them.
 
 > LinkedIn's userinfo includes `email` and `email_verified`. LinkedIn historically
 > ignores the PKCE parameters; that is harmless here because the exchange is also
@@ -216,6 +225,36 @@ OAUTH_OKTA_TOKEN_URL=https://<your>.okta.com/oauth2/v1/token
 OAUTH_OKTA_USERINFO_URL=https://<your>.okta.com/oauth2/v1/userinfo
 OAUTH_OKTA_SCOPES=openid email profile
 ```
+
+---
+
+## What the login screen shows
+
+The SPA asks the bridge which providers are configured and renders a button for
+each — nothing more:
+
+```bash
+curl -s https://app.example.com/api/v1/auth/providers
+{"providers":["microsoft","linkedin"]}
+```
+
+Unauthenticated by necessity: the login screen reads it before anyone has a
+token. It returns names only — never client ids, secrets or endpoints.
+
+A provider appears **only if a sign-in could actually succeed**: it must be in
+`OAUTH_PROVIDERS` *and* have a client id, a client secret and both endpoints. A
+half-finished block is omitted rather than shown, because a button whose only
+outcome is an error is worse than no button.
+
+If nothing is configured the endpoint returns an empty list and the SPA shows no
+buttons and no divider at all — the username/password form becomes the whole
+login screen. The same is true if the bridge cannot be reached: the failure is
+closed, never a guess.
+
+> This replaced a build-time `VITE_OAUTH_PROVIDERS` list in the SPA. That could
+> not work for the packaged image, which is built once and run by many
+> deployments: every one of them was offered the same buttons regardless of what
+> it had set up.
 
 ---
 

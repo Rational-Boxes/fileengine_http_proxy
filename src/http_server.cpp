@@ -361,6 +361,31 @@ private:
             return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
         }
 
+        // Which identity providers this deployment actually has configured.
+        //
+        // Pre-auth by necessity: it is read by the LOGIN SCREEN, before anyone
+        // has a token. It exposes nothing sensitive — the names of the sign-in
+        // buttons a visitor is about to be shown, and no client ids, secrets or
+        // endpoints.
+        //
+        // The SPA used to take this list from a build-time variable, which in a
+        // prebuilt image cannot know what a given deployment configured: the
+        // packaged SPA offered Google and GitHub to every deployment, and
+        // clicking one that was not set up produced an error rather than a
+        // missing button.
+        if (path == "/v1/auth/providers" && method == "GET") {
+            Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
+            // oauth_ may be null when no IdP is configured at all — that is
+            // the common case, and it must answer an empty list rather than
+            // crash. (See the constructor: the registry is optional.)
+            if (oauth_) for (const auto& n : oauth_->usableNames()) arr->add(n);
+            Poco::JSON::Object::Ptr obj = new Poco::JSON::Object();
+            obj->set("providers", arr);
+            std::ostringstream os;
+            obj->stringify(os);
+            return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
+        }
+
         // OAuth2 login (BFF). Pre-auth: the browser has no bearer token yet.
         //   GET /v1/auth/oauth/{provider}            -> redirect to the IdP
         //   GET /v1/auth/oauth/{provider}/callback   -> exchange + issue token

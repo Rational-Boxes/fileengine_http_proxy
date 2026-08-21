@@ -18,6 +18,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include "http_client.h"
 
@@ -63,6 +64,15 @@ public:
 
     bool has(const std::string& name) const { return providers_.count(name) > 0; }
     const OAuthProviderConfig* get(const std::string& name) const;
+
+    // The providers a caller may actually SIGN IN with, for the login screen.
+    //
+    // Only names that are genuinely usable: a provider listed in
+    // OAUTH_PROVIDERS but missing a client id, secret or endpoint is omitted,
+    // because a button that leads to an error is worse than no button. The SPA
+    // used to take this list from a BUILD-TIME variable, which in a prebuilt
+    // image cannot know what a given deployment configured.
+    std::vector<std::string> usableNames() const;
 
     // Assembles the IdP authorize URL (PKCE S256, given the precomputed
     // challenge, the opaque state, and the OIDC `nonce` binding the id_token).
