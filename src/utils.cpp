@@ -118,13 +118,34 @@ std::string calculateDigestResponse(const std::string& ha1, const std::string& n
     return md5HexLower(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2);
 }
 
+namespace {
+// The sign-in label, configurable because a deployment may not be able to
+// reserve "login" on its domain — on a shared host like ngrok.io it is very
+// likely already taken. Set once at startup; read on every host resolution.
+std::string g_login_label = "login";
+
+std::string lowered(const std::string& in) {
+    std::string out = in;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+}  // namespace
+
+void setLoginLabel(const std::string& label) {
+    // Empty restores the default rather than disabling the reservation: an
+    // empty label would make every hostname's leading label compare equal to
+    // it and reserve the entire namespace.
+    g_login_label = label.empty() ? "login" : lowered(label);
+}
+
+std::string loginLabel() { return g_login_label; }
+
 bool isReservedTenantLabel(const std::string& label) {
     // Lower-cased compare: DNS labels are case-insensitive, and an X-Tenant
     // header is attacker-controlled — "Login" must not slip past a check that
     // only knows "login".
-    std::string l = label;
-    for (char& c : l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return l == "www" || l == "login";
+    const std::string l = lowered(label);
+    return l == "www" || l == g_login_label;
 }
 
 std::string extractTenantFromHostname(const std::string& hostname) {

@@ -381,6 +381,12 @@ private:
             if (oauth_) for (const auto& n : oauth_->usableNames()) arr->add(n);
             Poco::JSON::Object::Ptr obj = new Poco::JSON::Object();
             obj->set("providers", arr);
+            // The sign-in label too. It has to reach a PREBUILT SPA somehow,
+            // and it cannot be a build-time variable for the same reason the
+            // provider list could not: one image, many deployments. This
+            // endpoint is already the pre-auth "what does this deployment look
+            // like" call, so it carries both.
+            obj->set("login_subdomain", cfg_.login_subdomain);
             std::ostringstream os;
             obj->stringify(os);
             return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
@@ -1509,13 +1515,13 @@ private:
         out.user = info.user_id.empty() ? user : info.user_id;
         out.roles = info.roles;
 
-        std::string xt = req.get("X-Tenant", "");
-        if (!xt.empty()) {
-            out.tenant = xt;
-        } else {
-            std::string t = webdav::extractTenantFromHostname(req.getHost());
-            out.tenant = t.empty() ? "default" : t;
-        }
+        // Through resolveTenant, NOT the raw header. Taking the header directly
+        // bypassed the reserved-label check: a tenant that happened to be named
+        // like the sign-in origin would have been honoured here, which is
+        // exactly what reserving the label exists to prevent. The bearer path
+        // already went through resolveTenant; this one did not.
+        out.tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
+        if (out.tenant.empty()) out.tenant = "default";
         return true;
     }
 

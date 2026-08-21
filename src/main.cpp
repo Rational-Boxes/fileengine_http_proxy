@@ -120,6 +120,10 @@ int main() {
     cfg.grpc_address = webdav::getEnvOrDefault("FILEENGINE_GRPC_HOST", "localhost") + ":" +
                        webdav::getEnvOrDefault("FILEENGINE_GRPC_PORT", "50051");
     cfg.oauth_redirect_base = webdav::getEnvOrDefault("OAUTH_REDIRECT_BASE", "");
+    // The shared sign-in origin's DNS label. Reserved from tenancy, and served
+    // to the SPA so a prebuilt image learns it at run time rather than at build.
+    cfg.login_subdomain = webdav::getEnvOrDefault("LOGIN_SUBDOMAIN", "login");
+    webdav::setLoginLabel(cfg.login_subdomain);
     cfg.oauth_return_allowlist = webdav::getEnvOrDefault("OAUTH_RETURN_ALLOWLIST", "");
     cfg.oauth_state_ttl = std::stoi(webdav::getEnvOrDefault("OAUTH_STATE_TTL_SECONDS", "300"));
 

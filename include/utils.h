@@ -51,9 +51,15 @@ std::string extractTenantFromHostname(const std::string& hostname);
 // bridge's per-request tenant precedence (no Poco request needed).
 std::string resolveTenant(const std::string& x_tenant_header, const std::string& host);
 
-// Labels that can never be a tenant. "www" is conventional; "login" is the
-// shared sign-in origin (see extractTenantFromHostname for why it matters).
+// Labels that can never be a tenant. "www" is conventional; the sign-in label
+// (default "login") is the shared sign-in origin — see extractTenantFromHostname.
 bool isReservedTenantLabel(const std::string& label);
+
+// Set the sign-in label at startup (LOGIN_SUBDOMAIN). Configurable because a
+// deployment may be unable to reserve "login" on its domain — on a shared host
+// like ngrok.io it is very likely already taken. Empty restores the default.
+void setLoginLabel(const std::string& label);
+std::string loginLabel();
 
 // True if `url` matches any non-empty, comma-separated prefix in `allowlist`
 // (each prefix whitespace-trimmed), where the match must end at an origin/path

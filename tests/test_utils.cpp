@@ -75,6 +75,31 @@ TEST(ResolveTenant, FallsBackToDefault) {
 
 // --- reserved tenant labels ----------------------------------------------
 
+TEST(ReservedTenantLabel, TheLabelIsConfigurable) {
+    // A deployment may be unable to reserve "login" on its domain — on a shared
+    // host it is very likely taken — so the name is settable.
+    setLoginLabel("signin");
+    EXPECT_TRUE(isReservedTenantLabel("signin"));
+    EXPECT_FALSE(isReservedTenantLabel("login"));   // no longer special
+    EXPECT_EQ(extractTenantFromHostname("signin.example.com"), "");
+    EXPECT_EQ(extractTenantFromHostname("login.example.com"), "login");
+
+    // Case-insensitive whichever name is configured.
+    setLoginLabel("SignIn");
+    EXPECT_TRUE(isReservedTenantLabel("signin"));
+
+    // Empty restores the default rather than reserving everything: an empty
+    // label would compare equal to nothing useful and could disable the guard.
+    setLoginLabel("");
+    EXPECT_TRUE(isReservedTenantLabel("login"));
+    EXPECT_FALSE(isReservedTenantLabel("signin"));
+
+    // "www" is unconditional, whatever the sign-in label is.
+    setLoginLabel("signin");
+    EXPECT_TRUE(isReservedTenantLabel("www"));
+    setLoginLabel("login");   // restore for the tests that follow
+}
+
 TEST(ReservedTenantLabel, LoginAndWwwAreNeverTenants) {
     EXPECT_TRUE(isReservedTenantLabel("login"));
     EXPECT_TRUE(isReservedTenantLabel("www"));
@@ -92,7 +117,9 @@ TEST(ReservedTenantLabel, TheLoginHostResolvesToNoTenant) {
     // return allowlist holds a single entry however many tenants exist.
     EXPECT_EQ(extractTenantFromHostname("login.example.com"), "");
     EXPECT_EQ(resolveTenant("", "login.example.com"), "default");
-    // ...and the interface-suffix convention does not smuggle it back in.
+    // There is no such host in practice — WebDAV is per-tenant and `login` is
+    // not a tenant — but if one were ever pointed at the stack it must not
+    // become a tenant called "login" via the <tenant>-<interface> convention.
     EXPECT_EQ(extractTenantFromHostname("login-drive.example.com"), "");
     // A real tenant is unaffected.
     EXPECT_EQ(extractTenantFromHostname("acme.example.com"), "acme");
