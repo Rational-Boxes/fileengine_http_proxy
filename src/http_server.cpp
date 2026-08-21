@@ -387,6 +387,27 @@ private:
             // endpoint is already the pre-auth "what does this deployment look
             // like" call, so it carries both.
             obj->set("login_subdomain", cfg_.login_subdomain);
+            // A recognisable marker, so a caller can tell "a FileEngine bridge
+            // answered" from "something answered". Without it the only way to
+            // identify an origin is that its response happens to parse, and a
+            // wildcard DNS error page or a parked domain answers just as
+            // readily as a real deployment.
+            obj->set("service", "fileengine-bridge");
+
+            // The ONE place this bridge allows a wildcard origin, and only
+            // because this endpoint is the deliberate exception: pre-auth, no
+            // credentials accepted, and nothing in the body that is not already
+            // public to anyone who can load the sign-in page. The general CORS
+            // policy above stays allow-list-only and never "*" — that is what
+            // protects the endpoints that DO take a bearer token.
+            //
+            // It is what lets the sign-in origin ask a tenant subdomain "are
+            // you really there?" before forwarding a session to it. Set only
+            // when the allow-list has not already answered, so an explicitly
+            // configured origin keeps its exact echo (and its Vary).
+            if (resp.get("Access-Control-Allow-Origin", "").empty()) {
+                resp.set("Access-Control-Allow-Origin", "*");
+            }
             std::ostringstream os;
             obj->stringify(os);
             return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
