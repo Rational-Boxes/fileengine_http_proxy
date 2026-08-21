@@ -118,6 +118,36 @@ std::string calculateDigestResponse(const std::string& ha1, const std::string& n
     return md5HexLower(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2);
 }
 
+namespace {
+// The sign-in label, configurable because a deployment may not be able to
+// reserve "login" on its domain — on a shared host like ngrok.io it is very
+// likely already taken. Set once at startup; read on every host resolution.
+std::string g_login_label = "login";
+
+std::string lowered(const std::string& in) {
+    std::string out = in;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+}  // namespace
+
+void setLoginLabel(const std::string& label) {
+    // Empty restores the default rather than disabling the reservation: an
+    // empty label would make every hostname's leading label compare equal to
+    // it and reserve the entire namespace.
+    g_login_label = label.empty() ? "login" : lowered(label);
+}
+
+std::string loginLabel() { return g_login_label; }
+
+bool isReservedTenantLabel(const std::string& label) {
+    // Lower-cased compare: DNS labels are case-insensitive, and an X-Tenant
+    // header is attacker-controlled — "Login" must not slip past a check that
+    // only knows "login".
+    const std::string l = lowered(label);
+    return l == "www" || l == g_login_label;
+}
+
 std::string extractTenantFromHostname(const std::string& hostname) {
     // The tenant is the first '-'-delimited segment of the leading DNS label.
     // Any remainder is an interface suffix (e.g. "<tenant>-drive" for the
@@ -148,7 +178,13 @@ std::string extractTenantFromHostname(const std::string& hostname) {
     }
 
     // Reserved / non-tenant first labels.
-    if (subdomain.empty() || subdomain == "www") {
+    //
+    // "login" is the shared sign-in origin. Reserving it is what makes the whole
+    // arrangement work: every OAuth flow returns to that ONE host, so
+    // OAUTH_RETURN_ALLOWLIST holds a single entry no matter how many tenants
+    // exist. It must therefore never resolve to a tenant of its own — a tenant
+    // literally named "login" would shadow the sign-in page for everybody.
+    if (subdomain.empty() || isReservedTenantLabel(subdomain)) {
         return "";
     }
 
@@ -162,7 +198,13 @@ std::string extractTenantFromHostname(const std::string& hostname) {
 }
 
 std::string resolveTenant(const std::string& x_tenant_header, const std::string& host) {
-    if (!x_tenant_header.empty()) return x_tenant_header;
+    // A reserved name is refused here too, not only in the hostname path:
+    // X-Tenant is client-supplied, so guarding only the host would leave the
+    // reservation bypassable by sending the header directly. A reserved header
+    // is IGNORED rather than honoured, falling through to normal host
+    // resolution — the same as if it had not been sent.
+    if (!x_tenant_header.empty() && !isReservedTenantLabel(x_tenant_header))
+        return x_tenant_header;
     std::string t = extractTenantFromHostname(host);
     return t.empty() ? "default" : t;
 }

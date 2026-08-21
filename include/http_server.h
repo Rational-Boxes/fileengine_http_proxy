@@ -56,6 +56,7 @@ struct Config {
     // live for seconds — long enough for the browser to follow a navigation,
     // far too short to be worth harvesting from a log. See mintDownloadTicket.
     int download_ticket_ttl = 30;            // download ticket lifetime (s)
+    std::string login_subdomain = "login";   // shared sign-in origin's DNS label
     std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
     std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap

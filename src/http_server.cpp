@@ -381,6 +381,12 @@ private:
             if (oauth_) for (const auto& n : oauth_->usableNames()) arr->add(n);
             Poco::JSON::Object::Ptr obj = new Poco::JSON::Object();
             obj->set("providers", arr);
+            // The sign-in label too. It has to reach a PREBUILT SPA somehow,
+            // and it cannot be a build-time variable for the same reason the
+            // provider list could not: one image, many deployments. This
+            // endpoint is already the pre-auth "what does this deployment look
+            // like" call, so it carries both.
+            obj->set("login_subdomain", cfg_.login_subdomain);
             std::ostringstream os;
             obj->stringify(os);
             return sendJson(resp, HTTPResponse::HTTP_OK, os.str());
@@ -1509,13 +1515,13 @@ private:
         out.user = info.user_id.empty() ? user : info.user_id;
         out.roles = info.roles;
 
-        std::string xt = req.get("X-Tenant", "");
-        if (!xt.empty()) {
-            out.tenant = xt;
-        } else {
-            std::string t = webdav::extractTenantFromHostname(req.getHost());
-            out.tenant = t.empty() ? "default" : t;
-        }
+        // Through resolveTenant, NOT the raw header. Taking the header directly
+        // bypassed the reserved-label check: a tenant that happened to be named
+        // like the sign-in origin would have been honoured here, which is
+        // exactly what reserving the label exists to prevent. The bearer path
+        // already went through resolveTenant; this one did not.
+        out.tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
+        if (out.tenant.empty()) out.tenant = "default";
         return true;
     }
 
@@ -1548,12 +1554,27 @@ private:
                         const std::string& aip = "") {
         auto byTenant = ldap_->getRolesByTenant(user);
 
+        // A session minted at the shared LOGIN origin has no tenant from its
+        // host — "login" is reserved, so resolveTenant yields nothing and the
+        // caller passes "default". That is a guess, and for a user with no
+        // access to "default" it produces a token whose own active tenant it is
+        // not a member of: every later call 403s on the membership check until
+        // an X-Tenant header happens to be sent.
+        //
+        // So when the guessed tenant is not one of the user's, fall back to
+        // their first. The map is ordered, so "first" is stable rather than
+        // arbitrary, and it is also the sensible landing place for a first-time
+        // sign-in that has no remembered workspace yet.
+        std::string tenant = activeTenant;
+        if (!byTenant.empty() && byTenant.find(tenant) == byTenant.end())
+            tenant = byTenant.begin()->first;
+
         Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
         long now = static_cast<long>(std::time(nullptr));
         claims->set("iss", cfg_.jwt_issuer);
         claims->set("sub", user);
         claims->set("email", user);
-        claims->set("tenant", activeTenant);
+        claims->set("tenant", tenant);
         claims->set("iat", static_cast<Poco::Int64>(now));
         claims->set("exp", static_cast<Poco::Int64>(now + cfg_.token_ttl));
         std::string jti = randomCodeVerifier();
