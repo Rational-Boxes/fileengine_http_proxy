@@ -45,7 +45,7 @@ Two things every provider needs from you:
 | Variable | Example | Meaning |
 |---|---|---|
 | `OAUTH_REDIRECT_BASE` | `https://files.example.com` | Public base URL of **this bridge**. Empty disables OAuth. |
-| `OAUTH_RETURN_ALLOWLIST` | `https://app.example.com/,http://localhost:3000/` | CSV of allowed SPA return-URL prefixes. A `return_to` not matching one of these is rejected (anti open-redirect). |
+| `OAUTH_RETURN_ALLOWLIST` | `https://app.example.com/,http://localhost:3000/` | CSV of allowed SPA return-URL prefixes, matched with a boundary guard; no wildcards. A `return_to` not matching one is rejected (anti open-redirect). **Grows with tenant subdomains** — see [Multi-tenant deployments](#multi-tenant-deployments-one-idp-app-many-subdomains). Never shorten an entry to a bare scheme. |
 | `OAUTH_PROVIDERS` | `google,github,microsoft` | CSV of enabled providers; each needs an `OAUTH_<NAME>_*` block. |
 | `OAUTH_STATE_TTL_SECONDS` | `300` | How long a started login may sit before the callback must arrive. |
 
@@ -225,6 +225,87 @@ OAUTH_OKTA_TOKEN_URL=https://<your>.okta.com/oauth2/v1/token
 OAUTH_OKTA_USERINFO_URL=https://<your>.okta.com/oauth2/v1/userinfo
 OAUTH_OKTA_SCOPES=openid email profile
 ```
+
+---
+
+## Multi-tenant deployments (one IdP app, many subdomains)
+
+FileEngine resolves the tenant from the host subdomain, so the login screen
+appears on every tenant's origin — `acme.example.com`, `someco.example.com`, and
+so on. That raises the obvious worry: does each subdomain need its own IdP app,
+or a wildcard redirect URI?
+
+**Neither. You register ONE redirect URI per provider.**
+
+`OAUTH_REDIRECT_BASE` is a single fixed host, so every provider has exactly one
+callback URL no matter how many tenants exist:
+
+```
+https://<redirect-base>/v1/auth/oauth/<provider>/callback
+```
+
+**Wildcards would not work anyway.** OAuth redirect-URI matching is exact string
+comparison by specification (RFC 6749 §3.1.2.3). Google and LinkedIn reject
+wildcard redirect URIs outright; Microsoft's limited support carries caveats and
+does not cover every app type. That strictness is deliberate — wildcard redirects
+are a known token-theft vector.
+
+### How the tenant survives the round trip
+
+The tenant is captured at the START of the flow, on the tenant's own subdomain,
+and carried through the signed state to the callback:
+
+1. User is on `acme.example.com/login` and presses the button.
+2. The bridge records `tenant=acme` (resolved from that host) in the OAuth state,
+   along with the `return_to`.
+3. The IdP sends the user back to the single registered callback.
+4. The bridge mints the token using **the tenant from the state**, not from the
+   callback's own host, and redirects to `return_to`.
+
+So a user who starts on `acme.example.com` lands back there with an `acme` token.
+Nothing about adding a tenant touches the IdP configuration.
+
+### The one thing that DOES grow per tenant
+
+`OAUTH_RETURN_ALLOWLIST` — the check that stops `return_to` becoming an open
+redirect. Every tenant origin you intend to support must be listed:
+
+```bash
+OAUTH_RETURN_ALLOWLIST=https://acme.example.com/,https://someco.example.com/
+```
+
+Matching is **prefix-based with a boundary guard**, and there is no wildcard
+syntax. A prefix matches only when it ends at an origin or path boundary, so:
+
+| Allowlist entry | URL | Result |
+|---|---|---|
+| `https://app.example.com` | `https://app.example.com/oauth/callback` | allowed |
+| `https://app.example.com` | `https://app.example.com.evil.com/cb` | **rejected** |
+| `https://app.example.com` | `https://app.example.com:8443/cb` | **rejected** (different port) |
+| `https://app.example.com` | `https://evil.com/app.example.com` | **rejected** |
+| `https://app.example.com/spa/` | `https://app.example.com/spa/page` | allowed |
+| *(empty)* | anything | **rejected** |
+
+> **Do not shorten an entry to a scheme.** `https://` — or `https:/`, or
+> `https:` — ends on a boundary and therefore matches **every URL on that
+> scheme**, turning the allowlist into an open redirect. It reads like "allow
+> HTTPS" and means "allow anywhere". Always list full origins.
+
+Because there is no wildcard, adding a tenant subdomain means editing this
+variable and restarting the bridge. If tenants are provisioned often, generate
+the value from the tenant list rather than maintaining it by hand.
+
+### Restricting WHICH accounts may sign in
+
+FileEngine's tenant decides where a session lands; it does not decide who the IdP
+lets through. With `OAUTH_MICROSOFT_TENANT=common`, any Microsoft account can
+authenticate and will be mapped to whichever FileEngine tenant they started from.
+If sign-in should be limited to one directory, pin the tenant GUID — the
+restriction that matters is the IdP's, not ours.
+
+The same applies generally: the IdP attests an email address, and FileEngine maps
+that address to LDAP roles. A user with no matching LDAP account authenticates
+successfully at the IdP and still has no access here.
 
 ---
 

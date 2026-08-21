@@ -96,6 +96,16 @@ TEST(ReturnUrlAllowed, RejectsConfusableHostsAndDifferentPorts) {
 
 TEST(ReturnUrlAllowed, RejectsNonMatchingOrEmptyAllowlist) {
     EXPECT_FALSE(returnUrlAllowed("https://app.example.com", "https://evil.com/app.example.com"));
+    // A SCHEME-ONLY entry matches every URL on that scheme — "allow https" is
+    // really "allow anywhere", and is the one way to turn this allowlist into
+    // an open redirect. True for every truncation that lands on a boundary,
+    // which is all three of these.
+    EXPECT_TRUE(returnUrlAllowed("https://", "https://evil.com/steal"));
+    EXPECT_TRUE(returnUrlAllowed("https:/",  "https://evil.com/steal"));
+    EXPECT_TRUE(returnUrlAllowed("https:",   "https://evil.com/steal"));
+    // A prefix that stops MID-TOKEN does not: 's' is not a boundary.
+    EXPECT_FALSE(returnUrlAllowed("http", "https://evil.com/steal"));
+
     EXPECT_FALSE(returnUrlAllowed("", "https://app.example.com/cb"));   // empty allowlist
     EXPECT_FALSE(returnUrlAllowed("   ", "https://app.example.com/cb")); // blank-only entry
 }
