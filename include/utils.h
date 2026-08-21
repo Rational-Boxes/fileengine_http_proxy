@@ -51,6 +51,10 @@ std::string extractTenantFromHostname(const std::string& hostname);
 // bridge's per-request tenant precedence (no Poco request needed).
 std::string resolveTenant(const std::string& x_tenant_header, const std::string& host);
 
+// Labels that can never be a tenant. "www" is conventional; "login" is the
+// shared sign-in origin (see extractTenantFromHostname for why it matters).
+bool isReservedTenantLabel(const std::string& label);
+
 // True if `url` matches any non-empty, comma-separated prefix in `allowlist`
 // (each prefix whitespace-trimmed), where the match must end at an origin/path
 // boundary: an exact match, a prefix ending in '/', or a following '/' '?' '#'.

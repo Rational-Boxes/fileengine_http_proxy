@@ -1548,12 +1548,27 @@ private:
                         const std::string& aip = "") {
         auto byTenant = ldap_->getRolesByTenant(user);
 
+        // A session minted at the shared LOGIN origin has no tenant from its
+        // host — "login" is reserved, so resolveTenant yields nothing and the
+        // caller passes "default". That is a guess, and for a user with no
+        // access to "default" it produces a token whose own active tenant it is
+        // not a member of: every later call 403s on the membership check until
+        // an X-Tenant header happens to be sent.
+        //
+        // So when the guessed tenant is not one of the user's, fall back to
+        // their first. The map is ordered, so "first" is stable rather than
+        // arbitrary, and it is also the sensible landing place for a first-time
+        // sign-in that has no remembered workspace yet.
+        std::string tenant = activeTenant;
+        if (!byTenant.empty() && byTenant.find(tenant) == byTenant.end())
+            tenant = byTenant.begin()->first;
+
         Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
         long now = static_cast<long>(std::time(nullptr));
         claims->set("iss", cfg_.jwt_issuer);
         claims->set("sub", user);
         claims->set("email", user);
-        claims->set("tenant", activeTenant);
+        claims->set("tenant", tenant);
         claims->set("iat", static_cast<Poco::Int64>(now));
         claims->set("exp", static_cast<Poco::Int64>(now + cfg_.token_ttl));
         std::string jti = randomCodeVerifier();

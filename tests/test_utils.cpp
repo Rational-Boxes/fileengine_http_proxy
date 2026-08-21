@@ -73,6 +73,44 @@ TEST(ResolveTenant, FallsBackToDefault) {
     EXPECT_EQ(resolveTenant("", ""), "default");               // no host
 }
 
+// --- reserved tenant labels ----------------------------------------------
+
+TEST(ReservedTenantLabel, LoginAndWwwAreNeverTenants) {
+    EXPECT_TRUE(isReservedTenantLabel("login"));
+    EXPECT_TRUE(isReservedTenantLabel("www"));
+    // DNS labels are case-insensitive and X-Tenant is client-supplied, so a
+    // check that only knew "login" would be bypassable with "Login".
+    EXPECT_TRUE(isReservedTenantLabel("LOGIN"));
+    EXPECT_TRUE(isReservedTenantLabel("Login"));
+    EXPECT_FALSE(isReservedTenantLabel("acme"));
+    EXPECT_FALSE(isReservedTenantLabel("logins"));   // not a prefix match
+    EXPECT_FALSE(isReservedTenantLabel(""));
+}
+
+TEST(ReservedTenantLabel, TheLoginHostResolvesToNoTenant) {
+    // The whole point: every OAuth flow returns to this ONE origin, so the
+    // return allowlist holds a single entry however many tenants exist.
+    EXPECT_EQ(extractTenantFromHostname("login.example.com"), "");
+    EXPECT_EQ(resolveTenant("", "login.example.com"), "default");
+    // ...and the interface-suffix convention does not smuggle it back in.
+    EXPECT_EQ(extractTenantFromHostname("login-drive.example.com"), "");
+    // A real tenant is unaffected.
+    EXPECT_EQ(extractTenantFromHostname("acme.example.com"), "acme");
+}
+
+TEST(ReservedTenantLabel, TheHeaderCannotClaimIt) {
+    // X-Tenant is attacker-controlled; guarding only the hostname would leave
+    // the reservation trivially bypassable.
+    // A reserved header is IGNORED, not honoured: resolution falls through to
+    // the host exactly as if the header had not been sent.
+    EXPECT_EQ(resolveTenant("login", "acme.example.com"), "acme");
+    EXPECT_EQ(resolveTenant("LOGIN", "acme.example.com"), "acme");
+    // Both reserved -> the ordinary default, never "login".
+    EXPECT_EQ(resolveTenant("login", "login.example.com"), "default");
+    // A legitimate header still overrides the host.
+    EXPECT_EQ(resolveTenant("acme", "login.example.com"), "acme");
+}
+
 // --- returnUrlAllowed (OAuth return-URL allowlist) ------------------------
 
 TEST(ReturnUrlAllowed, MatchesAtAnOriginOrPathBoundary) {
