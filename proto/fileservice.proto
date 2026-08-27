@@ -66,6 +66,12 @@ service FileService {
     rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsageResponse);
     rpc PurgeOldVersions(PurgeOldVersionsRequest) returns (PurgeOldVersionsResponse);
     rpc TriggerSync(TriggerSyncRequest) returns (TriggerSyncResponse);
+
+    // The accountability pull surface (PROPOSAL_accountability_record.md §4.3).
+    // audit_service reads core records forward by cursor over this instead of
+    // depending on the Redis stream, so no broker outage, outbox overflow or
+    // lost node can lose one, and a consumer can replay core history from zero.
+    rpc ListAccountabilityRecords(ListAccountabilityRecordsRequest) returns (ListAccountabilityRecordsResponse);
 }
 
 // Authentication context message - to be included in all requests
@@ -112,6 +118,16 @@ enum Permission {
     MANAGE_ACL = 9;        // Grant/revoke permissions on this resource (Phase 5)
     ACL_INHERIT = 10;      // Marks a rule for parent->child propagation (Phase 5)
     CULL_VERSIONS = 11;    // Permanently purge old versions (destroy-data op; must be granted explicitly)
+    // True delete: destroy a file's content, every version, and everything
+    // derived from it, keeping only the fact that it existed. The strongest
+    // destroy-data op — irreversible and compliance-driven. Must be granted
+    // explicitly, is NOT conferred by the tenant_admin bypass, and does NOT
+    // inherit to descendants. Deliberately unmapped in the file-protocol
+    // bridges: WebDAV and CMIS are mounted drives and document clients where an
+    // accidental or scripted invocation is plausible, and neither protocol has a
+    // natural verb for it, so erasure is reachable only from the admin surface.
+    // See PROPOSAL_accountability_record.md §5.4.9.
+    ERASE = 12;
 }
 
 // Directory operations
@@ -617,4 +633,86 @@ message TriggerSyncRequest {
 message TriggerSyncResponse {
     bool success = 1;
     string error = 2;
+}
+// ── Accountability records (PROPOSAL_accountability_record.md §4.3.1) ────────
+//
+// Why this rides the existing gRPC surface rather than letting the consumer read
+// the core's tables: reaching into another service's schema would couple it to
+// the core's internals, bypass the core's own access control, and make any
+// future schema change a cross-repo release.
+//
+// It still needs its own authorization. Everything inside the trust boundary is
+// trusted, but this is the most sensitive dataset in the system — reading it
+// across tenants reconstructs who did what to whom platform-wide — so it is
+// gated on a dedicated reader role and scoped to one tenant per call. Least
+// privilege applies even among trusted callers: a service that legitimately
+// holds gRPC access does not thereby hold the security log.
+message ListAccountabilityRecordsRequest {
+    // The tenant whose chain to read. Pass "*global*" for the cross-tenant
+    // lifecycle chain (tenant create/delete), which only a system_admin may read.
+    string tenant = 1;
+
+    // The consumer's `recorded_until` watermark, in microseconds since the Unix
+    // epoch. Records STRICTLY newer than this are returned. Because ts is
+    // assigned under the chain lock and forced strictly monotonic per tenant,
+    // this is exact: it cannot skip a record, return one twice, observe one that
+    // was rolled back, or be overtaken by an earlier-stamped record committing
+    // later. Start at 0 to replay from the beginning.
+    int64 newer_than_ts_micros = 2;
+
+    int32 limit = 3;                    // page size; server caps it
+    AuthenticationContext auth = 4;
+}
+
+message AccountabilityRecord {
+    // Gap-free and commit-ordered. Assigned under the chain lock, NOT from a
+    // sequence — so a gap is an unambiguous integrity alarm, not routine noise,
+    // and the consumer must alarm rather than skip ahead.
+    int64  seq = 1;
+
+    int64  ts_micros = 2;               // the cursor axis; strictly increasing per tenant
+    string ts = 3;                      // the same instant, RFC-3339 UTC, for humans
+
+    string actor = 4;                   // never empty
+    repeated string actor_roles = 5;
+    string source_iface = 6;
+    string source_addr = 7;
+
+    string category = 8;                // authorization | identity | destruction | lifecycle
+    string action = 9;                  // acl.grant | acl.revoke | role.* | cull.versions | tenant.*
+
+    // The uid ONLY. Names are never stored — a viewer joins to the current name
+    // at read time, so an erasure automatically stops the log disclosing it.
+    string target_uid = 10;
+    string target_type = 11;
+    string principal = 12;              // whose access changed
+
+    // Canonical JSON: keys sorted, compact separators, ASCII-escaped. A
+    // schema-constrained per-action structure, never an open map — there is no
+    // field here that can hold content, a filename or a metadata value. Feed
+    // this text verbatim into the chain verification; re-serializing it will
+    // change the bytes and break the hash.
+    string detail = 13;
+
+    bytes  prev_hash = 14;
+    bytes  hash = 15;                   // SHA-256(prev_hash ‖ canonical(row))
+
+    // Set only on the global chain: the tenant the lifecycle event is about.
+    string global_tenant = 16;
+}
+
+message ListAccountabilityRecordsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated AccountabilityRecord records = 3;
+
+    // True when more records are already waiting past this page — come straight
+    // back rather than waiting out the poll interval.
+    bool has_more = 4;
+
+    // The committed head position for this tenant at the time of the read. A
+    // queue hint asserts "at least seq N exists"; comparing it against this is
+    // what lets a consumer tell "no new records" apart from "I am reading state
+    // that has not caught up", which otherwise look identical.
+    int64 head_seq = 5;
 }
