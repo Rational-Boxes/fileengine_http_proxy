@@ -14,6 +14,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "grpc_client_wrapper.h"
+
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 
@@ -32,10 +35,70 @@ GRPCClientWrapper::~GRPCClientWrapper() = default;
 // response as a failure with the gRPC error message. `Resp` must expose
 // set_success(bool) and set_error(const std::string&).
 namespace {
+// ── Service authentication (PROPOSAL_service_authentication.md §3.1) ────────
+//
+// The token rides in call metadata under a dedicated header, never in a
+// protobuf field: it is a transport concern, it can be enforced in one place,
+// and putting a credential inside a message that is already logged and passed
+// around is how secrets end up in logs.
+//
+// Attached by attach_service_token() below, which every call path must use.
+//
+// The first version of this attached the token inside invoke<>() and claimed
+// that was "the one place every RPC goes through". It was not: the streaming
+// methods build their own ClientContext and never touch invoke<>, so file
+// content — upload and download — went to the core unauthenticated while every
+// unary call succeeded. The symptom was previews failing with HTTP 500 while
+// the rest of the UI worked perfectly, which points nowhere near here.
+//
+// Hence a named helper rather than a line inside invoke<>: a new call site that
+// forgets it is still a bug, but the thing it must call is now visible and
+// greppable instead of implied by a comment.
+//
+// Read once at startup. FILEENGINE_SERVICE_TOKEN_FILE is the container path —
+// an init writes the credential into a shared volume before the service starts,
+// which is what lets tokens exist that did not exist at `compose up` time, and
+// keeps the secret out of container metadata where an env var is visible to
+// `docker inspect`.
+const std::string& service_token() {
+    static const std::string token = [] {
+        if (const char* path = std::getenv("FILEENGINE_SERVICE_TOKEN_FILE")) {
+            if (*path) {
+                std::ifstream in(path);
+                std::string from_file;
+                std::getline(in, from_file);
+                // Trim: a file written by a shell almost always ends in a
+                // newline, and a token with a trailing newline authenticates
+                // as nobody with no clue as to why.
+                while (!from_file.empty() &&
+                       (from_file.back() == '\n' || from_file.back() == '\r' ||
+                        from_file.back() == ' ')) {
+                    from_file.pop_back();
+                }
+                if (!from_file.empty()) return from_file;
+            }
+        }
+        if (const char* env = std::getenv("FILEENGINE_SERVICE_TOKEN")) {
+            if (*env) return std::string(env);
+        }
+        return std::string();
+    }();
+    return token;
+}
+
+// Put the service credential on one outbound call. Every ClientContext the
+// bridge creates must pass through here before it is used.
+void attach_service_token(grpc::ClientContext& context) {
+    if (!service_token().empty()) {
+        context.AddMetadata("x-fe-service-token", service_token());
+    }
+}
+
 template <typename Resp, typename Fn>
 Resp invoke(const char* name, Fn&& fn) {
     Resp response;
     grpc::ClientContext context;
+    attach_service_token(context);
     grpc::Status status = fn(context, response);
     if (!status.ok()) {
         webdav::errorLog(std::string(name) + " failed: " + status.error_message());
@@ -240,6 +303,7 @@ GRPCClientWrapper::DownloadResult GRPCClientWrapper::streamFileDownload(
     const fileengine_rpc::GetFileRequest& request,
     const std::function<bool(const std::string&)>& onChunk) {
     grpc::ClientContext ctx;
+    attach_service_token(ctx);
     auto reader = stub_->StreamFileDownload(&ctx, request);
     fileengine_rpc::GetFileResponse resp;
     std::string err;
@@ -268,6 +332,7 @@ fileengine_rpc::PutFileResponse GRPCClientWrapper::streamFileUpload(
     const fileengine_rpc::AuthenticationContext& auth,
     const std::function<bool(std::string&)>& nextChunk) {
     grpc::ClientContext ctx;
+    attach_service_token(ctx);
     fileengine_rpc::PutFileResponse response;
     auto writer = stub_->StreamFileUpload(&ctx, &response);
     bool first = true;
