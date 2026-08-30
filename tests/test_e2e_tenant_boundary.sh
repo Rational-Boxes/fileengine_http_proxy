@@ -46,9 +46,36 @@ else
     printf '  \033[32m✓\033[0m tenant admin is not global system_admin (H2)\n'; PASS=$((PASS+1))
 fi
 
-echo "=== cross-tenant must be blocked (Basic) ==="
+echo "=== cross-tenant must be blocked (Basic, X-Tenant vector) ==="
 chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "X-Tenant: $FOREIGN_TENANT" "$BASE/v1/whoami")" "Basic whoami into $FOREIGN_TENANT"
 chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "X-Tenant: $FOREIGN_TENANT" "$BASE/v1/dirs/$ROOT_UID")" "Basic list $FOREIGN_TENANT root"
+
+echo "=== cross-tenant must be blocked (Basic, Host vector — no X-Tenant) ==="
+# The regression this file gained: the tenant was previously checked only when an
+# X-Tenant header was present, so selecting the foreign tenant through the request
+# Host (its own subdomain, or a spoofed Host straight to the bridge) skipped the
+# membership check entirely — and read-by-default then served the foreign tenant's
+# tree to a non-member. These assert the Host-derived tenant is now membership-
+# checked exactly like the header.
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $FOREIGN_TENANT.rationalboxes.com" "$BASE/v1/whoami")" "Basic whoami via Host $FOREIGN_TENANT.*"
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $FOREIGN_TENANT.rationalboxes.com" "$BASE/v1/dirs/$ROOT_UID")" "Basic list $FOREIGN_TENANT root via Host"
+# Positive control: the Host still SELECTS the tenant — a member reaching their
+# OWN tenant through its subdomain, with no X-Tenant, must still succeed, so the
+# fix has not broken legitimate subdomain routing.
+chk 200 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $TA_TENANT.rationalboxes.com" "$BASE/v1/whoami")" "Basic whoami via own-tenant Host $TA_TENANT.*"
+
+echo "=== data separation covers WRITES too, not only reads ==="
+# A cross-tenant leak is not only about listing: a non-member must not be able to
+# MUTATE a foreign tenant either. Both vectors are blocked at the auth boundary
+# (authenticate() runs before the write is dispatched), so a mkdir into the
+# foreign tenant is 403 whether the tenant was chosen by X-Tenant or by the Host.
+MKDIR='{"name":"boundary-probe-DELETE-ME"}'
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "X-Tenant: $FOREIGN_TENANT" \
+             -X POST -H 'Content-Type: application/json' -d "$MKDIR" \
+             "$BASE/v1/dirs/$ROOT_UID")" "Basic mkdir into $FOREIGN_TENANT (X-Tenant) blocked"
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $FOREIGN_TENANT.rationalboxes.com" \
+             -X POST -H 'Content-Type: application/json' -d "$MKDIR" \
+             "$BASE/v1/dirs/$ROOT_UID")" "Basic mkdir into $FOREIGN_TENANT (Host) blocked"
 
 echo "=== cross-tenant must be blocked (Bearer) ==="
 tok=$(curl -s -u "$TA_USER:$TA_PASS" -X POST "$BASE/v1/auth/token" | grep -oE '"token":"[^"]+"' | sed 's/.*"token":"//;s/"//')

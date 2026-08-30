@@ -1498,17 +1498,24 @@ private:
             return false;
         }
         out.source_addr = clientIp(req);  // forwarded to the core for audit
-        // M3: when the client explicitly overrides the tenant via X-Tenant (the
-        // attacker-controlled vector), verify LDAP membership. Host/subdomain
-        // routing is set by the trusted proxy and left as-is.
-        if (!req.get("X-Tenant", "").empty()) {
-            bool member = false;
-            for (const auto& t : ldap_->getTenantsForUser(out.user))
-                if (t == out.tenant) { member = true; break; }
-            if (!member) {
-                forbidTenant(resp, out.tenant);
-                return false;
-            }
+        // Verify LDAP membership of the resolved tenant on EVERY Basic request,
+        // whatever chose the tenant. The earlier form gated this behind "X-Tenant
+        // was sent", on the assumption that the host subdomain is set by the
+        // trusted proxy and needs no check. That assumption is wrong for
+        // authorization: the proxy forwards the request Host and routes any
+        // <tenant>.<base> to this bridge, but it does NOT restrict which tenant a
+        // given user may address — so a member of tenant A could reach tenant B
+        // simply by using B's own URL (or a spoofed Host when the bridge is hit
+        // directly), and read-by-default then handed them a baseline READ of B's
+        // tree. The bearer path already checks membership unconditionally
+        // (tokenTenantMember); this makes the Basic path symmetric. Host still
+        // selects the tenant — it just no longer authorizes access to it.
+        bool member = false;
+        for (const auto& t : ldap_->getTenantsForUser(out.user))
+            if (t == out.tenant) { member = true; break; }
+        if (!member) {
+            forbidTenant(resp, out.tenant);
+            return false;
         }
         return true;
     }
