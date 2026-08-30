@@ -64,6 +64,19 @@ chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $FOREIGN_TENANT.rationalboxes.c
 # fix has not broken legitimate subdomain routing.
 chk 200 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $TA_TENANT.rationalboxes.com" "$BASE/v1/whoami")" "Basic whoami via own-tenant Host $TA_TENANT.*"
 
+echo "=== data separation covers WRITES too, not only reads ==="
+# A cross-tenant leak is not only about listing: a non-member must not be able to
+# MUTATE a foreign tenant either. Both vectors are blocked at the auth boundary
+# (authenticate() runs before the write is dispatched), so a mkdir into the
+# foreign tenant is 403 whether the tenant was chosen by X-Tenant or by the Host.
+MKDIR='{"name":"boundary-probe-DELETE-ME"}'
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "X-Tenant: $FOREIGN_TENANT" \
+             -X POST -H 'Content-Type: application/json' -d "$MKDIR" \
+             "$BASE/v1/dirs/$ROOT_UID")" "Basic mkdir into $FOREIGN_TENANT (X-Tenant) blocked"
+chk 403 "$(code -u "$TA_USER:$TA_PASS" -H "Host: $FOREIGN_TENANT.rationalboxes.com" \
+             -X POST -H 'Content-Type: application/json' -d "$MKDIR" \
+             "$BASE/v1/dirs/$ROOT_UID")" "Basic mkdir into $FOREIGN_TENANT (Host) blocked"
+
 echo "=== cross-tenant must be blocked (Bearer) ==="
 tok=$(curl -s -u "$TA_USER:$TA_PASS" -X POST "$BASE/v1/auth/token" | grep -oE '"token":"[^"]+"' | sed 's/.*"token":"//;s/"//')
 if [ -n "$tok" ]; then
