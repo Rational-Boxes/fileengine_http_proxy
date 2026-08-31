@@ -569,10 +569,57 @@ private:
         addRolesAliased(a, id.roles);
     }
 
+    // Side-car children of one entry, as JSON.
+    //
+    // THE CORE HAS NO NOTION OF A RENDITION. It has files, and a file may have
+    // children. That a child called "<version>-preview.png" is a still image, or
+    // that "-model.xkt" is geometry for the 3D viewer, is a convention of this
+    // bridge and the SPA above it — nothing in the core reads those names. So the
+    // core is not asked to grow the concept: the bridge interrogates the children
+    // it can already list and passes them up verbatim, and the client decides
+    // what they are.
+    //
+    // A failure here is deliberately NOT fatal to the listing. The children of
+    // one entry may be unreadable to this caller, or the entry may have been
+    // removed between the listing and this call; neither is a reason to fail the
+    // whole directory. The entry simply arrives without the extra detail, which
+    // is exactly what a client that did not ask for it gets anyway.
+    std::string childrenJson(const AuthIdentity& id, const std::string& uid) {
+        fileengine_rpc::ListDirectoryRequest rq;
+        rq.set_uid(uid);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->listDirectory(rq);
+        if (!r.success()) return "[]";
+        std::string out = "[";
+        bool first = true;
+        for (const auto& c : r.entries()) {
+            // Side-cars are files. A directory under a file is not one, and
+            // passing it up would invite the client to parse it as one.
+            if (c.type() == fileengine_rpc::DIRECTORY) continue;
+            if (!first) out += ",";
+            first = false;
+            out += "{\"uid\":\"" + jsonEscape(c.uid()) + "\",\"name\":\"" + jsonEscape(c.name()) +
+                   "\",\"size\":" + std::to_string(c.size()) +
+                   ",\"modified_at\":" + std::to_string(c.modified_at()) + "}";
+        }
+        out += "]";
+        return out;
+    }
+
+    // `id` and `with_children` are optional: a listing only pays for the child
+    // lookups when the caller asked for them (?children=1). Left off, this is the
+    // listing it has always been.
     template <typename Resp>
-    std::string entriesJson(const Resp& r) {
+    std::string entriesJson(const Resp& r, const AuthIdentity* id = nullptr, bool with_children = false) {
         std::string body = "{\"entries\":[";
         bool first = true;
+        // One gRPC call per entry that has children, so a directory of a few
+        // hundred such files is a few hundred calls. They are cheap and local —
+        // far cheaper than the browser making them one at a time — but they are
+        // not free, so the work is bounded and the client is told when the bound
+        // was hit.
+        int budget = children_scan_limit_;
+        bool truncated = false;
         for (const auto& e : r.entries()) {
             if (!first) body += ",";
             first = false;
@@ -586,9 +633,27 @@ private:
                     ",\"modified_at\":" + std::to_string(e.modified_at()) +
                     ",\"owner\":\"" + jsonEscape(e.owner()) + "\"" +
                     ",\"created_by\":\"" + jsonEscape(e.created_by()) + "\"" +
-                    ",\"modified_by\":\"" + jsonEscape(e.modified_by()) + "\"}";
+                    ",\"modified_by\":\"" + jsonEscape(e.modified_by()) + "\"";
+            // Only entries that HAVE children are interrogated: rendition_count
+            // comes back with the listing, so an entry with none costs nothing.
+            // That is most of a normal directory.
+            if (with_children && id != nullptr && e.rendition_count() > 0) {
+                if (budget > 0) {
+                    --budget;
+                    body += ",\"children\":" + childrenJson(*id, e.uid());
+                } else {
+                    truncated = true;
+                }
+            }
+            body += "}";
         }
-        body += "]}";
+        body += "]";
+        // Say so when the budget ran out, rather than letting a partial answer
+        // look like a complete one. A client that sees false knows the entries
+        // without `children` were not interrogated — as opposed to having none —
+        // and can fall back to asking per file.
+        if (with_children) body += ",\"children_complete\":" + std::string(truncated ? "false" : "true");
+        body += "}";
         return body;
     }
 
@@ -712,20 +777,28 @@ private:
 
     void listDir(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         bool deleted = req.getURI().find("deleted=true") != std::string::npos;
+        // OPT-IN, and it has to be. Enumerating side-car children costs one
+        // dir() per entry that has any, which is worth it for the file browser —
+        // it replaces the same calls made one at a time from the browser — and
+        // pure overhead for the callers that want names and sizes, like the
+        // folder picker. Defaulting it on would slow every listing in the app to
+        // enrich one of them.
+        bool with_children = req.getURI().find("children=1") != std::string::npos ||
+                             req.getURI().find("children=true") != std::string::npos;
         if (deleted) {
             fileengine_rpc::ListDirectoryWithDeletedRequest rq;
             rq.set_uid(uid);
             fillAuth(rq.mutable_auth(), id);
             auto r = grpc_->listDirectoryWithDeleted(rq);
             if (!r.success()) return mapError(resp, r.error());
-            sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
+            sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r, &id, with_children));
         } else {
             fileengine_rpc::ListDirectoryRequest rq;
             rq.set_uid(uid);
             fillAuth(rq.mutable_auth(), id);
             auto r = grpc_->listDirectory(rq);
             if (!r.success()) return mapError(resp, r.error());
-            sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r));
+            sendJson(resp, HTTPResponse::HTTP_OK, entriesJson(r, &id, with_children));
         }
     }
 
@@ -2457,6 +2530,15 @@ private:
     }
 
     Config cfg_;
+    // How many entries in one listing will be dir()'d for their side-car
+    // children when ?children=1 is asked for. Bounded so a directory of several
+    // thousand files cannot turn one HTTP request into several thousand gRPC
+    // calls; the response says when the bound was reached rather than letting a
+    // partial answer pass for a complete one.
+    int children_scan_limit_ =
+        webdav::getEnvOrDefault("HTTP_CHILDREN_SCAN_LIMIT", "250").empty()
+            ? 250
+            : std::atoi(webdav::getEnvOrDefault("HTTP_CHILDREN_SCAN_LIMIT", "250").c_str());
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
     std::shared_ptr<webdav::LDAPAuthenticator> ldap_;
     std::shared_ptr<TokenStore> tokens_;
