@@ -1,0 +1,272 @@
+#!/bin/bash
+# End-to-end tests for ERASURE — "true delete" (PROPOSAL_accountability_record §5.4).
+#
+# WHY THIS EXISTS. Erasure was built with unit tests at every layer, and every
+# layer passed while the feature was broken end to end. Four separate failures
+# shipped, each invisible to the tests either side of it:
+#
+#   1. the bridge's service credential lacked the `destroy` capability, so the
+#      core refused the RPC before any of the logic ran;
+#   2. no role conferred ERASE, so an administrator could never erase anything;
+#   3. the bridge derived the erasure_admin role at LOGIN but not on the
+#      per-request path, so the role never reached the core;
+#   4. the erasure accountability actions had no schema, so the chain refused the
+#      record and — because record and destruction commit together — aborted the
+#      erasure.
+#
+# Every one of those lives BETWEEN components. That is what this suite covers:
+# it drives a real erasure through the REST door, against a live bridge, core,
+# chain and directory, and asserts on what actually happened to the data.
+#
+# Usage:
+#   BASE=http://localhost:8090 \
+#   FE_ERASE_USER='dpo@example.com' FE_ERASE_PASS='...' \
+#   [FE_TENANT=default] [FE_USER=<plain admin> FE_PASS=...] \
+#   ./tests/test_e2e_erasure.sh
+#
+#   FE_ERASE_USER must hold the erasure_admin role (member of the tenant's
+#   `erasure_admins` group). Without it, everything here fails at the first
+#   erase — which is itself the point.
+#
+#   FE_USER/FE_PASS, if given, must be a tenant ADMIN who is NOT an
+#   erasure_admin: it proves the role is a real gate and not decoration.
+#   Omitted, that check SKIPs rather than passing silently.
+#
+#   Where 2FA blocks a password login, pass a bearer token instead:
+#   FE_ERASE_TOKEN=... (and FE_TOKEN=... for the plain admin).
+
+BASE="${BASE:-http://localhost:8090}"
+TENANT="${FE_TENANT:-default}"
+PASS=0; FAIL=0; SKIP=0; FAILED=()
+ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
+skip() { SKIP=$((SKIP+1)); printf '  \033[33m⊘ SKIP\033[0m %s\n' "$1"; }
+
+# Bearer for an identity, from a token if supplied or a password login.
+mint() {  # mint <user> <pass> <preset-token>
+    if [ -n "$3" ]; then printf '%s' "$3"; return 0; fi
+    [ -n "$1" ] || return 1
+    curl -s -u "$1:$2" -X POST "$BASE/v1/auth/token?tenant=$TENANT" \
+         -H 'Content-Type: application/json' -d '{}' --max-time 20 \
+      | grep -oE '"token":"[^"]+"' | sed 's/.*"token":"//;s/"//'
+}
+api() {  # api <token> <method> <path> [body]
+    local t="$1" m="$2" p="$3" b="${4:-}"
+    if [ -n "$b" ]; then
+        curl -s -X "$m" "$BASE$p" -H "Authorization: Bearer $t" -H "X-Tenant: $TENANT" \
+             -H 'Content-Type: application/json' -d "$b" --max-time 30
+    else
+        curl -s -X "$m" "$BASE$p" -H "Authorization: Bearer $t" -H "X-Tenant: $TENANT" --max-time 30
+    fi
+}
+code_of() {  # code_of <token> <method> <path> [body]
+    local t="$1" m="$2" p="$3" b="${4:-}"
+    if [ -n "$b" ]; then
+        curl -s -o /dev/null -w '%{http_code}' -X "$m" "$BASE$p" -H "Authorization: Bearer $t" \
+             -H "X-Tenant: $TENANT" -H 'Content-Type: application/json' -d "$b" --max-time 30
+    else
+        curl -s -o /dev/null -w '%{http_code}' -X "$m" "$BASE$p" -H "Authorization: Bearer $t" \
+             -H "X-Tenant: $TENANT" --max-time 30
+    fi
+}
+jstr() { grep -oE "\"$2\":\"[^\"]*\"" <<<"$1" | head -1 | sed "s/.*\"$2\":\"//;s/\"$//"; }
+
+echo "=========================================================="
+echo " FileEngine — ERASURE E2E   base=$BASE tenant=$TENANT"
+echo "=========================================================="
+
+ETOKEN=$(mint "${FE_ERASE_USER:-}" "${FE_ERASE_PASS:-}" "${FE_ERASE_TOKEN:-}")
+if [ -z "$ETOKEN" ]; then
+    echo "  FATAL: could not authenticate FE_ERASE_USER."
+    echo "  Set FE_ERASE_USER/FE_ERASE_PASS, or FE_ERASE_TOKEN where 2FA is enrolled."
+    exit 1
+fi
+ok "authenticated as the erasure administrator"
+
+# A file of our own, so the suite never touches anything it did not create.
+mkfile() {  # mkfile <name> <content> -> uid
+    local uid
+    uid=$(api "$ETOKEN" POST "/v1/dirs/root/files" "{\"name\":\"$1\"}")
+    uid=$(grep -oE '"uid":"[^"]+"' <<<"$uid" | head -1 | sed 's/.*"uid":"//;s/"//')
+    [ -n "$uid" ] || return 1
+    curl -s -X PUT "$BASE/v1/files/$uid/content" -H "Authorization: Bearer $ETOKEN" \
+         -H "X-Tenant: $TENANT" --data-binary "$2" --max-time 30 -o /dev/null
+    printf '%s' "$uid"
+}
+
+STAMP=$(date +%s)
+
+# ── 1. The whole path, in one call ──────────────────────────────────────────
+# This single assertion is what all four shipped failures had in common: each
+# made it fail, from a different component, with a different message.
+echo "[erase]"
+UID1=$(mkfile "erase-e2e-$STAMP.txt" "sensitive party data")
+if [ -z "$UID1" ]; then bad "create a file to erase" "no uid returned"; else
+    ok "created a file to erase ($UID1)"
+    resp=$(api "$ETOKEN" POST "/v1/files/$UID1/erase" '{"reason":"e2e"}')
+    ecode=$(code_of "$ETOKEN" POST "/v1/files/$UID1/erase" '{"reason":"e2e"}' )
+    # (the second call is refused as already-erased; the first is the real one)
+    ERASURE_ID=$(jstr "$resp" erasure_id)
+    STATE=$(jstr "$resp" state)
+    if [ -n "$ERASURE_ID" ]; then
+        ok "erase accepted, erasure recorded ($STATE)"
+    else
+        bad "erase accepted" "$resp"
+    fi
+
+    # 202 while participants are outstanding, 200 only when there are none. The
+    # distinction is the feature: 204/'done' would be a compliance claim the
+    # platform cannot yet stand behind.
+    case "$STATE" in
+      initiated|complete) ok "state is a real erasure state ('$STATE')" ;;
+      *) bad "state is a real erasure state" "got '$STATE' from $resp" ;;
+    esac
+
+    # ── 2. The content is actually gone ─────────────────────────────────────
+    echo "[destruction]"
+    c=$(code_of "$ETOKEN" GET "/v1/files/$UID1/content")
+    [ "$c" != "200" ] && ok "content is unreadable after erasure ($c)" \
+                      || bad "content is unreadable after erasure" "still 200"
+    v=$(api "$ETOKEN" GET "/v1/files/$UID1/versions")
+    if grep -qE '"versions":\[\s*\]' <<<"$v" || ! grep -q '"version' <<<"$v"; then
+        ok "every version is destroyed"
+    else
+        bad "every version is destroyed" "$v"
+    fi
+
+    # ── 3. The fact survives; the name does not ─────────────────────────────
+    # The payload is destroyed and the fact is retained (§5.4.1). A filename is
+    # itself party data, so the default is to redact it.
+    st=$(api "$ETOKEN" GET "/v1/nodes/$UID1")
+    if [ -n "$st" ] && ! grep -q '"error"' <<<"$st"; then
+        ok "the existence record survives (uid still resolves)"
+        if grep -qE "\"name\":\"erase-e2e-$STAMP" <<<"$st"; then
+            bad "the filename is redacted by default" "$st"
+        else
+            ok "the filename is redacted by default"
+        fi
+    else
+        skip "existence record readable via /v1/nodes (endpoint returned: ${st:0:80})"
+    fi
+
+    # ── 4. Erasing twice is refused ─────────────────────────────────────────
+    # Not pedantry: a second run would destroy nothing, report success, and
+    # attest to a destruction that did not happen on that occasion.
+    [ "$ecode" = "202" ] || [ "$ecode" = "200" ] \
+        && bad "a second erasure is refused" "got $ecode" \
+        || ok "a second erasure is refused ($ecode)"
+
+    # ── 5. The attestation record ───────────────────────────────────────────
+    echo "[attestation]"
+    if [ -n "$ERASURE_ID" ]; then
+        stat=$(api "$ETOKEN" GET "/v1/erasures/$ERASURE_ID")
+        grep -q "\"uid\":\"$UID1\"" <<<"$stat" \
+            && ok "the erasure record names the file" || bad "erasure record names the file" "$stat"
+        grep -q '"actor":"' <<<"$stat" \
+            && ok "the erasure record names the actor" || bad "erasure record names the actor" "$stat"
+        grep -q '"awaiting":\[' <<<"$stat" \
+            && ok "the record lists who has yet to confirm" || bad "record lists awaiting" "$stat"
+        # A deployment with no participants configured completes immediately —
+        # correct only where nothing holds derived data. Say so either way.
+        if grep -q '"state":"complete"' <<<"$stat"; then
+            if grep -qE '"awaiting":\[\s*\]' <<<"$stat"; then
+                ok "complete with nothing outstanding (no participants configured)"
+            else
+                bad "complete while participants are outstanding" "$stat"
+            fi
+        else
+            ok "still initiated — participants have yet to confirm"
+        fi
+    fi
+fi
+
+# ── 5b. The tombstone does not appear as a file ─────────────────────────────
+# An erased row is a tombstone, not a file: no content, no versions, no name, and
+# undelete cannot bring it back. Listing it renders a nameless row that looks
+# like corruption and offers actions that can only fail. The fact is retained in
+# the erasure record and the chain, which is where an auditor looks.
+echo "[no phantom rows]"
+if [ -n "$UID1" ]; then
+    lst=$(api "$ETOKEN" GET "/v1/dirs/root")
+    if grep -q "\"uid\":\"$UID1\"" <<<"$lst"; then
+        bad "the erased file is gone from the listing" "still present as a row"
+    else
+        ok "the erased file is gone from the listing"
+    fi
+    # Not in the with-deleted view either: it is not a deleted file.
+    lstd=$(api "$ETOKEN" GET "/v1/dirs/root?deleted=true")
+    if grep -q "\"uid\":\"$UID1\"" <<<"$lstd"; then
+        bad "the erased file is gone from the deleted view too" "shows as recoverable"
+    else
+        ok "the erased file is gone from the deleted view too"
+    fi
+    # A nameless entry anywhere is the symptom this guards against.
+    if grep -qE '"name":""' <<<"$lst$lstd"; then
+        bad "no nameless rows in any listing" "a redacted tombstone is being rendered"
+    else
+        ok "no nameless rows in any listing"
+    fi
+fi
+
+# ── 6. Soft delete is NOT erasure ───────────────────────────────────────────
+# The two must never share a path: a soft delete is reversible and consumers may
+# reasonably keep derived data for it.
+echo "[soft delete is not erasure]"
+UID2=$(mkfile "softdel-e2e-$STAMP.txt" "recoverable")
+if [ -n "$UID2" ]; then
+    code_of "$ETOKEN" DELETE "/v1/files/$UID2" >/dev/null
+    u=$(code_of "$ETOKEN" POST "/v1/files/$UID2/undelete")
+    [ "$u" = "204" ] || [ "$u" = "200" ] \
+        && ok "a soft-deleted file is still undeletable ($u)" \
+        || bad "soft delete stays reversible" "undelete got $u"
+    c=$(code_of "$ETOKEN" GET "/v1/files/$UID2/content")
+    [ "$c" = "200" ] && ok "its content survived the soft delete" \
+                     || bad "content survives a soft delete" "got $c"
+else
+    skip "soft-delete comparison (could not create a file)"
+fi
+
+# ── 7. The role is a real gate ──────────────────────────────────────────────
+# A tenant administrator who is NOT an erasure_admin must be refused. This is
+# the check that would have caught the role never reaching the core: it passes
+# only if the role genuinely changes the outcome.
+echo "[the role gates]"
+PTOKEN=$(mint "${FE_USER:-}" "${FE_PASS:-}" "${FE_TOKEN:-}")
+if [ -n "$PTOKEN" ]; then
+    UID3=$(mkfile "gate-e2e-$STAMP.txt" "x")
+    if [ -n "$UID3" ]; then
+        g=$(code_of "$PTOKEN" POST "/v1/files/$UID3/erase" '{"reason":"should be refused"}')
+        [ "$g" = "403" ] && ok "an administrator without erasure_admin is refused (403)" \
+                         || bad "administrator without erasure_admin is refused" "got $g"
+        # And it is still there afterwards.
+        c=$(code_of "$ETOKEN" GET "/v1/files/$UID3/content")
+        [ "$c" = "200" ] && ok "the refused file is untouched" || bad "refused file untouched" "got $c"
+        api "$ETOKEN" POST "/v1/files/$UID3/erase" '{"reason":"cleanup"}' >/dev/null
+    fi
+else
+    skip "erasure_admin is a real gate (set FE_USER/FE_PASS to a plain tenant admin)"
+fi
+
+# ── 8. Permission reporting matches enforcement ─────────────────────────────
+# The SPA decides whether to OFFER erasure from this answer. If it disagreed with
+# the check, the UI would either hide a power the user has or offer one that then
+# fails.
+echo "[permission reporting]"
+p=$(api "$ETOKEN" GET "/v1/nodes/root/permissions?permission=ERASE")
+grep -q '"has_permission":true' <<<"$p" \
+    && ok "an erasure_admin is reported as holding ERASE" \
+    || bad "ERASE reported for an erasure_admin" "$p"
+if [ -n "$PTOKEN" ]; then
+    p2=$(api "$PTOKEN" GET "/v1/nodes/root/permissions?permission=ERASE")
+    grep -q '"has_permission":false' <<<"$p2" \
+        && ok "a plain administrator is reported as NOT holding ERASE" \
+        || bad "ERASE not reported for a plain admin" "$p2"
+fi
+
+echo "----------------------------------------------------------"
+printf ' passed %d   failed %d   skipped %d\n' "$PASS" "$FAIL" "$SKIP"
+if [ "$FAIL" -gt 0 ]; then
+    printf '\n failures:\n'; for f in "${FAILED[@]}"; do printf '   - %s\n' "$f"; done
+    exit 1
+fi
+exit 0
