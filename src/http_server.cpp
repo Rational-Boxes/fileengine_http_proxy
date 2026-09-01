@@ -565,15 +565,44 @@ private:
     // H2). The global "system_admin" bypass is NOT granted here; a platform
     // operator gets it only by being a member of a group literally named
     // "system_admin", which passes through verbatim below.
+    // Group name -> core role name. The core gates on ROLES; the directory holds
+    // GROUPS, and the two are deliberately spelled differently (plural group,
+    // singular role) so neither is mistaken for the other.
+    //
+    // This table is the one that matters. There is a second mapping in
+    // LDAPAuthenticator::extractRolesFromGroups, but that one runs at LOGIN,
+    // while this runs on EVERY request from the roles the session carries — so a
+    // mapping added there and not here is applied once and then silently
+    // dropped from every call that follows. That is exactly how `erasure_admins`
+    // reached the core un-aliased, and the core denied ERASE to a user who was
+    // in the group: the login log said the role had been mapped, and the request
+    // did not carry it.
+    static const std::vector<std::pair<std::string, std::string>>& roleAliases() {
+        static const std::vector<std::pair<std::string, std::string>> kAliases = {
+            {"administrators", "tenant_admin"},
+            // A tenant admin who may additionally ERASE. Its own group, not
+            // implied by administrators — an administrator grants it by editing
+            // that group's membership.
+            {"erasure_admins", "erasure_admin"},
+        };
+        return kAliases;
+    }
+
     static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
                                 const std::vector<std::string>& roles) {
-        bool tenantAdmin = false;
+        std::vector<std::string> derived;
         for (const auto& r : roles) {
             if (r.empty()) continue;
             a->add_roles(r);  // verbatim — includes "system_admin" iff the user is in that group
-            if (r == "administrators") tenantAdmin = true;
+            for (const auto& [group, role] : roleAliases()) {
+                if (r == group &&
+                    std::find(roles.begin(), roles.end(), role) == roles.end() &&
+                    std::find(derived.begin(), derived.end(), role) == derived.end()) {
+                    derived.push_back(role);
+                }
+            }
         }
-        if (tenantAdmin) a->add_roles("tenant_admin");
+        for (const auto& role : derived) a->add_roles(role);
     }
 
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
