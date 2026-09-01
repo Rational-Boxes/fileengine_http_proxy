@@ -65,6 +65,28 @@ service FileService {
     // Administrative operations
     rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsageResponse);
     rpc PurgeOldVersions(PurgeOldVersionsRequest) returns (PurgeOldVersionsResponse);
+
+    // Erasure ("true delete") — PROPOSAL_accountability_record.md §5.4.
+    //
+    // The payload is destroyed; the fact is retained. Distinct from RemoveFile,
+    // which is a SOFT delete that UndeleteFile reverses: a consumer may
+    // reasonably keep derived data for a soft-deleted file, and reusing that
+    // path for erasure would leave extracted text and embeddings exactly where
+    // they were.
+    //
+    // Erasure is a tracked job, not a call that returns done (§5.4.3). The core
+    // destroys its own content and records the erasure as INITIATED; each
+    // participating service acknowledges; the erasure becomes COMPLETE only when
+    // every participant has. Partial completion stays visibly incomplete, which
+    // is what makes the completion record worth showing an auditor.
+    rpc EraseFile(EraseFileRequest) returns (EraseFileResponse);
+    // The guarantee path (§5.4.5). Consumers poll for erasures they have not
+    // acknowledged, so one that missed the fail-open event, was down, or was
+    // restored from a backup converges without the instruction being redelivered.
+    rpc ListPendingErasures(ListPendingErasuresRequest) returns (ListPendingErasuresResponse);
+    rpc AcknowledgeErasure(AcknowledgeErasureRequest) returns (AcknowledgeErasureResponse);
+    // What an auditor is shown: participants, timestamps, outcome.
+    rpc GetErasureStatus(GetErasureStatusRequest) returns (GetErasureStatusResponse);
     rpc TriggerSync(TriggerSyncRequest) returns (TriggerSyncResponse);
 
     // The accountability pull surface (PROPOSAL_accountability_record.md §4.3).
@@ -623,6 +645,101 @@ message PurgeOldVersionsRequest {
 message PurgeOldVersionsResponse {
     bool success = 1;
     string error = 2;
+}
+
+// --- Erasure (§5.4) --------------------------------------------------------
+
+enum ErasureState {
+    ERASURE_INITIATED = 0;  // Core content destroyed; participants outstanding.
+    ERASURE_COMPLETE = 1;   // Every participant acknowledged.
+    ERASURE_FAILED = 2;     // A participant reported it could not comply.
+}
+
+message EraseFileRequest {
+    string uid = 1;                     // File to erase
+    AuthenticationContext auth = 2;
+    // The filename is itself party data — "Acme_Contract_J_Smith.pdf" names a
+    // person. §5.4.1 recommends redacting it by default, because the safe
+    // default for an erasure feature is to erase. Set this only where a
+    // retention justification covers keeping it.
+    bool retain_name = 3;
+    string reason = 4;                  // Recorded on the erasure record
+}
+message EraseFileResponse {
+    bool success = 1;
+    string error = 2;
+    string erasure_id = 3;              // The root's record
+    ErasureState state = 4;             // INITIATED unless there are no participants
+    repeated string awaiting = 5;       // Participants not yet acknowledged
+    // Every erasure this call started, deepest first. Erasing a FOLDER erases
+    // what is in it, and each member is a real document with its own derived
+    // copies — so each gets its own record and its own participants. The root's
+    // record alone does not attest to the subtree; these do.
+    repeated string erasure_ids = 6;
+}
+
+message PendingErasure {
+    string erasure_id = 1;
+    string uid = 2;
+    string tenant = 3;
+    int64 initiated_at = 4;             // Unix seconds
+}
+message ListPendingErasuresRequest {
+    string participant = 1;             // Service id, e.g. "csai"
+    AuthenticationContext auth = 2;
+    int32 limit = 3;                    // 0 = server default
+    // Sweep EVERY tenant rather than the one in `auth`.
+    //
+    // A consumer does not reliably know the tenant set. It knows the tenants it
+    // has happened to see traffic for, which is not the same thing: a tenant it
+    // has not served since starting, or one whose events it missed, is invisible
+    // to it — and an erasure there would sit unacknowledged for ever with
+    // nothing saying so. The core is the authority on which tenants exist, so it
+    // is the core that iterates. Each returned row carries its own tenant, and
+    // the acknowledgement must be sent with that tenant.
+    bool all_tenants = 4;
+}
+message ListPendingErasuresResponse {
+    bool success = 1;
+    string error = 2;
+    repeated PendingErasure erasures = 3;
+}
+
+message AcknowledgeErasureRequest {
+    string erasure_id = 1;
+    string participant = 2;
+    AuthenticationContext auth = 3;
+    bool complied = 4;                  // false records a failure, never silence
+    string detail = 5;                  // What was destroyed, or why it could not be
+}
+message AcknowledgeErasureResponse {
+    bool success = 1;
+    string error = 2;
+    ErasureState state = 3;             // COMPLETE once this was the last one
+}
+
+message ErasureAck {
+    string participant = 1;
+    int64 acked_at = 2;
+    bool complied = 3;
+    string detail = 4;
+}
+message GetErasureStatusRequest {
+    string erasure_id = 1;
+    AuthenticationContext auth = 2;
+}
+message GetErasureStatusResponse {
+    bool success = 1;
+    string error = 2;
+    string uid = 3;
+    string tenant = 4;
+    ErasureState state = 5;
+    int64 initiated_at = 6;
+    int64 completed_at = 7;             // 0 while incomplete
+    string actor = 8;
+    string reason = 9;
+    repeated ErasureAck acks = 10;
+    repeated string awaiting = 11;      // Participants still outstanding
 }
 
 message TriggerSyncRequest {

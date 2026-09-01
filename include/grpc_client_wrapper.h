@@ -71,6 +71,11 @@ public:
     fileengine_rpc::RestoreToVersionResponse restoreToVersion(const fileengine_rpc::RestoreToVersionRequest& request);
     fileengine_rpc::PurgeOldVersionsResponse purgeOldVersions(const fileengine_rpc::PurgeOldVersionsRequest& request);
 
+    // Erasure (§5.4). eraseFile is the destructive act; the rest is the
+    // attestation surface an auditor is shown.
+    fileengine_rpc::EraseFileResponse eraseFile(const fileengine_rpc::EraseFileRequest& request);
+    fileengine_rpc::GetErasureStatusResponse getErasureStatus(const fileengine_rpc::GetErasureStatusRequest& request);
+
     // Metadata operations
     fileengine_rpc::SetMetadataResponse setMetadata(const fileengine_rpc::SetMetadataRequest& request);
     fileengine_rpc::GetMetadataResponse getMetadata(const fileengine_rpc::GetMetadataRequest& request);

@@ -494,6 +494,15 @@ private:
             std::string uid = (segs[2] == "root") ? "" : segs[2];  // "root" alias; all-zeros handled by core
             const std::string sub = segs.size() >= 4 ? segs[3] : "";
 
+            // /v1/erasures/<id> — the attestation record, keyed by erasure
+            // rather than by file. The file's own uid still resolves (the
+            // existence record survives), but an erasure is the thing an
+            // auditor asks about, and a file can only ever have one.
+            if (resource == "erasures") {
+                if (segs.size() == 3 && method == "GET") return erasureStatus(resp, id, uid);
+                return sendJson(resp, HTTPResponse::HTTP_NOT_FOUND, R"({"error":"not found"})");
+            }
+
             if (resource == "dirs") {
                 if (segs.size() == 3) {
                     if (method == "POST")   return makeDir(req, resp, id, uid);
@@ -518,6 +527,11 @@ private:
                     if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
                     if (sub == "restore" && method == "POST")   return restoreVersion(req, resp, id, uid);
                     if (sub == "purge" && method == "POST")     return purgeVersions(req, resp, id, uid);
+                    // Erasure (§5.4). POST, not DELETE: DELETE on a node is the
+                    // SOFT delete, and the two must never be reachable by the
+                    // same verb on the same path — a client retrying a delete
+                    // must not be able to escalate it into an irreversible one.
+                    if (sub == "erase" && method == "POST")     return eraseNode(req, resp, id, uid);
                 } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
                     return getVersion(resp, id, uid, segs[4]);
                 }
@@ -551,15 +565,44 @@ private:
     // H2). The global "system_admin" bypass is NOT granted here; a platform
     // operator gets it only by being a member of a group literally named
     // "system_admin", which passes through verbatim below.
+    // Group name -> core role name. The core gates on ROLES; the directory holds
+    // GROUPS, and the two are deliberately spelled differently (plural group,
+    // singular role) so neither is mistaken for the other.
+    //
+    // This table is the one that matters. There is a second mapping in
+    // LDAPAuthenticator::extractRolesFromGroups, but that one runs at LOGIN,
+    // while this runs on EVERY request from the roles the session carries — so a
+    // mapping added there and not here is applied once and then silently
+    // dropped from every call that follows. That is exactly how `erasure_admins`
+    // reached the core un-aliased, and the core denied ERASE to a user who was
+    // in the group: the login log said the role had been mapped, and the request
+    // did not carry it.
+    static const std::vector<std::pair<std::string, std::string>>& roleAliases() {
+        static const std::vector<std::pair<std::string, std::string>> kAliases = {
+            {"administrators", "tenant_admin"},
+            // A tenant admin who may additionally ERASE. Its own group, not
+            // implied by administrators — an administrator grants it by editing
+            // that group's membership.
+            {"erasure_admins", "erasure_admin"},
+        };
+        return kAliases;
+    }
+
     static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
                                 const std::vector<std::string>& roles) {
-        bool tenantAdmin = false;
+        std::vector<std::string> derived;
         for (const auto& r : roles) {
             if (r.empty()) continue;
             a->add_roles(r);  // verbatim — includes "system_admin" iff the user is in that group
-            if (r == "administrators") tenantAdmin = true;
+            for (const auto& [group, role] : roleAliases()) {
+                if (r == group &&
+                    std::find(roles.begin(), roles.end(), role) == roles.end() &&
+                    std::find(derived.begin(), derived.end(), role) == derived.end()) {
+                    derived.push_back(role);
+                }
+            }
         }
-        if (tenantAdmin) a->add_roles("tenant_admin");
+        for (const auto& role : derived) a->add_roles(role);
     }
 
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
@@ -967,6 +1010,98 @@ private:
         auto r = grpc_->purgeOldVersions(rq);
         if (r.success()) sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
         else mapError(resp, r.error());
+    }
+
+    // Erasure — "true delete" (PROPOSAL_accountability_record.md §5.4).
+    //
+    // Returns 202 Accepted, not 204. The core's own copy is destroyed
+    // synchronously, but derived data — extracted text, embeddings, rendered
+    // pages, comment text — lives in other services and each must acknowledge
+    // before the obligation is met. 204 would tell the caller the erasure was
+    // done; it is INITIATED, and the difference is the whole point of the
+    // feature. Poll the returned erasure id for completion.
+    void eraseNode(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id,
+                   const std::string& uid) {
+        const std::string body = readBody(req);
+        fileengine_rpc::EraseFileRequest rq;
+        rq.set_uid(uid);
+        // Default false: the filename is itself party data, and the safe default
+        // for an erasure feature is to erase (§5.4.1). A caller keeping it has
+        // to say so.
+        rq.set_retain_name(jsonFieldBool(body, "retain_name"));
+        rq.set_reason(jsonField(body, "reason"));
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->eraseFile(rq);
+        if (!r.success()) return mapError(resp, r.error());
+
+        std::string awaiting = "[";
+        bool first = true;
+        for (const auto& p : r.awaiting()) {
+            if (!first) awaiting += ",";
+            first = false;
+            awaiting += "\"" + jsonEscape(p) + "\"";
+        }
+        awaiting += "]";
+        // Every erasure this started, not just the root's. Erasing a folder
+        // erases what is in it, and each member gets its own record because each
+        // has its own derived copies to be purged and attested. Reporting only
+        // the root would understate what happened and give the caller no way to
+        // follow the rest to completion.
+        std::string ids = "[";
+        first = true;
+        for (const auto& id : r.erasure_ids()) {
+            if (!first) ids += ",";
+            first = false;
+            ids += "\"" + jsonEscape(id) + "\"";
+        }
+        ids += "]";
+        const bool complete = r.state() == fileengine_rpc::ERASURE_COMPLETE;
+        sendJson(resp, complete ? HTTPResponse::HTTP_OK : HTTPResponse::HTTP_ACCEPTED,
+                 "{\"erasure_id\":\"" + jsonEscape(r.erasure_id()) +
+                 "\",\"state\":\"" + (complete ? "complete" : "initiated") +
+                 "\",\"awaiting\":" + awaiting +
+                 ",\"erasure_ids\":" + ids + "}");
+    }
+
+    // What an auditor is shown: who erased what, when, which services have
+    // confirmed destroying their copy, and which have not.
+    void erasureStatus(HTTPServerResponse& resp, const AuthIdentity& id,
+                       const std::string& erasure_id) {
+        fileengine_rpc::GetErasureStatusRequest rq;
+        rq.set_erasure_id(erasure_id);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->getErasureStatus(rq);
+        if (!r.success()) return mapError(resp, r.error());
+
+        const char* state = r.state() == fileengine_rpc::ERASURE_COMPLETE ? "complete"
+                          : r.state() == fileengine_rpc::ERASURE_FAILED   ? "failed"
+                                                                         : "initiated";
+        std::string body = "{\"erasure_id\":\"" + jsonEscape(erasure_id) +
+                           "\",\"uid\":\"" + jsonEscape(r.uid()) +
+                           "\",\"state\":\"" + state +
+                           "\",\"actor\":\"" + jsonEscape(r.actor()) +
+                           "\",\"reason\":\"" + jsonEscape(r.reason()) +
+                           "\",\"initiated_at\":" + std::to_string(r.initiated_at()) +
+                           ",\"completed_at\":" + std::to_string(r.completed_at()) +
+                           ",\"acks\":[";
+        bool first = true;
+        for (const auto& a : r.acks()) {
+            if (!first) body += ",";
+            first = false;
+            body += "{\"participant\":\"" + jsonEscape(a.participant()) +
+                    "\",\"acked_at\":" + std::to_string(a.acked_at()) +
+                    ",\"complied\":" + (a.complied() ? "true" : "false") +
+                    ",\"detail\":\"" + jsonEscape(a.detail()) + "\"}";
+        }
+        body += "],\"awaiting\":[";
+        first = true;
+        for (const auto& p : r.awaiting()) {
+            if (!first) body += ",";
+            first = false;
+            body += "\"" + jsonEscape(p) + "\"";
+        }
+        body += "]}";
+        sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
     // --- metadata ---
