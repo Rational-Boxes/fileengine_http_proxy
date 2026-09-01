@@ -204,6 +204,16 @@ fileengine_rpc::PurgeOldVersionsResponse GRPCClientWrapper::purgeOldVersions(con
         [&](grpc::ClientContext& c, fileengine_rpc::PurgeOldVersionsResponse& r) { return stub_->PurgeOldVersions(&c, request, &r); });
 }
 
+fileengine_rpc::EraseFileResponse GRPCClientWrapper::eraseFile(const fileengine_rpc::EraseFileRequest& request) {
+    return invoke<fileengine_rpc::EraseFileResponse>("EraseFile",
+        [&](grpc::ClientContext& c, fileengine_rpc::EraseFileResponse& r) { return stub_->EraseFile(&c, request, &r); });
+}
+
+fileengine_rpc::GetErasureStatusResponse GRPCClientWrapper::getErasureStatus(const fileengine_rpc::GetErasureStatusRequest& request) {
+    return invoke<fileengine_rpc::GetErasureStatusResponse>("GetErasureStatus",
+        [&](grpc::ClientContext& c, fileengine_rpc::GetErasureStatusResponse& r) { return stub_->GetErasureStatus(&c, request, &r); });
+}
+
 // Metadata operations
 fileengine_rpc::SetMetadataResponse GRPCClientWrapper::setMetadata(const fileengine_rpc::SetMetadataRequest& request) {
     return invoke<fileengine_rpc::SetMetadataResponse>("SetMetadata",
