@@ -208,6 +208,62 @@ if [ -n "$UID1" ]; then
     fi
 fi
 
+# ── 5c. The attestation LOOP ────────────────────────────────────────────────
+# The seam every other check leaves open. With participants configured, an
+# erasure is INITIATED and stays that way until csai, discussion and difference
+# each destroy their derived copy and say so. This is the part that makes the
+# completion record mean anything, and it is the only part that cannot be tested
+# without all four processes running.
+#
+# Skipped, loudly, where no participants are configured — a suite that quietly
+# passed through the no-participants branch is how this seam stayed open.
+echo "[attestation loop]"
+if [ -z "$ERASURE_ID" ]; then
+    skip "attestation loop (no erasure to follow)"
+elif ! grep -q '"state":"initiated"' <<<"$(api "$ETOKEN" GET "/v1/erasures/$ERASURE_ID")"; then
+    skip "attestation loop — this deployment has no FILEENGINE_ERASURE_PARTICIPANTS, so erasures complete immediately and the acknowledge path is NOT covered"
+else
+    ok "erasure starts INITIATED with participants outstanding"
+    deadline=$(( $(date +%s) + ${FE_ERASE_WAIT:-90} ))
+    final=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(api "$ETOKEN" GET "/v1/erasures/$ERASURE_ID")
+        case "$st" in
+          *'"state":"complete"'*) final="complete"; break ;;
+          *'"state":"failed"'*)   final="failed";   break ;;
+        esac
+        sleep 3
+    done
+    st=$(api "$ETOKEN" GET "/v1/erasures/$ERASURE_ID")
+    if [ "$final" = "complete" ]; then
+        ok "every participant acknowledged; the erasure completed"
+    elif [ "$final" = "failed" ]; then
+        bad "the erasure completed" "a participant reported it could not comply: $st"
+    else
+        bad "the erasure completed within ${FE_ERASE_WAIT:-90}s" "still outstanding: $st"
+    fi
+    # Nothing may be left waiting once complete: an empty awaiting list is the
+    # difference between "we are done" and "we stopped asking".
+    grep -qE '"awaiting":\[\s*\]' <<<"$st" \
+        && ok "no participant is left outstanding" \
+        || bad "no participant is left outstanding" "$st"
+    # Each participant must appear BY NAME, having said what it destroyed. An
+    # acknowledgement with no statement is not evidence.
+    for p in csai discussion difference; do
+        if grep -q "\"participant\":\"$p\"" <<<"$st"; then
+            ok "$p acknowledged by name"
+        else
+            bad "$p acknowledged by name" "$st"
+        fi
+    done
+    grep -q '"complied":false' <<<"$st" \
+        && bad "every acknowledgement reports compliance" "$st" \
+        || ok "every acknowledgement reports compliance"
+    grep -q '"completed_at":0' <<<"$st" \
+        && bad "the completion is timestamped" "completed_at is 0 in $st" \
+        || ok "the completion is timestamped"
+fi
+
 # ── 6. Soft delete is NOT erasure ───────────────────────────────────────────
 # The two must never share a path: a soft delete is reversible and consumers may
 # reasonably keep derived data for it.
