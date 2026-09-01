@@ -668,9 +668,14 @@ message EraseFileRequest {
 message EraseFileResponse {
     bool success = 1;
     string error = 2;
-    string erasure_id = 3;
+    string erasure_id = 3;              // The root's record
     ErasureState state = 4;             // INITIATED unless there are no participants
     repeated string awaiting = 5;       // Participants not yet acknowledged
+    // Every erasure this call started, deepest first. Erasing a FOLDER erases
+    // what is in it, and each member is a real document with its own derived
+    // copies — so each gets its own record and its own participants. The root's
+    // record alone does not attest to the subtree; these do.
+    repeated string erasure_ids = 6;
 }
 
 message PendingErasure {
@@ -683,6 +688,16 @@ message ListPendingErasuresRequest {
     string participant = 1;             // Service id, e.g. "csai"
     AuthenticationContext auth = 2;
     int32 limit = 3;                    // 0 = server default
+    // Sweep EVERY tenant rather than the one in `auth`.
+    //
+    // A consumer does not reliably know the tenant set. It knows the tenants it
+    // has happened to see traffic for, which is not the same thing: a tenant it
+    // has not served since starting, or one whose events it missed, is invisible
+    // to it — and an erasure there would sit unacknowledged for ever with
+    // nothing saying so. The core is the authority on which tenants exist, so it
+    // is the core that iterates. Each returned row carries its own tenant, and
+    // the acknowledgement must be sent with that tenant.
+    bool all_tenants = 4;
 }
 message ListPendingErasuresResponse {
     bool success = 1;

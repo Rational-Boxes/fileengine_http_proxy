@@ -1042,11 +1042,25 @@ private:
             awaiting += "\"" + jsonEscape(p) + "\"";
         }
         awaiting += "]";
+        // Every erasure this started, not just the root's. Erasing a folder
+        // erases what is in it, and each member gets its own record because each
+        // has its own derived copies to be purged and attested. Reporting only
+        // the root would understate what happened and give the caller no way to
+        // follow the rest to completion.
+        std::string ids = "[";
+        first = true;
+        for (const auto& id : r.erasure_ids()) {
+            if (!first) ids += ",";
+            first = false;
+            ids += "\"" + jsonEscape(id) + "\"";
+        }
+        ids += "]";
         const bool complete = r.state() == fileengine_rpc::ERASURE_COMPLETE;
         sendJson(resp, complete ? HTTPResponse::HTTP_OK : HTTPResponse::HTTP_ACCEPTED,
                  "{\"erasure_id\":\"" + jsonEscape(r.erasure_id()) +
                  "\",\"state\":\"" + (complete ? "complete" : "initiated") +
-                 "\",\"awaiting\":" + awaiting + "}");
+                 "\",\"awaiting\":" + awaiting +
+                 ",\"erasure_ids\":" + ids + "}");
     }
 
     // What an auditor is shown: who erased what, when, which services have

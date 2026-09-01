@@ -152,9 +152,14 @@ if [ -z "$UID1" ]; then bad "create a file to erase" "no uid returned"; else
     # ── 4. Erasing twice is refused ─────────────────────────────────────────
     # Not pedantry: a second run would destroy nothing, report success, and
     # attest to a destruction that did not happen on that occasion.
-    [ "$ecode" = "202" ] || [ "$ecode" = "200" ] \
-        && bad "a second erasure is refused" "got $ecode" \
-        || ok "a second erasure is refused ($ecode)"
+    # Written as an if, not an || && || chain: that chain evaluates left to
+    # right, so `A || B && C || D` ran C whenever B was true and reported a
+    # failure that had not happened.
+    if [ "$ecode" = "202" ] || [ "$ecode" = "200" ]; then
+        bad "a second erasure is refused" "got $ecode"
+    else
+        ok "a second erasure is refused ($ecode)"
+    fi
 
     # ── 5. The attestation record ───────────────────────────────────────────
     echo "[attestation]"
@@ -262,6 +267,78 @@ else
     grep -q '"completed_at":0' <<<"$st" \
         && bad "the completion is timestamped" "completed_at is 0 in $st" \
         || ok "the completion is timestamped"
+fi
+
+# ── 5d. Erasing a FOLDER erases what is in it, attestably ───────────────────
+# The flaw this pins: a folder's members were treated as RENDITIONS and erased
+# with NO participants, so their content was destroyed in the core while csai,
+# discussion and difference were never asked to purge theirs. Verified in
+# production — a document inside an erased folder kept its text and embedding in
+# the search index, with nothing outstanding to show it. And the walk was one
+# level, so a subfolder's contents survived entirely.
+echo "[folder erasure]"
+FDIR=$(api "$ETOKEN" POST "/v1/dirs/root" "{\"name\":\"erase-tree-$STAMP\"}" \
+       | grep -oE '"uid":"[^"]+"' | head -1 | sed 's/.*"uid":"//;s/"//')
+if [ -z "$FDIR" ]; then skip "folder erasure (could not create a folder)"; else
+    SUB=$(api "$ETOKEN" POST "/v1/dirs/$FDIR" "{\"name\":\"nested\"}" \
+          | grep -oE '"uid":"[^"]+"' | head -1 | sed 's/.*"uid":"//;s/"//')
+    mkin() {  # mkin <parent> <name> -> uid
+        local uid
+        uid=$(api "$ETOKEN" POST "/v1/dirs/$1/files" "{\"name\":\"$2\"}" \
+              | grep -oE '"uid":"[^"]+"' | head -1 | sed 's/.*"uid":"//;s/"//')
+        curl -s -X PUT "$BASE/v1/files/$uid/content" -H "Authorization: Bearer $ETOKEN" \
+             -H "X-Tenant: $TENANT" --data-binary "party data" --max-time 30 -o /dev/null
+        printf '%s' "$uid"
+    }
+    TOP=$(mkin "$FDIR" "top-$STAMP.txt")
+    DEEP=$(mkin "$SUB" "deep-$STAMP.txt")
+    ok "built a folder with a file and a nested subfolder"
+
+    resp=$(api "$ETOKEN" POST "/v1/files/$FDIR/erase" '{"reason":"folder e2e"}')
+    n=$(grep -o '"erasure_ids":\[[^]]*\]' <<<"$resp" | grep -o '"' | wc -l)
+    n=$(( n / 2 ))
+    # root + subfolder + 2 files = 4 records, one per node.
+    [ "$n" -ge 4 ] && ok "every node in the subtree got its own erasure record ($n)" \
+                   || bad "one erasure record per node" "got $n from $resp"
+
+    # The nested file is the one the old code never reached at all.
+    for u in "$TOP" "$DEEP"; do
+        c=$(code_of "$ETOKEN" GET "/v1/files/$u/content")
+        [ "$c" != "200" ] && ok "content destroyed ($u)" || bad "content destroyed" "$u still 200"
+    done
+
+    # And the part that actually mattered: each FILE must carry participants, so
+    # the services holding its derived copies are asked. A record with an empty
+    # awaiting list on a file means nobody was ever told.
+    for u in "$TOP" "$DEEP"; do
+        eid=$(api "$ETOKEN" GET "/v1/dirs/root" >/dev/null; \
+              grep -o '"erasure_ids":\[[^]]*\]' <<<"$resp" >/dev/null; echo "")
+    done
+    missing=0
+    for eid in $(grep -o '"erasure_ids":\[[^]]*\]' <<<"$resp" | tr -d '[]"' | sed 's/erasure_ids://' | tr ',' ' '); do
+        st=$(api "$ETOKEN" GET "/v1/erasures/$eid")
+        # Renditions legitimately have none; a FILE with content must have some.
+        if grep -q '"state":"initiated"' <<<"$st" || grep -qE '"awaiting":\[\s*"' <<<"$st"; then
+            :   # has participants outstanding — correct for a real file
+        fi
+    done
+    # Direct assertion: the two documents' own records name participants.
+    for u in "$TOP" "$DEEP"; do
+        found=0
+        for eid in $(grep -o '"erasure_ids":\[[^]]*\]' <<<"$resp" | tr -d '[]"' | sed 's/erasure_ids://' | tr ',' ' '); do
+            st=$(api "$ETOKEN" GET "/v1/erasures/$eid")
+            if grep -q "\"uid\":\"$u\"" <<<"$st"; then
+                found=1
+                if grep -qE '"awaiting":\[\s*\]' <<<"$st" && grep -q '"acks":\[\]' <<<"$st"; then
+                    bad "the document's erasure asks the services ($u)" \
+                        "no participants — its derived copies were never requested"
+                else
+                    ok "the document's erasure asks the services ($u)"
+                fi
+            fi
+        done
+        [ "$found" = "1" ] || bad "the document has an erasure record of its own ($u)" "none found"
+    done
 fi
 
 # ── 6. Soft delete is NOT erasure ───────────────────────────────────────────
