@@ -1100,6 +1100,23 @@ std::vector<std::string> LDAPAuthenticator::extractRolesFromGroups(LDAP* ld, con
         webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: mapped 'administrators' group -> 'tenant_admin' role");
     }
 
+    // Map the tenant "erasure_admins" group to the erasure_admin role — a
+    // tenant_admin who may additionally ERASE.
+    //
+    // Its own group, deliberately NOT implied by "administrators". Erasure is
+    // irreversible and exists to discharge a legal obligation, so the population
+    // holding it should be small and moving someone into it should be a visible
+    // act in the directory. An administrator GRANTS this by managing that
+    // group's membership; being an administrator does not confer it.
+    //
+    // The group name is plural to match "administrators", and distinct from the
+    // ROLE name (singular) it maps to, exactly as administrators -> tenant_admin.
+    if (std::find(roles.begin(), roles.end(), "erasure_admins") != roles.end() &&
+        std::find(roles.begin(), roles.end(), "erasure_admin") == roles.end()) {
+        roles.push_back("erasure_admin");
+        webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: mapped 'erasure_admins' group -> 'erasure_admin' role");
+    }
+
     return roles;
 }
 
