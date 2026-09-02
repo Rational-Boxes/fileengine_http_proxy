@@ -61,6 +61,14 @@ struct Config {
     std::string jwt_secret;                  // HS256 shared secret (REQUIRED)
     std::string jwt_issuer = "fileengine-bridge";
     long max_body_bytes = 100L * 1024 * 1024;  // 100 MiB request-body cap
+    // Separate allowance for the ONE route that streams. PUT /v1/files/{uid}/
+    // content reads 256 KiB at a time into the gRPC stream and never holds the
+    // body, so the limit that protects the buffered JSON handlers is the wrong
+    // limit for it — and it was the binding one: nginx allows 1 GiB in front,
+    // the bridge refused at 100 MiB, so a video failed with "request body too
+    // large" a tenth of the way to the edge's actual ceiling. 0 = no bridge
+    // limit, leaving the edge (client_max_body_size) as the ceiling.
+    long max_upload_bytes = 5368709120L;  // 5 GiB
     std::string cors_origin;                   // legacy single origin (HTTP_CORS_ORIGIN)
     std::vector<std::string> cors_origins;     // allow-list (HTTP_CORS_ORIGINS CSV + the legacy one); exact match, never "*"
     std::string grpc_address = "localhost:50051";

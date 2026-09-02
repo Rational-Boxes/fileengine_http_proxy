@@ -288,9 +288,17 @@ public:
         }
 
         // Reject over-large declared bodies up front (413).
+        //
+        // Two limits, because there are two kinds of route behind this guard.
+        // The streaming upload never holds the body; every other handler copies
+        // it whole into a std::string. One number for both meant the upload cap
+        // had to be as small as the JSON cap could safely be.
         std::streamsize clen = req.getContentLength();
+        const long body_cap = webdav::isStreamingUploadPath(method, path)
+                                  ? cfg_.max_upload_bytes
+                                  : cfg_.max_body_bytes;
         if (clen != Poco::Net::HTTPMessage::UNKNOWN_CONTENT_LENGTH &&
-            static_cast<long>(clen) > cfg_.max_body_bytes) {
+            body_cap > 0 && static_cast<long>(clen) > body_cap) {
             sendJson(resp, HTTPResponse::HTTP_REQUEST_ENTITY_TOO_LARGE, R"({"error":"request body too large"})");
             return accessLog(method, path, resp, start);
         }

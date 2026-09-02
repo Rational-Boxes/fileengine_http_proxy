@@ -400,4 +400,20 @@ int httpStatusForCoreError(const std::string& err) {
     return 500;
 }
 
+bool isStreamingUploadPath(const std::string& method, const std::string& path) {
+    if (method != "PUT") return false;
+    // /v1/files/{uid}/content — exactly. Not a prefix match: /v1/files/{uid}/
+    // content/anything-else is a different route and must not inherit the
+    // upload allowance.
+    static const std::string kPrefix = "/v1/files/";
+    static const std::string kSuffix = "/content";
+    if (path.size() <= kPrefix.size() + kSuffix.size()) return false;
+    if (path.compare(0, kPrefix.size(), kPrefix) != 0) return false;
+    if (path.compare(path.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) return false;
+    // The middle must be one path segment (the uid) and nothing more.
+    const std::string mid = path.substr(kPrefix.size(),
+                                        path.size() - kPrefix.size() - kSuffix.size());
+    return !mid.empty() && mid.find('/') == std::string::npos;
+}
+
 } // namespace webdav

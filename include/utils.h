@@ -94,6 +94,23 @@ std::string getErrorMessage(int error_code);
  */
 int httpStatusForCoreError(const std::string& err);
 
+/**
+ * Is this request the STREAMING content upload?
+ *
+ * It matters because the bridge's body-size guard runs before routing, and the
+ * routes behind it fall into two very different classes. Every JSON handler
+ * copies the whole body into a std::string (readBody), so for those the cap is
+ * the only thing standing between an authenticated caller and the heap.
+ * `PUT /v1/files/{uid}/content` never buffers — it reads 256 KiB at a time
+ * straight into the gRPC stream — so the same number applied to both means
+ * either uploads are small or JSON bodies are dangerous.
+ *
+ * Pure so the classification can be tested: it decides which limit applies, and
+ * getting it wrong in the permissive direction is a memory-exhaustion bug that
+ * no test of the upload path would notice.
+ */
+bool isStreamingUploadPath(const std::string& method, const std::string& path);
+
 // Logging utilities
 void logMessage(const std::string& level, const std::string& message);
 bool shouldLogToConsole();
