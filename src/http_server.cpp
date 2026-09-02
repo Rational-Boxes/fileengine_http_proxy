@@ -261,10 +261,11 @@ public:
                    std::shared_ptr<OAuthProvider> oauth,
                    std::shared_ptr<OAuthStateStore> oauth_states,
                    std::shared_ptr<AuditPublisher> audit,
-                   std::shared_ptr<SessionStore> sessions)
+                   std::shared_ptr<SessionStore> sessions,
+                   std::shared_ptr<TokenDenylist> denylist)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
           oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
-          sessions_(std::move(sessions)) {}
+          sessions_(std::move(sessions)), denylist_(std::move(denylist)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -1654,6 +1655,31 @@ private:
                 unauthorized(req, resp);
                 return false;
             }
+            // Signature and exp are satisfied — but that is all a stateless JWT
+            // can tell us, and it is not enough to say the session still exists.
+            // Ask the denylist whether this jti was signed out.
+            //
+            // FIRST, before mfa_pending / typ / tenant-membership: those answer
+            // "what is this token allowed to do", and there is no point asking
+            // that about a token that is no longer anyone's. A jti we cannot get
+            // a verdict on is refused, not waved through — see token_denylist.h.
+            {
+                const std::string jti = claims->optValue<std::string>("jti", std::string());
+                if (!denylist_->permits(jti)) {
+                    webdav::debugLog("authenticate: rejected a revoked token (jti " + jti + ")");
+                    // Worth recording: a revoked token being presented is either a
+                    // client that has not noticed it was signed out, or a copy of
+                    // one that outlived the session. Best-effort — a token that
+                    // must not be honoured is not honoured because the audit sink
+                    // is busy.
+                    audit_->emitAuth("token_revoked_use", "denied",
+                                     claims->optValue<std::string>("sub", std::string()),
+                                     claims->optValue<std::string>("tenant", std::string()),
+                                     clientIp(req));
+                    unauthorized(req, resp);
+                    return false;
+                }
+            }
             // A pre-auth challenge token (issued before the 2FA step) carries no
             // roles and MUST NOT reach any resource — reject it here (defence in
             // depth; it also has no roles, so it would authorize nothing anyway).
@@ -2573,11 +2599,20 @@ private:
     }
 
     void revokeToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
-        // The JWT itself stays stateless (it still expires within token_ttl), but
-        // logout now actively cuts the WebDAV session-presence entry (PROPOSAL §14)
-        // so external WebDAV stops working immediately — and records the logout for
-        // the audit trail. Both are best-effort and never block the 204.
+        // Sign-out. Three things happen, and only one of them used to:
+        //
+        //   1. the jti goes on the shared denylist, so the token stops being
+        //      honoured HERE and on every other bridge instance;
+        //   2. the WebDAV session-presence entry is cut (PROPOSAL §14), so
+        //      external WebDAV stops immediately;
+        //   3. the logout is recorded for the audit trail.
+        //
+        // (1) is the one that makes this a sign-out at all. Without it the token
+        // remained valid for the rest of token_ttl in every copy of it — another
+        // tab, a script, anything that had read localStorage — and the 204 said
+        // the session had ended when nothing had.
         std::string h = req.get("Authorization", "");
+        bool revoked = true;
         if (h.compare(0, 7, "Bearer ") == 0) {
             Poco::JSON::Object::Ptr claims;
             std::string err;
@@ -2587,9 +2622,27 @@ private:
                 const std::string tenant = claims->optValue<std::string>("tenant", std::string());
                 const std::string jti = claims->optValue<std::string>("jti", std::string());
                 const std::string ip = clientIp(req);
-                audit_->emitAuth("logout", "ok", sub, tenant, ip);
+                // Only for as long as the token had left to live. Past that it is
+                // refused on exp alone and the entry would be dead weight.
+                const long exp = claims->optValue<Poco::Int64>("exp", 0);
+                revoked = denylist_->revoke(jti, static_cast<int>(exp - now));
+                audit_->emitAuth("logout", revoked ? "ok" : "error", sub, tenant, ip);
                 dropSession(tenant, sub, jti, ip);
+                if (!revoked) {
+                    webdav::errorLog("logout: could not record the revocation for jti " + jti +
+                                     " — the token remains valid until it expires");
+                }
             }
+        }
+        // Say which of the two happened. The client clears its own copy either
+        // way, but a sign-out that could not be enforced must not answer with the
+        // same 204 as one that was: that is how the old behaviour passed for
+        // working. 503 rather than 500 — the store is unavailable, not wrong, and
+        // retrying is the right response.
+        if (!revoked) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"revocation_unavailable","error_description":)"
+                            R"("signed out locally, but the token could not be revoked server-side"})");
         }
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
@@ -2681,6 +2734,7 @@ private:
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
+    std::shared_ptr<TokenDenylist> denylist_;
     // Per-tenant WebDAV session-TTL cache (tenant -> {ttl_seconds, expiry-epoch}),
     // so the login/refresh path doesn't call ldap_manager on every request.
     inline static std::mutex sessTtlMu_;
@@ -2734,10 +2788,11 @@ public:
                    std::shared_ptr<OAuthProvider> oauth,
                    std::shared_ptr<OAuthStateStore> oauth_states,
                    std::shared_ptr<AuditPublisher> audit,
-                   std::shared_ptr<SessionStore> sessions)
+                   std::shared_ptr<SessionStore> sessions,
+                   std::shared_ptr<TokenDenylist> denylist)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
           oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
-          sessions_(std::move(sessions)) {}
+          sessions_(std::move(sessions)), denylist_(std::move(denylist)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& req) override {
         // Shed before doing any work, but never the monitoring paths: an
@@ -2750,7 +2805,8 @@ public:
             shed_total_.fetch_add(1);
             return new OverloadHandler();
         }
-        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_);
+        return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_,
+                                 sessions_, denylist_);
     }
 
     // Set once the server exists (the factory is built first, to be handed to it).
@@ -2774,6 +2830,7 @@ private:
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
+    std::shared_ptr<TokenDenylist> denylist_;
 };
 
 }  // namespace
@@ -2790,7 +2847,11 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
           cfg.redis_db, cfg.audit_stream, cfg.audit_stream_maxlen})),
       sessions_(std::make_shared<SessionStore>(SessionStore::Options{
           cfg.webdav_ip_binding_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
-          cfg.redis_db, "webdav:session:"})) {}
+          cfg.redis_db, "webdav:session:"})),
+      denylist_(std::make_shared<TokenDenylist>(TokenDenylist::Options{
+          cfg.revocation_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
+          cfg.redis_db, "auth:revoked:", cfg.revocation_cache_ttl,
+          cfg.revocation_fail_open})) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -2919,7 +2980,8 @@ void HttpBridgeServer::start() {
 
     // Held so the factory can ask the server how deep its queue is; the server
     // owns the factory, so this pointer stays valid for the server's lifetime.
-    auto* factory = new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_, sessions_);
+    auto* factory = new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_,
+                                       sessions_, denylist_);
     server_ = std::make_unique<Poco::Net::HTTPServer>(factory, *pool_, socket, params);
     // Start shedding once the backlog is several times the worker count: enough
     // headroom that an ordinary burst still queues and succeeds, low enough that

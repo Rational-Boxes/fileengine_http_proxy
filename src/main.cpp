@@ -211,6 +211,25 @@ int main() {
     }
     cfg.webdav_session_ttl_default = std::stoi(webdav::getEnvOrDefault("WEBDAV_IP_BIND_TTL_SECONDS", "43200"));
 
+    // Revoked-token denylist (shared, in the same Redis). ON by default: a
+    // stateless session token that outlives its own sign-out is a defect, not a
+    // feature to opt into, and every deployment that runs this bridge already
+    // runs the Redis it needs. A deployment that genuinely cannot must turn it
+    // off deliberately — the startup gate below refuses to pretend.
+    {
+        std::string re = webdav::getEnvOrDefault("AUTH_REVOCATION_ENABLED", "true");
+        cfg.revocation_enabled = (re == "1" || re == "true" || re == "yes" || re == "on");
+        // How long a verdict is cached, and therefore the worst-case lag between
+        // signing out and the token dying. 0 asks Redis on every request.
+        cfg.revocation_cache_ttl =
+            std::stoi(webdav::getEnvOrDefault("AUTH_REVOCATION_CACHE_TTL_SECONDS", "5"));
+        // Honour tokens whose revocation status cannot be established. Trades the
+        // sign-out guarantee for availability during a Redis outage; off unless
+        // asked for, because failing open here silently restores the old bug.
+        std::string fo = webdav::getEnvOrDefault("AUTH_REVOCATION_FAIL_OPEN", "");
+        cfg.revocation_fail_open = (fo == "1" || fo == "true" || fo == "yes" || fo == "on");
+    }
+
     auto grpc = std::make_shared<webdav::GRPCClientWrapper>(cfg.grpc_address);
     auto ldap = std::make_shared<webdav::LDAPAuthenticator>(
         webdav::getEnvOrDefault("FILEENGINE_LDAP_ENDPOINT", "ldap://localhost:1389"),
@@ -233,6 +252,21 @@ int main() {
     if (!server.auditReady()) {
         webdav::errorLog("FATAL: FILEENGINE_AUDIT_ENABLED=true but the audit log is "
                          "unavailable (built without hiredis, or Redis unreachable). Refusing to start.");
+        Poco::Net::uninitializeSSL();
+        return 1;
+    }
+
+    // Same gate, same reasoning, for sign-out. Running with revocation enabled but
+    // no reachable denylist would mean every logout reported success while the
+    // token stayed live — the exact failure this feature exists to end, and
+    // invisible from the outside. Fail-open deployments have already accepted
+    // that trade explicitly, so they are not held back here.
+    if (!server.revocationReady()) {
+        webdav::errorLog("FATAL: AUTH_REVOCATION_ENABLED=true but the token denylist is "
+                         "unavailable (built without hiredis, or Redis unreachable). "
+                         "Refusing to start: sign-out could not be enforced. Set "
+                         "AUTH_REVOCATION_FAIL_OPEN=true to run anyway, or "
+                         "AUTH_REVOCATION_ENABLED=false to disable revocation.");
         Poco::Net::uninitializeSSL();
         return 1;
     }

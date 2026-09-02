@@ -29,6 +29,7 @@
 #include "oauth_provider.h"
 #include "oauth_state_store.h"
 #include "token_store.h"
+#include "token_denylist.h"
 
 namespace httpbridge {
 
@@ -113,6 +114,14 @@ struct Config {
     // fallback when that lookup is unavailable.
     bool webdav_ip_binding_enabled = false;
     int webdav_session_ttl_default = 43200;  // 12h fallback score window
+
+    // Revoked-token denylist, keyed by jti, in the same Redis. Session tokens are
+    // stateless JWTs, so without this DELETE /v1/auth/token ends nothing: the
+    // token keeps working, in every other copy of it, until exp. See
+    // token_denylist.h for the fail-closed reasoning and the cache trade-off.
+    bool revocation_enabled = true;
+    int revocation_cache_ttl = 5;       // seconds a verdict is trusted = revocation latency
+    bool revocation_fail_open = false;  // honour a token whose status is unknown
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -132,6 +141,15 @@ public:
     // without hiredis, or Redis unreachable). Startup gate + probe helper (A-i).
     bool auditReady() { return !audit_->enabled() || audit_->healthy(); }
 
+    // True unless revocation is enabled but the denylist cannot be reached
+    // (built without hiredis, or Redis unreachable). Same startup gate as
+    // auditing, for the same reason: "enabled but unable to revoke" must not run
+    // as though sign-out worked. Fail-open deployments have said they would
+    // rather serve requests, so they are not gated.
+    bool revocationReady() {
+        return !denylist_->enabled() || denylist_->failOpen() || denylist_->healthy();
+    }
+
 private:
     Config cfg_;
     std::shared_ptr<webdav::GRPCClientWrapper> grpc_;
@@ -141,6 +159,7 @@ private:
     std::shared_ptr<OAuthStateStore> oauth_states_;
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
+    std::shared_ptr<TokenDenylist> denylist_;
     // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
     // it is destroyed *after* the server stops using it.
     std::unique_ptr<Poco::ThreadPool> pool_;
