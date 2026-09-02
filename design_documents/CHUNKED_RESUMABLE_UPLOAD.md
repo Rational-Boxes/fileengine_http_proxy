@@ -138,9 +138,21 @@ mid-rename. None of these is exceptional. Without something that removes them,
 `UPLOAD_SESSION_DIR` only ever grows, and the failure is a full disk on the
 host that also runs the core and the database.
 
-So a **sentinel sweep** runs inside the bridge on an interval, plus once at
-startup — startup because the crash that orphaned a session is exactly the event
-that also stopped the timer.
+So a **sentinel sweep** runs in two places, which between them cover the two
+states a deployment is ever in:
+
+- **On upload start**, in `create()`. This is close to free: `create()` already
+  walks the session root to enforce `UPLOAD_MAX_SESSIONS_PER_USER`, so the sweep
+  rides the walk that is happening anyway. It also has the right shape — the
+  moment someone needs disk is the moment worth reclaiming it — and it keeps a
+  busy deployment clean without anything scheduled at all.
+- **On a systemd timer**, for the case sweep-on-start cannot reach: a deployment
+  where nobody uploads for a week still accumulated detritus from the week
+  before. This matches how audit retention is already run on this host.
+
+Deliberately no in-process interval thread. Sweep-on-start covers active use and
+the timer covers idle, so a third mechanism would only add a thread whose death
+is silent.
 
 ### What counts as orphaned
 
@@ -175,6 +187,34 @@ bridge should refuse to start with a clear message if it is not — a sweep that
 outruns the resume window silently deletes sessions clients are still entitled
 to finish, and the symptom would be indistinguishable from Issue 1.
 
+### How the timer reaches the parts
+
+This is the part that has to be got right, because the obvious implementation is
+wrong.
+
+**Not** a host-side `find <dir> -mtime +2 -delete`. That path knows nothing about
+manifests, `expires`, or which parts belong to a session still being written; it
+would eventually delete a live upload, and the report would say it succeeded.
+
+Instead the timer invokes the **bridge's own sweep**, so exactly one
+implementation of "what is orphaned" exists:
+
+```
+fileengine-upload-sweep.timer  ─▶  .service
+      └─ podman exec fileengine-http-bridge fileengine-upload-sweep
+```
+
+A small command in the bridge image, reading the same `UPLOAD_SESSION_DIR` and
+`UPLOAD_CULL_AGE_SECONDS` as the server, so the policy cannot drift between the
+two callers. Running it *inside the container* also means it sweeps the parts of
+**that instance** — which is what keeps this correct if there is ever more than
+one bridge, and is why the mechanism is `podman exec` rather than a path on the
+host.
+
+Schedule and jitter live in the timer unit (`OnUnitActiveSec`,
+`RandomizedDelaySec`), not in bridge configuration — that is what a timer is
+for, and it means the interval can be changed without touching the service.
+
 ### Reporting
 
 The sweep logs what it removed (sessions, files, bytes reclaimed) and exports
@@ -203,8 +243,12 @@ all still to be built.
 | `UPLOAD_MAX_PART_BYTES` | 128 MiB | largest part |
 | `UPLOAD_TTL_SECONDS` | 86400 | abandoned sessions expire |
 | `UPLOAD_MAX_SESSIONS_PER_USER` | 8 | bounds disk held by one user |
-| `UPLOAD_SWEEP_INTERVAL_SECONDS` | 3600 | how often the sentinel sweep runs; `0` disables it |
+| `UPLOAD_SWEEP_ON_CREATE` | `true` | sweep during the directory walk `create()` already does |
 | `UPLOAD_CULL_AGE_SECONDS` | 172800 | nothing modified more recently than this is removed (48h) |
+
+The sweep **interval** is deliberately not here: it belongs to the systemd timer
+(`OnUnitActiveSec`), so it can be changed without a bridge restart. Suggested
+hourly with a randomised delay, alongside the existing audit-retention timer.
 
 Part count is additionally capped at 10 000, so a tiny `chunk_size` on a huge
 file cannot create a directory with hundreds of thousands of entries.
@@ -254,23 +298,25 @@ A named volume (and headroom for concurrent uploads) has to be added to the
 Ansible role and compose before this is worth shipping. **This is a blocker for
 deployment, not for review.**
 
-### 3. Sweep defaults — DECIDED in principle, numbers still open
+### 3. Sweep — DECIDED; numbers and packaging still open
 
-The sentinel sweep is now part of the design (see
-[Sentinel sweep](#sentinel-sweep)) rather than an open question: it runs in the
-bridge on `UPLOAD_SWEEP_INTERVAL_SECONDS`, plus once at startup, and removes
-nothing younger than `UPLOAD_CULL_AGE_SECONDS`.
+Settled: sweep on upload start, plus a systemd timer (see
+[Sentinel sweep](#sentinel-sweep)). Sweep-on-start covers a busy deployment and
+costs almost nothing, because `create()` already walks the directory; the timer
+covers an idle one, which sweep-on-start alone never would.
 
-In-process rather than a systemd timer, because parts are local to the instance
-that holds them — an external timer would have to be told where they are and
-would do the wrong thing the moment there were two bridges. It is the same
-reasoning as Issue 1, and if that is resolved by moving parts to shared or
-object storage, the sweep should move with them.
+Still to decide or build:
 
-What is still open is the **numbers**: 1h interval and a 48h cull age against a
-24h session TTL. The constraint is only that the cull age exceed the TTL; the
-margin between them is a judgement about how long a stalled upload deserves to
-hold disk, and I would rather you set it than inherit my guess.
+- **The numbers.** 48h cull age against a 24h session TTL, timer hourly. The
+  only hard constraint is cull age > TTL; the margin is a judgement about how
+  long a stalled upload deserves to hold disk.
+- **The `fileengine-upload-sweep` command does not exist yet**, nor the timer
+  and service units in the Ansible role. Both are prerequisites for shipping.
+- **What sweep-on-start does when the directory is large.** It is bounded by
+  `UPLOAD_MAX_SESSIONS_PER_USER` in the normal case, but a directory that has
+  accumulated detritus for months makes the first upload after a restart pay for
+  all of it. A cap on work per invocation — sweep at most N sessions, leave the
+  rest to the timer — would keep that off the request path.
 
 ### 4. Disk is bounded by session count, not by bytes
 
