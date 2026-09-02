@@ -1,6 +1,8 @@
 # http_bridge — chunked / resumable upload
 
-Status: **Proposed.** A working prototype exists on `feature/resumable-chunked-upload`
+Status: **Proposed**, with the integrity model, the sweep and the
+staging location settled (see [Decisions](#decisions)). A working prototype
+exists on `feature/resumable-chunked-upload`
 (bridge + SPA), verified against a live stack but **not merged and not deployed**.
 This document is the design put up for review; the open questions in
 [Issues for review](#issues-for-review) are the parts I do not think should be
@@ -29,6 +31,21 @@ all or nothing: a connection lost at 900 MB of a 1 GB file starts again at zero.
 On a phone, a hotel network, or a laptop that sleeps, that is the ordinary case
 rather than the unlucky one — and it is the one thing raising a byte limit
 cannot help with.
+
+## Decisions
+
+Settled in review; the reasoning is in the sections named.
+
+| Question | Decision |
+|---|---|
+| Where partial uploads are staged | **In the bridge**, on local disk. An append operation in the core was worked through and declined — [appendix](#appendix-an-append-operation-in-the-core) |
+| Per-part integrity | **Required** `Content-Digest` on every part, verified on arrival and again at commit — [Part integrity](#part-integrity) |
+| Whole-upload integrity | **Content root** over the part digests, declared by the client at commit and enforced by the bridge; plain `sha256` optional |
+| Reclaiming orphaned parts | **Sweep on upload start, plus a systemd timer** invoking the bridge's own sweep — [Sentinel sweep](#sentinel-sweep) |
+| Hashing on the client | **In a Web Worker.** WASM only if measurement justifies it |
+
+Still open: the numbers (thresholds, cull age, chunk size), the deployment
+plumbing, and the items under [Issues for review](#issues-for-review).
 
 ## Goals
 
@@ -547,10 +564,12 @@ streamed reads as defence in depth.
   from the data path entirely and is how large systems usually do this. Rejected
   for now: it bypasses the core's compress/encrypt pipeline and its permission
   model, which is a much larger architectural change than it first looks.
-- **An append RPC in the core.** Attractive enough to be worked through properly
-  rather than dismissed in a line — see [Appendix: an append operation in the
-  core](#appendix-an-append-operation-in-the-core). The conclusion is *not now*,
-  and the reason is more interesting than "it is a proto change".
+- **An append RPC in the core.** Worked through rather than dismissed in a line,
+  and **decided against for now** — see [Appendix: an append operation in the
+  core](#appendix-an-append-operation-in-the-core). The reason is sharper than
+  "it is a proto change": the core encrypts with AES-256-GCM, whose tag is
+  computed over the whole message in order, so appending to the stored format is
+  inherently ordered while resumable upload is inherently unordered.
 - **Parts in Redis.** Rejected: gigabytes of binary in a store that everything
   else depends on for auth and audit.
 
@@ -659,7 +678,7 @@ becomes a container of blocks rather than one stream.
 | Parts are independently verifiable and independently repairable | Compression ratio drops — no dictionary shared across parts |
 | This is essentially how object-store multipart already works | The largest change of the three, in the most critical component |
 
-### Recommendation: not now, and the reason matters
+### Decision: not now — parts stay in the bridge
 
 **A moves the problem rather than removing it.** The parts still have to live
 somewhere, still need sweeping, still need a quota — the only thing that changes
@@ -676,9 +695,12 @@ stores do, and it makes every problem in this document go away. It is also a
 storage-format change in the core, with a migration path for every file already
 stored, to serve one door's upload ergonomics. That is disproportionate today.
 
-So: keep the parts in the bridge. **Revisit the append operation when one of
-these becomes true**, at which point the arithmetic changes rather than the
-argument:
+**Decided: the parts stay in the bridge.** The three shapes above are recorded
+so the reasoning does not have to be rebuilt, not because the question is still
+open.
+
+**Revisit when one of these becomes true**, at which point the arithmetic
+changes rather than the argument:
 
 1. **A second door needs resumable upload.** WebDAV or MCP wanting the same
    thing turns bridge-side staging from a local choice into duplication, and the
