@@ -369,4 +369,35 @@ void errorLog(const std::string& message) {
     }
 }
 
+int httpStatusForCoreError(const std::string& err) {
+    if (err.find("permission") != std::string::npos) return 403;
+    // The core's root-directory guard refuses in its own words rather than the
+    // word "permission", so it fell through to 500 — a plain authorization
+    // refusal reported as a server fault. Found while fixing the erased-content
+    // case below: same mapper, same class of mistake.
+    if (err.find("Only an admin") != std::string::npos) return 403;
+    if (err.find("not exist") != std::string::npos ||
+        err.find("not found") != std::string::npos) return 404;
+
+    // "No versions available" — the file row is there but has no content to
+    // return. Two ways to arrive: the file was ERASED (§5.4 destroys every
+    // version and leaves a tombstone), or it was created and nothing has been
+    // written to it yet. Neither is a server fault, and answering 500 said it
+    // was: every read of an erased file raised an alertable error for a state
+    // the erasure feature is supposed to produce.
+    //
+    // 404 rather than 410, even though 410 ("existed, permanently gone") is the
+    // better description of an erasure. The door cannot tell the two cases
+    // apart — the core's FileInfo has no `erased` flag and neither does the
+    // proto's — and answering 410 for a newly created empty file would be a
+    // worse lie than answering 404 for an erased one. Distinguishing them means
+    // carrying `erased` through types.h, the proto and its four consumers; when
+    // that exists, the erased case should become 410.
+    if (err.find("No versions available") != std::string::npos) return 404;
+
+    if (err.find("subtree") != std::string::npos ||
+        err.find("already") != std::string::npos) return 409;
+    return 500;
+}
+
 } // namespace webdav

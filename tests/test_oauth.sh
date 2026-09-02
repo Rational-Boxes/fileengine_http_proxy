@@ -13,8 +13,13 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$HERE/build/http_bridge"
-PORT="${PORT:-8097}"
-IDP_PORT="${IDP_PORT:-8098}"
+# NOT 8097/8098 any more: the dev stack took those for audit_service and
+# bcf_service. Colliding there was worse than a clean failure — the bridge could
+# not bind, the liveness probe hit the AUDIT service's /healthz and got its 200,
+# so the suite decided the bridge was up and then failed twelve checks against
+# somebody else's 404s.
+PORT="${PORT:-8397}"
+IDP_PORT="${IDP_PORT:-8398}"
 BASE="http://localhost:$PORT"
 IDP="http://127.0.0.1:$IDP_PORT"
 RETURN_OK="http://localhost:3000/oauth/callback"
@@ -68,6 +73,9 @@ export HTTP_PORT="$PORT"
 export FILEENGINE_GRPC_HOST=127.0.0.1 FILEENGINE_GRPC_PORT=59999  # no core needed here
 export FILEENGINE_LDAP_ENDPOINT="ldap://127.0.0.1:59998"          # unreachable => 403 on lookup
 export LOG_LEVEL=warn
+# The bridge refuses to start without one, and this instance signs its own
+# tokens. Any value will do — it is thrown away with $TMP.
+export FILEENGINE_JWT_SECRET="${FILEENGINE_JWT_SECRET:-oauth-suite-throwaway-secret-0123456789}"
 export OAUTH_REDIRECT_BASE="$BASE"
 export OAUTH_RETURN_ALLOWLIST="http://localhost:3000/"
 export OAUTH_STATE_TTL_SECONDS=300
@@ -78,6 +86,15 @@ export OAUTH_MOCK_KIND=oidc OAUTH_MOCK_CLIENT_ID=cid OAUTH_MOCK_CLIENT_SECRET=se
 export OAUTH_MOCKUNVERIFIED_KIND=oidc OAUTH_MOCKUNVERIFIED_CLIENT_ID=cid OAUTH_MOCKUNVERIFIED_CLIENT_SECRET=sec \
        OAUTH_MOCKUNVERIFIED_AUTH_URL="$IDP/authorize" OAUTH_MOCKUNVERIFIED_TOKEN_URL="$IDP/token" \
        OAUTH_MOCKUNVERIFIED_USERINFO_URL="$IDP/userinfo_unverified" OAUTH_MOCKUNVERIFIED_SCOPES="openid email"
+
+# This suite stands up its OWN bridge, with no Redis behind it — that is the
+# point of being self-contained. The revoked-token denylist is fail-closed and
+# the bridge refuses to start when it cannot reach one, so it has to be turned
+# off here explicitly. Opting out is the honest way to say "this instance does
+# not enforce sign-out": the alternative, letting it boot and quietly not
+# revoke, is the behaviour the denylist exists to end. Revocation has its own
+# suite — tests/test_e2e_revocation.sh.
+export AUTH_REVOCATION_ENABLED=false
 
 ( cd "$TMP" && "$BIN" ) > "$TMP/bridge.log" 2>&1 & BRIDGE_PID=$!
 
