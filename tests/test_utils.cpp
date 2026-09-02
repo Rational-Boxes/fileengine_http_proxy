@@ -367,3 +367,50 @@ TEST(CoreErrorStatus, TheRootDirectoryGuardIsARefusalNotAFault) {
     EXPECT_EQ(webdav::httpStatusForCoreError(
         "Only an admin (system_admin or tenant_admin) can create in the root directory"), 403);
 }
+
+// ---------------------------------------------------------------------------
+// Which requests get the streaming-upload allowance.
+//
+// The body-size guard runs before routing over two very different classes of
+// route: PUT /v1/files/{uid}/content streams into gRPC and never holds the
+// body, while fifteen other handlers copy theirs whole into a std::string. This
+// decides which limit applies, and a false positive here hands the large
+// allowance to a route that buffers — a memory-exhaustion bug that no test of
+// the upload path itself would notice.
+// ---------------------------------------------------------------------------
+
+TEST(StreamingUploadPath, TheContentPutGetsTheUploadAllowance) {
+    EXPECT_TRUE(webdav::isStreamingUploadPath(
+        "PUT", "/v1/files/2b1c8f1e-0000-4000-8000-000000000000/content"));
+}
+
+TEST(StreamingUploadPath, OnlyPut) {
+    // GET/POST on the same path are different handlers; POST .../content is not
+    // a route at all, and must not inherit the allowance if one is ever added.
+    for (const char* m : {"GET", "POST", "DELETE", "HEAD"}) {
+        EXPECT_FALSE(webdav::isStreamingUploadPath(m, "/v1/files/abc/content")) << m;
+    }
+}
+
+TEST(StreamingUploadPath, BufferedRoutesDoNot) {
+    // Every one of these reads its body with readBody, into memory, whole.
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/nodes/abc/metadata/color"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/files/abc"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/roles/abc"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/auth/token"));
+}
+
+TEST(StreamingUploadPath, NotAPrefixMatch) {
+    // The uid is ONE segment and /content is the end. A deeper path is another
+    // route; letting it match would widen the allowance by accident.
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/files/abc/content/extra"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/files/abc/def/content"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/files//content"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/v1/files/content"));
+}
+
+TEST(StreamingUploadPath, RejectsDegenerateInput) {
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", ""));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("PUT", "/content"));
+    EXPECT_FALSE(webdav::isStreamingUploadPath("", ""));
+}

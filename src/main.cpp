@@ -108,6 +108,12 @@ int main() {
         return 1;
     }
     cfg.max_body_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_BODY_BYTES", "104857600"));
+    // The streaming upload route gets its own, larger allowance — see
+    // Config::max_upload_bytes. Kept separate from HTTP_MAX_BODY_BYTES because
+    // raising THAT to fit a video would also let a JSON body of the same size be
+    // buffered whole by readBody, on any of fifteen handlers, on every worker
+    // thread. 0 disables the bridge-side limit.
+    cfg.max_upload_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_UPLOAD_BYTES", "5368709120"));
     cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
     // Multi-origin allow-list (a bespoke deployment may embed FileEngine in several
     // host origins). HTTP_CORS_ORIGINS is a CSV; the legacy single HTTP_CORS_ORIGIN
