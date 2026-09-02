@@ -45,6 +45,13 @@ CORS_ORIGIN="${FE_CORS_ORIGIN:-http://localhost:3000}"
 # when this is small enough to exercise cheaply; otherwise it SKIPs (see below).
 MAX_BODY="${FE_MAX_BODY:-104857600}"
 PASS=0; FAIL=0; SKIP=0; FAILED=()
+# Cleanup that really destroys what these tests make: erasure where the caller
+# may, the soft delete where it may not. See tests/lib_cleanup.sh — DELETE alone
+# left every file every run ever made sitting in the deleted view, content and
+# all, which is not cleanup.
+# shellcheck source=tests/lib_cleanup.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_cleanup.sh"
+
 ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33m⊘ SKIP\033[0m %s\n' "$1"; }
@@ -158,7 +165,9 @@ grep -q 'hello.txt' <<<"$out" && ok "GET /v1/dirs/{uid} lists file" || bad "list
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/files/$FILE")
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } && ok "DELETE /v1/files/{uid} -> 2xx" || bad "delete file" "got $code"
 
-curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$DIR"   # cleanup
+# Erasing the folder erases hello.txt inside it too, including the copy the
+# soft delete above left recoverable.
+fe_cleanup "$DIR" dirs
 
 # ---- soft-delete a non-empty folder + leak-proof reachability ----
 echo "[delete non-empty + reachability]"
@@ -217,6 +226,11 @@ fi
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/files/$LEAF/content")
 [ "$code" = "200" ] && ok "admin exemption: admin still reaches deleted subtree (recovery)" \
     || bad "admin exemption" "admin unexpectedly blocked from a deleted subtree ($code)"
+
+# The subtree above is only SOFT-deleted — that is what the checks needed. Left
+# there it accumulates every run, buried content and all, so destroy it now that
+# the assertions are done. One call: erasure descends.
+fe_cleanup "$RD" dirs
 
 # ---- streaming (large file) + Range ----
 echo "[streaming + range]"
@@ -283,7 +297,7 @@ else
 fi
 rm -f /tmp/hb_tkt.bin
 
-curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$SD"   # cleanup
+fe_cleanup "$SD" dirs
 rm -f /tmp/hb_big.bin /tmp/hb_big_dl.bin /tmp/hb_range
 
 # ---- versioning + metadata + manipulation ----
@@ -317,7 +331,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/nodes/
 [ "$code" = "204" ] && ok "POST rename -> 204" || bad "rename" "got $code"
 grep -q '"exists":true'  <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/$F2/exists")" && ok "exists true" || bad "exists true"
 grep -q '"exists":false' <<<"$(curl -s "${A[@]}" "$BASE/v1/nodes/deadbeef-0000-0000-0000-000000000000/exists")" && ok "exists false (bogus uid)" || bad "exists false"
-curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/files/$F2"
+fe_cleanup "$F2" files
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/files/$F2/undelete")
 [ "$code" = "204" ] && ok "soft-delete + POST undelete -> 204" || bad "undelete" "got $code"
 SUB=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$WS" -d '{"name":"sub"}' | uidof)
@@ -333,7 +347,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/nodes/deadbeef
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/bogus/resource")
 [ "$code" = "404" ] && ok "unknown route -> 404" || bad "unknown route" "got $code"
 
-curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$WS"   # cleanup
+fe_cleanup "$WS" dirs
 
 # ---- admin + roles + ACL ----
 echo "[admin + roles + ACL]"
@@ -401,7 +415,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/principals")
 
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X DELETE "$BASE/v1/roles/$ROLE")
 [ "$code" = "204" ] && ok "DELETE /v1/roles/{role} -> 204" || bad "delete role" "got $code"
-curl -s -o /dev/null "${A[@]}" -X DELETE "$BASE/v1/dirs/$GD"   # cleanup
+fe_cleanup "$GD" dirs
 
 # ---- hardening ----
 echo "[hardening]"
@@ -426,6 +440,8 @@ if [ "$MAX_BODY" -le 16777216 ]; then
 else
     skip "body-size cap (cap=${MAX_BODY}B too large to exercise cheaply; run the bridge with a small HTTP_MAX_BODY_BYTES and set FE_MAX_BODY)"
 fi
+
+fe_cleanup_report
 
 echo "=========================================================="
 echo " RESULTS:  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
