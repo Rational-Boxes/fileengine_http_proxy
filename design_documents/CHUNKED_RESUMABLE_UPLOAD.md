@@ -80,7 +80,7 @@ auth as everything else.
 | `POST /v1/files/{uid}/uploads` | open a session; body `{size, chunk_size}` | `201` + state |
 | `PUT /v1/files/{uid}/uploads/{id}/parts/{n}` | send part `n`, raw body + `Content-Digest` | `204` |
 | `GET /v1/files/{uid}/uploads/{id}` | what has landed | `200` + state |
-| `POST /v1/files/{uid}/uploads/{id}/commit` | assemble → one version; body `{sha256}` | `204` |
+| `POST /v1/files/{uid}/uploads/{id}/commit` | assemble → one version; body `{content_root, sha256?}` | `204` |
 | `DELETE /v1/files/{uid}/uploads/{id}` | abandon, drop the parts | `204` |
 
 State object:
@@ -165,77 +165,91 @@ refused.
   It closes the gap between arrival and commit — a part corrupted on disk, or a
   disk that lied — which arrival-time checking alone cannot see.
 
-### Whole-file digest — the client declares it, the server enforces it
+### Content root — the client declares it, the server enforces it
 
-The bridge hashes the assembled whole while commit streams it, which costs
-nothing because the bytes are already moving. The question is what to compare it
-against, and the answer decides what the check can catch.
+Per-part digests cannot see a file that changed **between** attempts. Each part
+is individually valid — the early ones hash against the old content, the later
+ones against the new — so every check passes and the reconstruction is a silent
+splice of two different files. Catching that needs one value derived from the
+whole.
 
-**The client sends its own expected digest with the commit**, and the bridge
-refuses to create a version if they differ:
+The value is a **content root** over the part digests, not a hash of the file
+bytes:
+
+```
+content_root = SHA-256( "fe-upload-v1" ‖ size ‖ chunk_size ‖ d₀ ‖ d₁ ‖ … ‖ dₙ₋₁ )
+```
+
+where `dᵢ` is the raw 32-byte SHA-256 of part `i`. A flat digest-of-digests, not
+a tree — nothing here needs inclusion proofs. The size and chunk size are bound
+in so the root cannot be reused across a different chunking of the same bytes.
+
+**Both sides already have every input.** The client hashes each part to send it;
+the bridge stores each part's digest in the manifest on arrival. So:
+
+- the client computes the root **for free**, as a by-product of hashing it must
+  do anyway — no second read of the file;
+- the bridge recomputes it at commit from the manifest, hashing `n × 32` bytes.
+  For a 1 GiB upload that is 4 KiB of hashing. It never re-reads the parts.
+
+The client declares its root at commit and the bridge refuses to create a
+version if they differ:
 
 ```
 POST /v1/files/{uid}/uploads/{id}/commit
-{ "sha256": "b6b4050498db9247…" }        ← the client's hash of the file it MEANT to send
+{ "content_root": "b6b4050498db9247…" }
 
-409 { "error": "assembled content does not match the declared digest" }
+409 { "error": "assembled content does not match the declared content root" }
 ```
 
-Rejecting server-side rather than returning the digest for the client to check
-matters: a bad file then never becomes a version at all, instead of becoming one
-that a well-behaved client is trusted to notice and delete.
+Rejecting server-side rather than reporting the mismatch back matters: a spliced
+file never becomes a version at all, instead of becoming one a well-behaved
+client is trusted to notice.
 
-#### What this catches that nothing else does
+#### The one thing that makes this work
 
-**A file edited between the first attempt and the resumption.** Every part is
-individually valid — the early ones hash correctly against the old content, the
-later ones against the new — so per-part digests pass and the reconstruction is
-a silent splice of two different files. The only thing that sees it is a digest
-over the whole, compared against what the client believes the file to be.
+**The root must be computed from the file as it was on the FIRST attempt, and
+stored** alongside the session id. Recomputing it on resume is worse than
+useless: the client would hash the remaining chunks from the *new* content and
+combine them with stored digests for the old — arriving at exactly the root the
+bridge computes from the same mixture, so the two agree and the splice goes
+through undetected.
 
-The design already refuses to reuse a session unless name, **size** and
-**mtime** all match, which catches essentially every ordinary edit for free.
-What it does not catch is an edit that preserves both — a tool that restores
-mtime, an in-place write of identical length, a filesystem with coarse mtime
-granularity. Rare, but the failure is a corrupt file reported as a success, and
-that is the category worth paying for.
+That means the client must hash the whole file during the first attempt even if
+the upload does not finish. In practice the hasher runs ahead of the network:
+hashing is 50–100 MB/s against an upload of perhaps 6 MB/s, so the digests are
+complete long before the transfer is. Only an interruption in the first seconds
+leaves the root unknown.
 
-It also subsumes the assembly check: parts concatenated in the wrong order, or
-one skipped, produce a digest that differs from the client's.
+When it is unknown — an early interruption, or `localStorage` cleared between
+attempts — the client has two honest options: declare nothing and fall back to
+the name/size/mtime guard, or read the file once to compute a root over its
+current content. The second still detects the splice (a root over the new file
+cannot match one the bridge derives from old-and-new parts) and costs the full
+pass this design otherwise avoids. Either is correct; the fallback is a
+degradation, not a hole.
 
-#### The browser cost, which is the real constraint
+#### What it costs, and what it replaces
 
-`crypto.subtle.digest()` is **one-shot over a BufferSource — there is no
-streaming or incremental WebCrypto API.** So hashing a 1 GiB file with it means
-holding 1 GiB in an ArrayBuffer, which is not acceptable on a phone and is
-wasteful anywhere. The options are:
+It replaces a plain whole-file SHA-256 declared at commit, which was the earlier
+proposal. That would have required a **second full read of the file**, hashed
+with an implementation WebCrypto does not provide — `crypto.subtle.digest()` is
+one-shot over a BufferSource, with no streaming or incremental API, so a 1 GiB
+file means either 1 GiB resident or a pure-JS/WASM hasher. The content root
+needs none of that: the per-chunk hashing is already happening, and combining 32
+byte digests is trivial in plain JS.
 
-| Approach | Cost | Notes |
-|---|---|---|
-| `crypto.subtle` over the whole file | 1 GiB resident | Rejected — memory |
-| Pure-JS incremental SHA-256 | ~50–100 MB/s | ~10–20 s of CPU for 1 GiB |
-| WASM SHA-256 | ~500 MB/s+ | Fast, but a dependency to vendor and audit |
+**What is given up** is that the root is meaningful only inside this protocol. A
+plain SHA-256 is what `sha256sum` prints — it could later verify the stored file,
+feed an audit record, or be checked by something that is not our client. The
+content root cannot do any of that.
 
-**Overlap it with the transfer.** The hash pass is a second read of the file, but
-it does not have to happen before the upload starts: run it concurrently and
-have the digest ready by the time the last part is sent. The upload is minutes;
-the hash is seconds; done in parallel the user waits for neither. That is why
-the digest is supplied at **commit** rather than at session open.
-
-Two consequences worth stating: the concurrent read means the file is read twice
-in total, which matters on a slow disk more than on a fast one; and if the file
-is edited *while* the hash is running, the client's own digest is taken from a
-mixed read too — it will still mismatch, so the commit is still refused, which
-is the correct outcome even though the digest is meaningless.
-
-#### A cheaper middle option, if the full pass is unwanted
-
-On resume, the client re-hashes a **bounded sample** of the parts the server
-says it already holds — the first and last, say — and compares against the
-per-part digests in the manifest. A few chunks of reading instead of the whole
-file, and it catches any edit that touched the sampled regions. It is a
-heuristic rather than a guarantee, and it is offered as a fallback for slow
-devices rather than as the design.
+So: content root as the primary, because it is free and catches the case that
+prompted it. **A plain `sha256` may be declared as well** — the field is
+accepted, verified against the assembled stream at commit (which already reads
+every byte, so the check itself is free), and simply omitted by clients that do
+not want to pay for the extra read. That keeps the externally-comparable digest
+available where it is worth its cost, without making every upload pay for it.
 
 ### What this does and does not defend against
 
@@ -386,9 +400,9 @@ file cannot create a directory with hundreds of thousands of entries.
 | Part fails its `Content-Digest` | `400`, temp file discarded, part never becomes `received` |
 | Part sent without a digest | `400` — the digest is required |
 | Part corrupted on disk after arrival | Caught at commit against the manifest digest; commit fails, parts retained |
-| Parts assembled wrongly by the bridge | Whole-file digest differs from the declared one; commit `409` |
+| Parts assembled wrongly by the bridge | Content root differs from the declared one; commit `409` |
 | File edited between attempts (mtime changed) | Session not reused; a fresh one is opened |
-| File edited between attempts (mtime preserved) | Parts individually valid, whole-file digest differs; commit `409`, parts retained |
+| File edited between attempts (mtime preserved) | Parts individually valid, content root differs; commit `409`, parts retained |
 | Commit while incomplete | `409` with the current state |
 | Another user touches the session | `404` on every call |
 
@@ -455,11 +469,16 @@ Settled: a required per-part `Content-Digest`, verified on arrival and again at
 commit, plus a whole-file digest computed during commit and returned. See
 [Part integrity](#part-integrity).
 
-The whole-file digest is now **declared by the client at commit and enforced by
-the bridge**, so a file edited mid-flight is rejected rather than spliced. See
-[Whole-file digest](#whole-file-digest--the-client-declares-it-the-server-enforces-it).
+Settled: a required per-part `Content-Digest`, verified on arrival and again at
+commit, plus a **content root** over the part digests that the client declares at
+commit and the bridge enforces — so a file edited between attempts is rejected
+rather than spliced. Both are free: the client hashes each part anyway, and the
+bridge recomputes the root from the manifest without re-reading a byte. A plain
+`sha256` remains available as an optional extra for clients that want an
+externally-comparable digest and will pay a second read for it. See
+[Part integrity](#part-integrity).
 
-Three things left, all on the client:
+Two things left, both on the client:
 
 - **`crypto.subtle` is only available in a secure context.** Over HTTPS, or on
   `localhost`, it is there; on the dev stack reached by LAN IP over plain HTTP it
@@ -467,12 +486,24 @@ Three things left, all on the client:
   requires. Either large uploads are HTTPS-only (defensible, and true of the real
   deployment), or a pure-JS SHA-256 fallback is carried for dev — which is slow
   enough on 8 MiB to be worth avoiding if we can just say "use HTTPS".
-- **The whole-file hash needs a streaming implementation.** WebCrypto has no
-  incremental API, so this is pure-JS (~10–20 s of CPU per GiB) or vendored
-  WASM (fast, but a dependency to audit). Run concurrently with the upload it is
-  free in wall-clock terms, but it is a second read of the file and it is code
-  we do not have yet.
-- **Hashing 8 MiB on the main thread janks the UI.** A 1 GiB file is ~128
+- **Hashing must move off the main thread.** This is the non-negotiable part, and
+  it is the Worker rather than the language: a 1 GiB file is ~128 chunks at
+  roughly 20 ms each, and on the main thread that is seconds of blocking in
+  slices long enough to feel. In a Worker, plain-JS SHA-256 at 50–100 MB/s is
+  10–20 s of background CPU against an upload of minutes — invisible. The SPA
+  has **no Web Worker anywhere today**, so this is new code, but it is ordinary.
+- **WASM is an optimisation to justify by measurement, not to assume.** It buys
+  ~5–10× on hashing, which matters only when the upload is fast enough for the
+  hash to be the bottleneck — a LAN client, not the deployment this was reported
+  from. And the project **ships no WebAssembly to the browser today**: the only
+  `.wasm` in the tree is xeokit's `web-ifc`, which is never on the client path
+  because models are loaded as server-produced `.xkt` renditions, and pdfjs's
+  optional codecs are never fetched because nothing configures a `wasmUrl`.
+  Adding it means solving four things for the first time — serving
+  `application/wasm`, a CSP that permits `wasm-unsafe-eval`, Vite emitting and
+  fingerprinting the asset, and vendoring a binary dependency into an AGPL
+  product. None is hard; none is free either. Keeping the hasher behind an
+  interface in the Worker means the swap later touches one module. A 1 GiB file is ~128
   chunks; at roughly 20 ms each that is 2.5 s of blocking spread through the
   upload, in slices long enough to feel. A Web Worker fixes it and is the
   standard answer, but it is real work rather than a line of code, and it should
@@ -540,10 +571,14 @@ and behaviour when the disk fills.
 
 **Integrity needs its own tests**, and the interesting ones are the negatives: a
 part whose digest does not match must not become `received`; a part file
-corrupted on disk after arrival must fail the commit rather than pass it; and
-parts assembled in the wrong order must produce a whole-file digest that differs
-from the client's. The last is the only test that would catch an assembly bug,
-and it is the one a happy-path suite would never think to write.
+corrupted on disk after arrival must fail the commit rather than pass it; and a
+commit whose declared content root disagrees with the manifest must be refused.
+
+The one that actually models the reported case is worth building deliberately:
+upload half a file, **change the content**, resume, and assert the commit is
+refused. Every part passes its own digest in that scenario — which is precisely
+why a suite that only checks per-part integrity would report the splice as a
+success.
 
 **The sweep needs tests it does not have**, and they are mostly about what it
 must NOT remove — a directory younger than the cull age even with no manifest, a
