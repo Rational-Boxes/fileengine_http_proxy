@@ -81,6 +81,19 @@ std::string getEnvOrDefault(const std::string& env_var, const std::string& defau
 // Utility functions for error handling
 std::string getErrorMessage(int error_code);
 
+/**
+ * HTTP status for an error string coming back from the core.
+ *
+ * The core reports failures as prose, so the door classifies them by what they
+ * say. Pure and separate from the response so the classification can be tested
+ * — the mapping decides whether a caller sees "you got it wrong" or "we broke",
+ * and a wrong answer there is invisible until someone reads a log.
+ *
+ * Anything unrecognised stays 500: a fault we cannot explain IS a server fault,
+ * and quietly calling it 4xx would hide real breakage.
+ */
+int httpStatusForCoreError(const std::string& err);
+
 // Logging utilities
 void logMessage(const std::string& level, const std::string& message);
 bool shouldLogToConsole();

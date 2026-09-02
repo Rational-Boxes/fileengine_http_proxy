@@ -130,12 +130,18 @@ refr=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/refresh"
 NEWTOKEN=$(grep -oE '"token":"[^"]+"' <<<"$refr" | sed 's/.*"token":"//;s/"//')
 { [ -n "$NEWTOKEN" ] && grep -q "\"user\":\"$EXPECT_USER\"" <<<"$(curl -s -H "Authorization: Bearer $NEWTOKEN" "$BASE/v1/whoami")"; } \
   && ok "POST /v1/auth/refresh -> fresh usable JWT" || bad "refresh" "$refr"
-# Stateless JWT: DELETE is a no-op (logout is client-side); the token stays valid
-# until it expires (short TTL). Revocation is by expiry, not a server-side list.
+# Sign-out ENDS the session. This used to assert the opposite — that the token
+# stayed valid after DELETE, "revocation is by expiry" — which described the
+# defect rather than the requirement: a signed-out token went on working in
+# every copy of it for the rest of the TTL. The jti now goes on a shared
+# denylist and is refused. See tests/test_e2e_revocation.sh for the whole loop,
+# including a second bridge process that never saw the logout.
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/auth/token")
-[ "$code" = "204" ] && ok "DELETE /v1/auth/token -> 204 (stateless no-op)" || bad "revoke" "got $code"
+[ "$code" = "204" ] && ok "DELETE /v1/auth/token -> 204" || bad "revoke" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")
-[ "$code" = "200" ] && ok "stateless token still valid until expiry -> 200" || bad "stateless token" "got $code"
+[ "$code" = "401" ] && ok "the signed-out token is refused -> 401" || bad "revoked token still works" "got $code"
+# Everything below needs a live session, and the one above has just been ended.
+TOKEN="$NEWTOKEN"
 
 # ---- filesystem round-trip ----
 echo "[filesystem]"
@@ -316,8 +322,24 @@ out=$(curl -s "${A[@]}" "$BASE/v1/files/$F2/versions/$TS")
 [ -n "$out" ] && ok "GET specific version" || bad "get version" "$out"
 out=$(curl -s "${A[@]}" -X POST "$BASE/v1/files/$F2/restore" -d "{\"version_timestamp\":\"$TS\"}")
 grep -q 'restored_version' <<<"$out" && ok "POST restore version" || bad "restore" "$out"
+# Purging versions needs CULL_VERSIONS, a DESTROY-DATA bit that NO admin role
+# confers by bypass (§5.4.9, finding H2): not tenant_admin, and not
+# erasure_admin either — that role answers erasure requests, and bundling
+# storage housekeeping into it is exactly how tenant_admin came to hold
+# CULL_VERSIONS silently before. Only system_admin, or an explicit grant.
+#
+# This asserted a flat 204 and so encoded the pre-H2 world. It now checks the
+# GATE, which is what must not regress in either direction — and the interesting
+# direction is a 204, because that would mean the bit had started riding along
+# with a role again.
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/files/$F2/purge" -d '{"keep_count":1}')
-[ "$code" = "204" ] && ok "POST purge -> 204" || bad "purge" "got $code"
+if grep -q '"system_admin"' <<<"$(curl -s "${A[@]}" "$BASE/v1/whoami")"; then
+    [ "$code" = "204" ] && ok "POST purge -> 204 (system_admin passes every check)" \
+        || bad "purge" "got $code (system_admin should be able to cull)"
+else
+    [ "$code" = "403" ] && ok "POST purge -> 403 (CULL_VERSIONS is not conferred by any admin role)" \
+        || bad "purge gate" "got $code (no admin role may cull versions by bypass)"
+fi
 
 curl -s -o /dev/null "${A[@]}" -X PUT "$BASE/v1/nodes/$F2/metadata/color" -d '{"value":"blue"}'
 out=$(curl -s "${A[@]}" "$BASE/v1/nodes/$F2/metadata/color")

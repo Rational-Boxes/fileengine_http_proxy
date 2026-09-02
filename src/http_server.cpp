@@ -239,14 +239,10 @@ std::vector<std::string> pathSegments(const std::string& path) {
 
 // Translate a gRPC core error string to the right HTTP status.
 void mapError(HTTPServerResponse& resp, const std::string& err) {
-    HTTPResponse::HTTPStatus status = HTTPResponse::HTTP_INTERNAL_SERVER_ERROR;
-    if (err.find("permission") != std::string::npos) {
-        status = HTTPResponse::HTTP_FORBIDDEN;
-    } else if (err.find("not exist") != std::string::npos || err.find("not found") != std::string::npos) {
-        status = HTTPResponse::HTTP_NOT_FOUND;
-    } else if (err.find("subtree") != std::string::npos || err.find("already") != std::string::npos) {
-        status = HTTPResponse::HTTP_CONFLICT;
-    }
+    // The classification is pure and lives in utils, so it can be tested
+    // directly — see webdav::httpStatusForCoreError and test_utils.cpp.
+    const auto status =
+        static_cast<HTTPResponse::HTTPStatus>(webdav::httpStatusForCoreError(err));
     sendJson(resp, status, std::string("{\"error\":\"") + jsonEscape(err) + "\"}");
 }
 

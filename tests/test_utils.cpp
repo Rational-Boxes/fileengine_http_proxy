@@ -314,3 +314,56 @@ TEST(Digest, Ha1AliasesGenerateDigestHashAndIsDeterministic) {
     EXPECT_EQ(calculateHA1("u", "r", "p"), calculateHA1("u", "r", "p"));
     EXPECT_NE(calculateHA1("u", "r", "p"), calculateHA1("u", "r", "p2"));
 }
+
+// ---------------------------------------------------------------------------
+// Core error -> HTTP status.
+//
+// The core reports failures as prose and the door classifies them by what they
+// say, so this mapping decides whether a caller is told "you got it wrong" or
+// "we broke". Getting it wrong is invisible: the request still returns, just
+// with the wrong meaning, and a 500 for an ordinary condition is a page at 3am
+// for something working as designed.
+// ---------------------------------------------------------------------------
+
+TEST(CoreErrorStatus, PermissionFailuresAreForbidden) {
+    EXPECT_EQ(webdav::httpStatusForCoreError("Insufficient permission to read"), 403);
+}
+
+TEST(CoreErrorStatus, MissingThingsAreNotFound) {
+    EXPECT_EQ(webdav::httpStatusForCoreError("File does not exist"), 404);
+    EXPECT_EQ(webdav::httpStatusForCoreError("version not found"), 404);
+}
+
+TEST(CoreErrorStatus, ConflictsAreConflicts) {
+    EXPECT_EQ(webdav::httpStatusForCoreError("cannot move into its own subtree"), 409);
+    EXPECT_EQ(webdav::httpStatusForCoreError("File has already been erased: abc"), 409);
+}
+
+TEST(CoreErrorStatus, AFileWithNoContentIsNotAServerFault) {
+    // THE BUG. Reading an ERASED file's content answered
+    // 500 {"error":"No versions available for file"} — erasure destroys every
+    // version by design, so the feature working as intended raised a server
+    // error on every subsequent read.
+    EXPECT_EQ(webdav::httpStatusForCoreError("No versions available for file"), 404);
+}
+
+TEST(CoreErrorStatus, TheSourceFormOfThatErrorIsAlsoNotAServerFault) {
+    // Copy/move from a file with nothing in it reports its own variant.
+    EXPECT_EQ(webdav::httpStatusForCoreError("No versions available for source file"), 404);
+}
+
+TEST(CoreErrorStatus, AnUnrecognisedFailureStaysAServerError) {
+    // The important half of the change: only the understood cases move off 500.
+    // Reclassifying the unknown would hide real breakage behind a tidy 4xx.
+    EXPECT_EQ(webdav::httpStatusForCoreError("connection reset by peer"), 500);
+    EXPECT_EQ(webdav::httpStatusForCoreError(""), 500);
+}
+
+TEST(CoreErrorStatus, TheRootDirectoryGuardIsARefusalNotAFault) {
+    // The core refuses this in its own words, without the word "permission", so
+    // it fell through to 500. A non-admin creating at the root got a server
+    // error for being told no — which also means every such attempt looked like
+    // breakage to whoever watches the 5xx rate.
+    EXPECT_EQ(webdav::httpStatusForCoreError(
+        "Only an admin (system_admin or tenant_admin) can create in the root directory"), 403);
+}
