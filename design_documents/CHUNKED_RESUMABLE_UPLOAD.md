@@ -128,6 +128,72 @@ response was lost but whose body arrived.
   older one. A session whose `chunk_size` differs is discarded — its parts do not
   line up with the ranges the current client would send.
 
+## Sentinel sweep
+
+Parts are the only thing this feature leaves on disk, and every failure mode
+that does not end in a commit or an abort leaves some behind: a client that
+closes the tab, a laptop that sleeps and never comes back, a create that died
+between making the directory and writing the manifest, a part write interrupted
+mid-rename. None of these is exceptional. Without something that removes them,
+`UPLOAD_SESSION_DIR` only ever grows, and the failure is a full disk on the
+host that also runs the core and the database.
+
+So a **sentinel sweep** runs inside the bridge on an interval, plus once at
+startup — startup because the crash that orphaned a session is exactly the event
+that also stopped the timer.
+
+### What counts as orphaned
+
+In descending order of confidence:
+
+1. **A session directory with no readable manifest.** A create that failed
+   partway, or a manifest that was truncated. Nothing can ever resume it.
+2. **A session past its `expires`.** The client was told when it would stop
+   being resumable; after that the bytes are dead weight.
+3. **A directory whose name is not a valid session id.** Nothing this code
+   writes produces one, so it is either detritus from an older version or
+   something that does not belong to us.
+4. **A stray `*.partial`** inside an otherwise live session — the temp name a
+   part is written under before it is renamed into place.
+
+### The safety property that matters
+
+**Age is measured from last modification, and nothing younger than the cull age
+is ever removed** — including the four cases above. This is the whole of the
+sweep's correctness:
+
+- A session directory exists for a moment *before* its manifest is written, so
+  rule 1 without an age check deletes sessions as they are being created. The
+  window is milliseconds and the sweep runs hourly, which is precisely the kind
+  of race that never appears in testing and appears in production.
+- A `*.partial` file for a 128 MiB part is legitimately present for as long as
+  that part takes to arrive. Rule 4 without an age check truncates uploads in
+  flight.
+
+The cull age must therefore be **greater than `UPLOAD_TTL_SECONDS`**, and the
+bridge should refuse to start with a clear message if it is not — a sweep that
+outruns the resume window silently deletes sessions clients are still entitled
+to finish, and the symptom would be indistinguishable from Issue 1.
+
+### Reporting
+
+The sweep logs what it removed (sessions, files, bytes reclaimed) and exports
+counters, because a sweep that quietly stops is invisible: disk fills slowly and
+the cause is a thread that died months earlier. `fileengine_upload_sweep_*` —
+runs, sessions removed, bytes reclaimed, last-run age — alongside the metrics
+the bridge already publishes. **Alert on last-run age climbing**, not on bytes
+reclaimed: a healthy deployment with nothing to clean reclaims zero, which looks
+identical to a sweeper that is no longer running.
+
+### Note on the prototype
+
+`sweepExpired()` as written on `feature/resumable-chunked-upload` is **not this**
+and should not be shipped as-is: it calls `load()` twice, and it fetches
+`last_write_time` and then ignores it — so it has no age check at all and would
+be subject to both races above. It was written to prove the directory walk, not
+the policy. The interval, the age check, the startup run and the reporting are
+all still to be built.
+
 ## Configuration
 
 | Env | Default | Meaning |
@@ -137,6 +203,8 @@ response was lost but whose body arrived.
 | `UPLOAD_MAX_PART_BYTES` | 128 MiB | largest part |
 | `UPLOAD_TTL_SECONDS` | 86400 | abandoned sessions expire |
 | `UPLOAD_MAX_SESSIONS_PER_USER` | 8 | bounds disk held by one user |
+| `UPLOAD_SWEEP_INTERVAL_SECONDS` | 3600 | how often the sentinel sweep runs; `0` disables it |
+| `UPLOAD_CULL_AGE_SECONDS` | 172800 | nothing modified more recently than this is removed (48h) |
 
 Part count is additionally capped at 10 000, so a tiny `chunk_size` on a huge
 file cannot create a directory with hundreds of thousands of entries.
@@ -149,7 +217,9 @@ file cannot create a directory with hundreds of thousands of entries.
 | Connection drops between parts | Nothing lost; resume from `received` |
 | Browser reload mid-upload | Session recalled from `localStorage`, `received` re-fetched |
 | Bridge restarts mid-upload | Manifest and parts survive on disk; resume works |
-| Client abandons the upload | Session expires after TTL and is swept |
+| Client abandons the upload | Session expires after TTL; the sentinel sweep reclaims the parts once they pass the cull age |
+| Create dies between mkdir and manifest | Directory has no manifest; swept once older than the cull age |
+| Part write interrupted mid-rename | `*.partial` left behind; swept once older than the cull age |
 | Commit fails in the core | Parts retained; commit is retryable |
 | Part sent with the wrong size | `400`, part not stored |
 | Commit while incomplete | `409` with the current state |
@@ -184,14 +254,23 @@ A named volume (and headroom for concurrent uploads) has to be added to the
 Ansible role and compose before this is worth shipping. **This is a blocker for
 deployment, not for review.**
 
-### 3. Nothing sweeps expired sessions on a schedule
+### 3. Sweep defaults — DECIDED in principle, numbers still open
 
-`sweepExpired()` exists and is correct, but is only reachable opportunistically.
-Abandoned uploads therefore occupy disk until something calls it. Options: sweep
-on session create (cheap, but only runs when someone uploads), a timer thread in
-the bridge, or a systemd timer alongside the existing audit-retention job. **I
-lean toward sweeping on create *and* a systemd timer**, so an idle deployment
-still cleans up.
+The sentinel sweep is now part of the design (see
+[Sentinel sweep](#sentinel-sweep)) rather than an open question: it runs in the
+bridge on `UPLOAD_SWEEP_INTERVAL_SECONDS`, plus once at startup, and removes
+nothing younger than `UPLOAD_CULL_AGE_SECONDS`.
+
+In-process rather than a systemd timer, because parts are local to the instance
+that holds them — an external timer would have to be told where they are and
+would do the wrong thing the moment there were two bridges. It is the same
+reasoning as Issue 1, and if that is resolved by moving parts to shared or
+object storage, the sweep should move with them.
+
+What is still open is the **numbers**: 1h interval and a 48h cull age against a
+24h session TTL. The constraint is only that the cull age exceed the TTL; the
+margin between them is a judgement about how long a stalled upload deserves to
+hold disk, and I would rather you set it than inherit my guess.
 
 ### 4. Disk is bounded by session count, not by bytes
 
@@ -270,3 +349,9 @@ status, part, commit and abort.
 **Not yet tested:** a genuine mid-transfer network drop (simulated by withholding
 parts, which is not the same thing), concurrent sessions against the same file,
 and behaviour when the disk fills.
+
+**The sweep needs tests it does not have**, and they are mostly about what it
+must NOT remove — a directory younger than the cull age even with no manifest, a
+`*.partial` for a part still arriving, a session inside its TTL. A sweep tested
+only on what it deletes will pass while being far too eager, and the damage
+lands on someone else's upload.
