@@ -78,7 +78,7 @@ auth as everything else.
 | Call | Purpose | Success |
 |---|---|---|
 | `POST /v1/files/{uid}/uploads` | open a session; body `{size, chunk_size}` | `201` + state |
-| `PUT /v1/files/{uid}/uploads/{id}/parts/{n}` | send part `n`, raw body | `204` |
+| `PUT /v1/files/{uid}/uploads/{id}/parts/{n}` | send part `n`, raw body + `Content-Digest` | `204` |
 | `GET /v1/files/{uid}/uploads/{id}` | what has landed | `200` + state |
 | `POST /v1/files/{uid}/uploads/{id}/commit` | assemble → one version | `204` |
 | `DELETE /v1/files/{uid}/uploads/{id}` | abandon, drop the parts | `204` |
@@ -127,6 +127,66 @@ response was lost but whose body arrived.
   editing a file and re-dropping it cannot splice new bytes onto a half-sent
   older one. A session whose `chunk_size` differs is discarded — its parts do not
   line up with the ranges the current client would send.
+
+## Part integrity
+
+Every part carries a checksum and the bridge verifies it. Without one, the only
+check on a part is its length, and the failure that gets through is the one
+nobody notices: a corrupt file that every layer reports as a success.
+
+### On the wire
+
+The client sends a digest with each part:
+
+```
+PUT /v1/files/{uid}/uploads/{id}/parts/3
+Content-Digest: sha-256=:9f6c28ccc09f06c4…=:
+```
+
+RFC 9530 `Content-Digest`, because it is the standard spelling and intermediaries
+understand it. (`X-Part-SHA256: <hex>` would be equivalent in effect and simpler
+to parse — a small open choice, not a design one.)
+
+**Required, not optional.** The reflex is to make a new header optional for
+compatibility, but there are no older clients — this API does not exist yet — and
+an optional digest buys nothing while costing the ability to distinguish "this
+client cannot checksum" from "this part is corrupt". A part without a digest is
+refused.
+
+### Where it is verified
+
+- **On arrival**, incrementally, as the part streams to its temp file. Nothing is
+  buffered to hash it; the digest is updated per 256 KiB read, the same buffer
+  the write already uses. A mismatch deletes the temp file and answers `400` —
+  the part is never renamed into place, so it never becomes `received` and the
+  client re-sends it like any other failure.
+- **At commit**, against the digest recorded in the manifest. This is free: the
+  commit already reads every part to stream it, so verification rides that read.
+  It closes the gap between arrival and commit — a part corrupted on disk, or a
+  disk that lied — which arrival-time checking alone cannot see.
+
+### Whole-file digest, at no extra cost
+
+While commit streams the parts it also hashes the assembled whole, and returns
+it:
+
+```json
+{ "sha256": "b6b4050498db9247…" }
+```
+
+The client compares against its own. This is the only check that would catch an
+**assembly** fault — parts individually valid but concatenated in the wrong
+order, or one silently skipped — which is precisely the class of bug per-part
+digests cannot detect, and precisely the class this feature introduces. It costs
+nothing because the bytes are already moving through.
+
+### What this does and does not defend against
+
+It is a **corruption** check, not an authentication one. The caller is already
+authenticated and the transport is TLS; a client that wants to send different
+bytes can simply send different bytes and a matching digest. What it catches is
+a truncated part, a flipped bit, a proxy that mangled a body, a bad disk, and an
+assembly mistake in our own code.
 
 ## Sentinel sweep
 
@@ -266,6 +326,10 @@ file cannot create a directory with hundreds of thousands of entries.
 | Part write interrupted mid-rename | `*.partial` left behind; swept once older than the cull age |
 | Commit fails in the core | Parts retained; commit is retryable |
 | Part sent with the wrong size | `400`, part not stored |
+| Part fails its `Content-Digest` | `400`, temp file discarded, part never becomes `received` |
+| Part sent without a digest | `400` — the digest is required |
+| Part corrupted on disk after arrival | Caught at commit against the manifest digest; commit fails, parts retained |
+| Parts assembled wrongly by the bridge | Caught by the whole-file digest the client compares |
 | Commit while incomplete | `409` with the current state |
 | Another user touches the session | `404` on every call |
 
@@ -326,15 +390,25 @@ denial-of-service by ordinary use, not by attack. A byte-based quota (per user
 and global) would be the honest bound; it needs a decision on what the limits
 should be, and on what a user sees when they hit one.
 
-### 5. No integrity check on a part or on the whole file
+### 5. Integrity — DECIDED; one client-side cost to weigh
 
-Nothing verifies that a part arrived intact beyond its length, and nothing
-verifies the assembled file against a client-side digest. TCP and TLS make
-silent corruption unlikely but not impossible, and the failure would be a
-corrupt file that everything reports as successful. A per-part checksum
-(client-supplied, verified on arrival) is cheap; a whole-file digest checked at
-commit is stronger and costs a full read. **Worth deciding explicitly rather
-than defaulting to none.**
+Settled: a required per-part `Content-Digest`, verified on arrival and again at
+commit, plus a whole-file digest computed during commit and returned. See
+[Part integrity](#part-integrity).
+
+Two things left, both on the client:
+
+- **`crypto.subtle` is only available in a secure context.** Over HTTPS, or on
+  `localhost`, it is there; on the dev stack reached by LAN IP over plain HTTP it
+  is not, and the uploader would have no way to produce the digest the server now
+  requires. Either large uploads are HTTPS-only (defensible, and true of the real
+  deployment), or a pure-JS SHA-256 fallback is carried for dev — which is slow
+  enough on 8 MiB to be worth avoiding if we can just say "use HTTPS".
+- **Hashing 8 MiB on the main thread janks the UI.** A 1 GiB file is ~128
+  chunks; at roughly 20 ms each that is 2.5 s of blocking spread through the
+  upload, in slices long enough to feel. A Web Worker fixes it and is the
+  standard answer, but it is real work rather than a line of code, and it should
+  be planned rather than discovered when the progress bar stutters.
 
 ### 6. A token can expire mid-upload
 
@@ -395,6 +469,13 @@ status, part, commit and abort.
 **Not yet tested:** a genuine mid-transfer network drop (simulated by withholding
 parts, which is not the same thing), concurrent sessions against the same file,
 and behaviour when the disk fills.
+
+**Integrity needs its own tests**, and the interesting ones are the negatives: a
+part whose digest does not match must not become `received`; a part file
+corrupted on disk after arrival must fail the commit rather than pass it; and
+parts assembled in the wrong order must produce a whole-file digest that differs
+from the client's. The last is the only test that would catch an assembly bug,
+and it is the one a happy-path suite would never think to write.
 
 **The sweep needs tests it does not have**, and they are mostly about what it
 must NOT remove — a directory younger than the cull age even with no manifest, a
