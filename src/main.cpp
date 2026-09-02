@@ -114,6 +114,16 @@ int main() {
     // buffered whole by readBody, on any of fifteen handlers, on every worker
     // thread. 0 disables the bridge-side limit.
     cfg.max_upload_bytes = std::stol(webdav::getEnvOrDefault("HTTP_MAX_UPLOAD_BYTES", "5368709120"));
+
+    // Resumable chunked upload. The part directory holds in-flight uploads only
+    // — parts are deleted as soon as a commit reaches the core, and abandoned
+    // sessions are swept after UPLOAD_TTL_SECONDS — but it does need room for
+    // whatever is mid-transfer, so it is configurable rather than assumed.
+    cfg.upload_dir = webdav::getEnvOrDefault("UPLOAD_SESSION_DIR", "/var/tmp/fileengine-uploads");
+    cfg.upload_max_bytes = std::stoll(webdav::getEnvOrDefault("UPLOAD_MAX_BYTES", "5368709120"));
+    cfg.upload_max_part_bytes = std::stol(webdav::getEnvOrDefault("UPLOAD_MAX_PART_BYTES", "134217728"));
+    cfg.upload_ttl_seconds = std::stoi(webdav::getEnvOrDefault("UPLOAD_TTL_SECONDS", "86400"));
+    cfg.upload_max_sessions_per_user = std::stoi(webdav::getEnvOrDefault("UPLOAD_MAX_SESSIONS_PER_USER", "8"));
     cfg.cors_origin = webdav::getEnvOrDefault("HTTP_CORS_ORIGIN", "");
     // Multi-origin allow-list (a bespoke deployment may embed FileEngine in several
     // host origins). HTTP_CORS_ORIGINS is a CSV; the legacy single HTTP_CORS_ORIGIN

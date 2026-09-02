@@ -402,6 +402,18 @@ int httpStatusForCoreError(const std::string& err) {
 
 bool isStreamingUploadPath(const std::string& method, const std::string& path) {
     if (method != "PUT") return false;
+    // A resumable PART also streams — straight to a file on disk — so it needs
+    // the same allowance. It is bounded separately by the session's own
+    // max_part_bytes; this guard only decides which of the two request-body
+    // limits applies.
+    {
+        static const std::string kParts = "/parts/";
+        const std::size_t p = path.find("/uploads/");
+        if (p != std::string::npos && path.rfind("/v1/files/", 0) == 0 &&
+            path.find(kParts, p) != std::string::npos) {
+            return true;
+        }
+    }
     // /v1/files/{uid}/content — exactly. Not a prefix match: /v1/files/{uid}/
     // content/anything-else is a different route and must not inherit the
     // upload allowance.

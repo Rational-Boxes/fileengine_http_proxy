@@ -174,6 +174,19 @@ int jsonFieldInt(const std::string& body, const std::string& key, int def) {
     return def;
 }
 
+// Byte counts do not fit in an int: a 3 GiB upload would wrap and be accepted
+// as a negative size. Separate from jsonFieldInt so the narrow one keeps its
+// meaning for the small numbers it is used for.
+long long jsonFieldInt64(const std::string& body, const std::string& key, long long def) {
+    try {
+        Poco::JSON::Parser p;
+        auto obj = p.parse(body).extract<Poco::JSON::Object::Ptr>();
+        if (obj && obj->has(key)) return obj->getValue<Poco::Int64>(key);
+    } catch (...) {
+    }
+    return def;
+}
+
 bool jsonFieldBool(const std::string& body, const std::string& key) {
     try {
         Poco::JSON::Parser p;
@@ -258,10 +271,12 @@ public:
                    std::shared_ptr<OAuthStateStore> oauth_states,
                    std::shared_ptr<AuditPublisher> audit,
                    std::shared_ptr<SessionStore> sessions,
-                   std::shared_ptr<TokenDenylist> denylist)
+                   std::shared_ptr<TokenDenylist> denylist,
+                   std::shared_ptr<UploadSession> uploads)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
           oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
-          sessions_(std::move(sessions)), denylist_(std::move(denylist)) {}
+          sessions_(std::move(sessions)), denylist_(std::move(denylist)),
+          uploads_(std::move(uploads)) {}
 
     void handleRequest(HTTPServerRequest& req, HTTPServerResponse& resp) override {
         auto start = std::chrono::steady_clock::now();
@@ -540,6 +555,20 @@ private:
                 } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
                     return getVersion(resp, id, uid, segs[4]);
                 }
+                // Resumable chunked upload (§ upload_session.h). A large file
+                // arrives as independent parts that can be retried one at a
+                // time, and the client can ask what already landed instead of
+                // starting again — which a single streamed PUT cannot offer.
+                if (segs.size() == 4 && sub == "uploads" && method == "POST")
+                    return createUpload(req, resp, id, uid);
+                if (segs.size() == 5 && sub == "uploads") {
+                    if (method == "GET")    return uploadStatus(resp, id, uid, segs[4]);
+                    if (method == "DELETE") return abortUpload(resp, id, uid, segs[4]);
+                }
+                if (segs.size() == 6 && sub == "uploads" && segs[5] == "commit" && method == "POST")
+                    return commitUpload(resp, id, uid, segs[4]);
+                if (segs.size() == 7 && sub == "uploads" && segs[5] == "parts" && method == "PUT")
+                    return putUploadPart(req, resp, id, uid, segs[4], segs[6]);
             } else if (resource == "nodes") {
                 if (segs.size() == 3) {
                     if (method == "GET") return statNode(resp, id, uid);
@@ -731,6 +760,179 @@ private:
 
     // PUT content via client-streaming upload — reads the HTTP body in chunks
     // and streams to gRPC, so memory does not scale with file size.
+    // ---- resumable chunked upload ------------------------------------------
+    //
+    // Five calls: open, send parts, ask what landed, commit, or abandon. The
+    // parts are the file, so every one of these re-checks that the caller is
+    // the one who opened the session and that it is for THIS uid — a handle
+    // that outlives a request is a handle somebody else could otherwise finish.
+
+    // Does this caller hold WRITE on the target?
+    //
+    // Asked up front because opening a session RESERVES DISK: without it a
+    // caller who could never commit could still spend the quota. The core is
+    // the authority — this asks it rather than reimplementing the ACL rules,
+    // and treats an unreachable core as "no", since guessing yes would be the
+    // permissive kind of wrong.
+    bool ensureWritable(HTTPServerResponse& resp, const AuthIdentity& id,
+                        const std::string& uid) {
+        fileengine_rpc::CheckPermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_required_permission(coercePermission("w"));
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->checkPermission(rq);
+        if (!r.has_permission()) {
+            sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                     R"({"error":"no permission to write this file"})");
+            return false;
+        }
+        return true;
+    }
+
+    // Look up a session and prove it belongs to this caller and this file.
+    // Deliberately answers 404 for "not yours" as well as "not there": whether
+    // somebody else's upload exists is not this caller's business.
+    bool sessionFor(HTTPServerResponse& resp, const AuthIdentity& id,
+                    const std::string& uid, const std::string& sid,
+                    UploadSession::Meta& out) {
+        if (!uploads_->load(sid, out) || !UploadSession::owns(out, uid, id.user, id.tenant)) {
+            sendJson(resp, HTTPResponse::HTTP_NOT_FOUND,
+                     R"({"error":"no such upload session"})");
+            return false;
+        }
+        return true;
+    }
+
+    std::string sessionJson(const UploadSession::Meta& m) {
+        std::string got = "[";
+        bool first = true;
+        for (int i : uploads_->received(m)) {
+            if (!first) got += ",";
+            first = false;
+            got += std::to_string(i);
+        }
+        got += "]";
+        return std::string("{\"upload_id\":\"") + jsonEscape(m.id) +
+               "\",\"size\":" + std::to_string(m.size) +
+               ",\"chunk_size\":" + std::to_string(m.chunk_size) +
+               ",\"parts\":" + std::to_string(UploadSession::partCount(m.size, m.chunk_size)) +
+               ",\"received\":" + got +
+               ",\"complete\":" + (uploads_->complete(m) ? "true" : "false") +
+               ",\"expires_at\":" + std::to_string(static_cast<long long>(m.expires)) + "}";
+    }
+
+    void createUpload(HTTPServerRequest& req, HTTPServerResponse& resp,
+                      const AuthIdentity& id, const std::string& uid) {
+        // WRITE on the target is checked HERE, at the door, rather than being
+        // left to the commit. Opening a session reserves disk, so a caller who
+        // could never commit must not be able to spend it.
+        if (!ensureWritable(resp, id, uid)) return;
+        const std::string body = readBody(req);
+        const long long size = jsonFieldInt64(body, "size", 0);
+        long chunk = static_cast<long>(jsonFieldInt64(body, "chunk_size", 0));
+        if (chunk <= 0) chunk = 8 * 1024 * 1024;   // 8 MiB default
+        std::string err;
+        const std::string sid = uploads_->create(uid, id.user, id.tenant, size, chunk, err);
+        if (sid.empty()) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            std::string("{\"error\":\"") + jsonEscape(err) + "\"}");
+        }
+        UploadSession::Meta m;
+        uploads_->load(sid, m);
+        audit_->emitAuth("upload_session_open", "ok", id.user, id.tenant, clientIp(req));
+        sendJson(resp, HTTPResponse::HTTP_CREATED, sessionJson(m));
+    }
+
+    void uploadStatus(HTTPServerResponse& resp, const AuthIdentity& id,
+                      const std::string& uid, const std::string& sid) {
+        UploadSession::Meta m;
+        if (!sessionFor(resp, id, uid, sid, m)) return;
+        sendJson(resp, HTTPResponse::HTTP_OK, sessionJson(m));
+    }
+
+    void abortUpload(HTTPServerResponse& resp, const AuthIdentity& id,
+                     const std::string& uid, const std::string& sid) {
+        UploadSession::Meta m;
+        if (!sessionFor(resp, id, uid, sid, m)) return;
+        uploads_->discard(sid);
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+    }
+
+    void putUploadPart(HTTPServerRequest& req, HTTPServerResponse& resp,
+                       const AuthIdentity& id, const std::string& uid,
+                       const std::string& sid, const std::string& index_s) {
+        UploadSession::Meta m;
+        if (!sessionFor(resp, id, uid, sid, m)) return;
+        int index = -1;
+        try { index = std::stoi(index_s); } catch (...) { index = -1; }
+        std::string err;
+        // Streamed to disk, not buffered: a part can be 128 MiB.
+        if (!uploads_->putPartStream(m, index, req.stream(), err)) {
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            std::string("{\"error\":\"") + jsonEscape(err) + "\"}");
+        }
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+    }
+
+    void commitUpload(HTTPServerResponse& resp, const AuthIdentity& id,
+                      const std::string& uid, const std::string& sid) {
+        UploadSession::Meta m;
+        if (!sessionFor(resp, id, uid, sid, m)) return;
+        if (!ensureWritable(resp, id, uid)) return;   // re-checked: rights change
+        if (!uploads_->complete(m)) {
+            return sendJson(resp, HTTPResponse::HTTP_CONFLICT,
+                            std::string("{\"error\":\"upload is incomplete\",\"status\":") +
+                            sessionJson(m) + "}");
+        }
+        fileengine_rpc::AuthenticationContext auth;
+        fillAuth(&auth, id);
+        std::string rerr;
+        bool read_ok = true;
+        // The parts become one continuous stream — the core has no append, so
+        // this is where a resumable upload turns back into an ordinary version.
+        // Neither side holds the whole file: a chunk at a time, both ways.
+        // The callback shape is "next chunk or stop", so the read is driven by
+        // an explicit cursor across the parts rather than a nested loop.
+        std::vector<std::pair<int, long long>> plan;
+        const int n = UploadSession::partCount(m.size, m.chunk_size);
+        for (int i = 0; i < n; ++i) plan.emplace_back(i, UploadSession::expectedPartSize(m, i));
+        std::ifstream cur;
+        int cur_part = -1;
+        long long cur_left = 0;
+        std::vector<char> buf(256 * 1024);
+        auto next = [&](std::string& out) -> bool {
+            while (true) {
+                if (cur_part >= 0 && cur_left > 0 && cur) {
+                    const std::streamsize want = static_cast<std::streamsize>(
+                        std::min<long long>(cur_left, static_cast<long long>(buf.size())));
+                    cur.read(buf.data(), want);
+                    const std::streamsize got = cur.gcount();
+                    if (got <= 0) { read_ok = false; rerr = "part " + std::to_string(cur_part) + " is short"; return false; }
+                    cur_left -= got;
+                    out.assign(buf.data(), static_cast<std::size_t>(got));
+                    return true;
+                }
+                ++cur_part;
+                if (cur_part >= n) return false;         // done
+                cur.close(); cur.clear();
+                cur.open(uploads_->partPath(m, cur_part), std::ios::binary);
+                if (!cur) { read_ok = false; rerr = "part " + std::to_string(cur_part) + " is missing"; return false; }
+                cur_left = plan[cur_part].second;
+            }
+        };
+        auto res = grpc_->streamFileUpload(uid, auth, next);
+        if (!read_ok) {
+            return sendJson(resp, HTTPResponse::HTTP_INTERNAL_SERVER_ERROR,
+                            std::string("{\"error\":\"") + jsonEscape(rerr) + "\"}");
+        }
+        if (!res.success()) return mapError(resp, res.error());
+        // Only once the core has the version: an upload whose commit failed is
+        // still resumable, and throwing the parts away would make a transient
+        // core error cost the whole transfer.
+        uploads_->discard(sid);
+        sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
+    }
+
     void putContent(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         fileengine_rpc::AuthenticationContext auth;
         fillAuth(&auth, id);
@@ -2739,6 +2941,7 @@ private:
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
     std::shared_ptr<TokenDenylist> denylist_;
+    std::shared_ptr<UploadSession> uploads_;
     // Per-tenant WebDAV session-TTL cache (tenant -> {ttl_seconds, expiry-epoch}),
     // so the login/refresh path doesn't call ldap_manager on every request.
     inline static std::mutex sessTtlMu_;
@@ -2793,10 +2996,12 @@ public:
                    std::shared_ptr<OAuthStateStore> oauth_states,
                    std::shared_ptr<AuditPublisher> audit,
                    std::shared_ptr<SessionStore> sessions,
-                   std::shared_ptr<TokenDenylist> denylist)
+                   std::shared_ptr<TokenDenylist> denylist,
+                   std::shared_ptr<UploadSession> uploads)
         : cfg_(std::move(cfg)), grpc_(std::move(grpc)), ldap_(std::move(ldap)), tokens_(std::move(tokens)),
           oauth_(std::move(oauth)), oauth_states_(std::move(oauth_states)), audit_(std::move(audit)),
-          sessions_(std::move(sessions)), denylist_(std::move(denylist)) {}
+          sessions_(std::move(sessions)), denylist_(std::move(denylist)),
+          uploads_(std::move(uploads)) {}
 
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& req) override {
         // Shed before doing any work, but never the monitoring paths: an
@@ -2810,7 +3015,7 @@ public:
             return new OverloadHandler();
         }
         return new RequestHandler(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_,
-                                 sessions_, denylist_);
+                                 sessions_, denylist_, uploads_);
     }
 
     // Set once the server exists (the factory is built first, to be handed to it).
@@ -2835,6 +3040,7 @@ private:
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
     std::shared_ptr<TokenDenylist> denylist_;
+    std::shared_ptr<UploadSession> uploads_;
 };
 
 }  // namespace
@@ -2855,7 +3061,10 @@ HttpBridgeServer::HttpBridgeServer(const Config& cfg,
       denylist_(std::make_shared<TokenDenylist>(TokenDenylist::Options{
           cfg.revocation_enabled, cfg.redis_host, cfg.redis_port, cfg.redis_password,
           cfg.redis_db, "auth:revoked:", cfg.revocation_cache_ttl,
-          cfg.revocation_fail_open})) {}
+          cfg.revocation_fail_open})),
+      uploads_(std::make_shared<UploadSession>(UploadSession::Options{
+          cfg.upload_dir, cfg.upload_max_bytes, cfg.upload_max_part_bytes,
+          cfg.upload_ttl_seconds, cfg.upload_max_sessions_per_user})) {}
 
 HttpBridgeServer::~HttpBridgeServer() { stop(); }
 
@@ -2985,7 +3194,7 @@ void HttpBridgeServer::start() {
     // Held so the factory can ask the server how deep its queue is; the server
     // owns the factory, so this pointer stays valid for the server's lifetime.
     auto* factory = new HandlerFactory(cfg_, grpc_, ldap_, tokens_, oauth_, oauth_states_, audit_,
-                                       sessions_, denylist_);
+                                       sessions_, denylist_, uploads_);
     server_ = std::make_unique<Poco::Net::HTTPServer>(factory, *pool_, socket, params);
     // Start shedding once the backlog is several times the worker count: enough
     // headroom that an ordinary burst still queues and succeeds, low enough that

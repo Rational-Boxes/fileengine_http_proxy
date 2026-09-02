@@ -62,6 +62,7 @@ add_executable(http_bridge
     src/audit_publisher.cpp
     src/session_store.cpp
     src/token_denylist.cpp
+    src/upload_session.cpp
     src/utils.cpp
     ${PROTO_SRCS}
 )
@@ -155,6 +156,22 @@ target_link_libraries(denylist_tests
     GTest::gtest
 )
 add_test(NAME denylist_tests COMMAND denylist_tests)
+
+# --- resumable chunked upload sessions ---
+# The session id becomes a filesystem path and the part index becomes a file, so
+# the validation here is a security boundary, not tidiness. Tested against a
+# real temp directory: the failure modes that matter (a short part counted as
+# complete, a traversal id reaching remove_all) are I/O behaviour, not logic.
+add_executable(upload_session_tests tests/test_main.cpp tests/test_upload_session.cpp src/upload_session.cpp src/utils.cpp)
+target_include_directories(upload_session_tests PRIVATE include)
+target_compile_features(upload_session_tests PRIVATE cxx_std_17)
+target_link_libraries(upload_session_tests
+    Poco::JSON
+    Poco::Foundation
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME upload_session_tests COMMAND upload_session_tests)
 
 # --- OIDC id_token (RS256 / JWKS) verification suite ---
 add_executable(oidc_tests tests/test_main.cpp tests/test_oidc_verify.cpp src/oidc_verify.cpp)

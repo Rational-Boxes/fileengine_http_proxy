@@ -30,6 +30,7 @@
 #include "oauth_state_store.h"
 #include "token_store.h"
 #include "token_denylist.h"
+#include "upload_session.h"
 
 namespace httpbridge {
 
@@ -130,6 +131,16 @@ struct Config {
     bool revocation_enabled = true;
     int revocation_cache_ttl = 5;       // seconds a verdict is trusted = revocation latency
     bool revocation_fail_open = false;  // honour a token whose status is unknown
+
+    // Resumable chunked upload (see upload_session.h). Parts land on local disk
+    // and are streamed to the core on commit, so this directory needs room for
+    // the in-flight uploads — not for every file ever stored, but for whatever
+    // is mid-transfer and not yet abandoned.
+    std::string upload_dir = "/var/tmp/fileengine-uploads";
+    long long upload_max_bytes = 5368709120LL;   // 5 GiB, same ceiling as a streamed PUT
+    long upload_max_part_bytes = 134217728L;     // 128 MiB per part
+    int upload_ttl_seconds = 86400;              // abandoned sessions swept after a day
+    int upload_max_sessions_per_user = 8;
 };
 
 // Lightweight, concurrent REST front-end over the FileEngine gRPC FileService.
@@ -168,6 +179,7 @@ private:
     std::shared_ptr<AuditPublisher> audit_;
     std::shared_ptr<SessionStore> sessions_;
     std::shared_ptr<TokenDenylist> denylist_;
+    std::shared_ptr<UploadSession> uploads_;
     // Dedicated worker pool sized to cfg_.thread_pool. Declared before server_ so
     // it is destroyed *after* the server stops using it.
     std::unique_ptr<Poco::ThreadPool> pool_;
