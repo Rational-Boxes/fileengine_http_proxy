@@ -4,3 +4,10 @@ build*/
 *.log
 log/
 .env
+
+# Release tarballs. `make rpm-package` regenerates one of these on every build
+# (`git archive --output=$(PACKAGE_NAME)-$(VERSION).tar.gz HEAD`), so it is a
+# build artifact that happens to live in the source root. Four of them had been
+# committed over time; ignoring the pattern stops the next `git add -A` from
+# quietly re-adding the one the last build left behind.
+fileengine-http-bridge-*.tar.gz
