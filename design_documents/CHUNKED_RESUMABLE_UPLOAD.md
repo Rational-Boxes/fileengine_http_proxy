@@ -80,7 +80,7 @@ auth as everything else.
 | `POST /v1/files/{uid}/uploads` | open a session; body `{size, chunk_size}` | `201` + state |
 | `PUT /v1/files/{uid}/uploads/{id}/parts/{n}` | send part `n`, raw body + `Content-Digest` | `204` |
 | `GET /v1/files/{uid}/uploads/{id}` | what has landed | `200` + state |
-| `POST /v1/files/{uid}/uploads/{id}/commit` | assemble → one version | `204` |
+| `POST /v1/files/{uid}/uploads/{id}/commit` | assemble → one version; body `{sha256}` | `204` |
 | `DELETE /v1/files/{uid}/uploads/{id}` | abandon, drop the parts | `204` |
 
 State object:
@@ -165,20 +165,77 @@ refused.
   It closes the gap between arrival and commit — a part corrupted on disk, or a
   disk that lied — which arrival-time checking alone cannot see.
 
-### Whole-file digest, at no extra cost
+### Whole-file digest — the client declares it, the server enforces it
 
-While commit streams the parts it also hashes the assembled whole, and returns
-it:
+The bridge hashes the assembled whole while commit streams it, which costs
+nothing because the bytes are already moving. The question is what to compare it
+against, and the answer decides what the check can catch.
 
-```json
-{ "sha256": "b6b4050498db9247…" }
+**The client sends its own expected digest with the commit**, and the bridge
+refuses to create a version if they differ:
+
+```
+POST /v1/files/{uid}/uploads/{id}/commit
+{ "sha256": "b6b4050498db9247…" }        ← the client's hash of the file it MEANT to send
+
+409 { "error": "assembled content does not match the declared digest" }
 ```
 
-The client compares against its own. This is the only check that would catch an
-**assembly** fault — parts individually valid but concatenated in the wrong
-order, or one silently skipped — which is precisely the class of bug per-part
-digests cannot detect, and precisely the class this feature introduces. It costs
-nothing because the bytes are already moving through.
+Rejecting server-side rather than returning the digest for the client to check
+matters: a bad file then never becomes a version at all, instead of becoming one
+that a well-behaved client is trusted to notice and delete.
+
+#### What this catches that nothing else does
+
+**A file edited between the first attempt and the resumption.** Every part is
+individually valid — the early ones hash correctly against the old content, the
+later ones against the new — so per-part digests pass and the reconstruction is
+a silent splice of two different files. The only thing that sees it is a digest
+over the whole, compared against what the client believes the file to be.
+
+The design already refuses to reuse a session unless name, **size** and
+**mtime** all match, which catches essentially every ordinary edit for free.
+What it does not catch is an edit that preserves both — a tool that restores
+mtime, an in-place write of identical length, a filesystem with coarse mtime
+granularity. Rare, but the failure is a corrupt file reported as a success, and
+that is the category worth paying for.
+
+It also subsumes the assembly check: parts concatenated in the wrong order, or
+one skipped, produce a digest that differs from the client's.
+
+#### The browser cost, which is the real constraint
+
+`crypto.subtle.digest()` is **one-shot over a BufferSource — there is no
+streaming or incremental WebCrypto API.** So hashing a 1 GiB file with it means
+holding 1 GiB in an ArrayBuffer, which is not acceptable on a phone and is
+wasteful anywhere. The options are:
+
+| Approach | Cost | Notes |
+|---|---|---|
+| `crypto.subtle` over the whole file | 1 GiB resident | Rejected — memory |
+| Pure-JS incremental SHA-256 | ~50–100 MB/s | ~10–20 s of CPU for 1 GiB |
+| WASM SHA-256 | ~500 MB/s+ | Fast, but a dependency to vendor and audit |
+
+**Overlap it with the transfer.** The hash pass is a second read of the file, but
+it does not have to happen before the upload starts: run it concurrently and
+have the digest ready by the time the last part is sent. The upload is minutes;
+the hash is seconds; done in parallel the user waits for neither. That is why
+the digest is supplied at **commit** rather than at session open.
+
+Two consequences worth stating: the concurrent read means the file is read twice
+in total, which matters on a slow disk more than on a fast one; and if the file
+is edited *while* the hash is running, the client's own digest is taken from a
+mixed read too — it will still mismatch, so the commit is still refused, which
+is the correct outcome even though the digest is meaningless.
+
+#### A cheaper middle option, if the full pass is unwanted
+
+On resume, the client re-hashes a **bounded sample** of the parts the server
+says it already holds — the first and last, say — and compares against the
+per-part digests in the manifest. A few chunks of reading instead of the whole
+file, and it catches any edit that touched the sampled regions. It is a
+heuristic rather than a guarantee, and it is offered as a fallback for slow
+devices rather than as the design.
 
 ### What this does and does not defend against
 
@@ -329,7 +386,9 @@ file cannot create a directory with hundreds of thousands of entries.
 | Part fails its `Content-Digest` | `400`, temp file discarded, part never becomes `received` |
 | Part sent without a digest | `400` — the digest is required |
 | Part corrupted on disk after arrival | Caught at commit against the manifest digest; commit fails, parts retained |
-| Parts assembled wrongly by the bridge | Caught by the whole-file digest the client compares |
+| Parts assembled wrongly by the bridge | Whole-file digest differs from the declared one; commit `409` |
+| File edited between attempts (mtime changed) | Session not reused; a fresh one is opened |
+| File edited between attempts (mtime preserved) | Parts individually valid, whole-file digest differs; commit `409`, parts retained |
 | Commit while incomplete | `409` with the current state |
 | Another user touches the session | `404` on every call |
 
@@ -396,7 +455,11 @@ Settled: a required per-part `Content-Digest`, verified on arrival and again at
 commit, plus a whole-file digest computed during commit and returned. See
 [Part integrity](#part-integrity).
 
-Two things left, both on the client:
+The whole-file digest is now **declared by the client at commit and enforced by
+the bridge**, so a file edited mid-flight is rejected rather than spliced. See
+[Whole-file digest](#whole-file-digest--the-client-declares-it-the-server-enforces-it).
+
+Three things left, all on the client:
 
 - **`crypto.subtle` is only available in a secure context.** Over HTTPS, or on
   `localhost`, it is there; on the dev stack reached by LAN IP over plain HTTP it
@@ -404,6 +467,11 @@ Two things left, both on the client:
   requires. Either large uploads are HTTPS-only (defensible, and true of the real
   deployment), or a pure-JS SHA-256 fallback is carried for dev — which is slow
   enough on 8 MiB to be worth avoiding if we can just say "use HTTPS".
+- **The whole-file hash needs a streaming implementation.** WebCrypto has no
+  incremental API, so this is pure-JS (~10–20 s of CPU per GiB) or vendored
+  WASM (fast, but a dependency to audit). Run concurrently with the upload it is
+  free in wall-clock terms, but it is a second read of the file and it is code
+  we do not have yet.
 - **Hashing 8 MiB on the main thread janks the UI.** A 1 GiB file is ~128
   chunks; at roughly 20 ms each that is 2.5 s of blocking spread through the
   upload, in slices long enough to feel. A Web Worker fixes it and is the
