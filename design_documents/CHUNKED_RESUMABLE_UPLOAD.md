@@ -547,9 +547,10 @@ streamed reads as defence in depth.
   from the data path entirely and is how large systems usually do this. Rejected
   for now: it bypasses the core's compress/encrypt pipeline and its permission
   model, which is a much larger architectural change than it first looks.
-- **An append RPC in the core.** Cleaner than assembling in the bridge, and it
-  would let commit be O(1). It is a proto change with four consumers and a core
-  release; deferred rather than dismissed.
+- **An append RPC in the core.** Attractive enough to be worked through properly
+  rather than dismissed in a line — see [Appendix: an append operation in the
+  core](#appendix-an-append-operation-in-the-core). The conclusion is *not now*,
+  and the reason is more interesting than "it is a proto change".
 - **Parts in Redis.** Rejected: gigabytes of binary in a store that everything
   else depends on for auth and audit.
 
@@ -585,3 +586,107 @@ must NOT remove — a directory younger than the cull age even with no manifest,
 `*.partial` for a part still arriving, a session inside its TTL. A sweep tested
 only on what it deletes will pass while being far too eager, and the damage
 lands on someone else's upload.
+
+---
+
+## Appendix: an append operation in the core
+
+The bridge holds parts because the core cannot be appended to. If it could, four
+of the nine issues above — instance affinity, the part volume, the sweep, and
+the disk quota — would stop being the bridge's problem. That is a real prize, so
+it is worth being precise about the price.
+
+### What the write path actually is
+
+```
+chunk ──▶ CompressStream (zlib deflate) ──▶ EncryptStream (AES-256-GCM) ──▶ ofstream
+```
+
+Both are **stateful, sequential** codecs, and the encryption is the binding
+constraint:
+
+- **AES-256-GCM emits `[IV ‖ ciphertext ‖ tag]`, and the tag is computed at
+  `finish()` over the entire message.** You cannot append to a finished GCM
+  stream — the tag would no longer authenticate. And you cannot compute the tag
+  for part *n* without having processed parts *0…n-1*, in order. GCM's
+  *encryption* is counter mode and would be seekable; its *authentication* is
+  not.
+- **zlib deflate carries a dictionary across the whole stream**, so the same
+  ordering constraint applies, and its state cannot be cheaply checkpointed
+  (`Z_FULL_FLUSH` at every part boundary would make it resettable at a cost to
+  the compression ratio).
+- Neither an OpenSSL `EVP_CIPHER_CTX` nor a zlib `z_stream` is serialisable, so
+  **codec state cannot be persisted**. An upload in progress cannot survive a
+  core restart unless the parts themselves are kept.
+
+This is the crux, and it is not incidental: **appending to this format is
+inherently ordered, while resumable upload is inherently unordered.** Retrying
+one part, sending parts in parallel, filling a gap — all of it assumes parts are
+independent. The storage format says they are not.
+
+### The three shapes an append could take
+
+**A — the core buffers parts and assembles at commit.**
+`BeginUpload` / `AppendPart(index, bytes)` / `CommitUpload` / `AbortUpload` /
+`UploadStatus`. Parts are stored as separate files under a pending version and
+streamed through the pipeline once, at commit.
+
+| Pros | Cons |
+|---|---|
+| Any bridge instance can serve any part — Issue 1 dissolves | It is the bridge design relocated: same disk, same sweep, same quota, now in the core |
+| Storage lifecycle is owned by the component that owns storage | Proto change, 4 consumers, core release |
+| Out-of-order and parallel parts work | A "pending version" concept the DB does not have, with its own GC |
+| Survives a core restart (parts are on disk) | Makes Issue 7 (non-atomic writes) more pressing, not less |
+
+**B — strictly-ordered streaming append.**
+The core keeps the compress/encrypt pipeline open and appends each part into it
+as it arrives.
+
+| Pros | Cons |
+|---|---|
+| The only shape that genuinely removes intermediate storage — nothing is ever staged | Parts must arrive **in order**: no parallelism, and one slow retry stalls everything behind it |
+| Commit is free — the stream is already written | Cannot survive a core restart: the GCM/zlib state is unserialisable, so a bounce loses every in-flight upload |
+| | Holds an `EVP_CIPHER_CTX`, a `z_stream` and an open fd per in-flight upload, for the life of the transfer |
+| | Resume after a client disconnect needs the core to hold that state on a TTL — memory pinned by idle uploads |
+
+**C — per-part sealed blocks.**
+Each part is independently compressed and encrypted, and the stored object
+becomes a container of blocks rather than one stream.
+
+| Pros | Cons |
+|---|---|
+| Append becomes trivial, order-free and restart-safe — the constraint disappears entirely | **Changes the on-disk format.** Every existing file is one `[IV ‖ ct ‖ tag]` stream; the read path must learn a container and support both, or every file must be migrated |
+| Parts are independently verifiable and independently repairable | Compression ratio drops — no dictionary shared across parts |
+| This is essentially how object-store multipart already works | The largest change of the three, in the most critical component |
+
+### Recommendation: not now, and the reason matters
+
+**A moves the problem rather than removing it.** The parts still have to live
+somewhere, still need sweeping, still need a quota — the only thing that changes
+is which component owns the directory. That buys Issue 1 and little else, and
+Issue 1 can be bought far more cheaply with sticky sessions at nginx.
+
+**B is the only shape that truly removes the staging cost**, and it pays for it
+by giving up the two properties that make chunked upload worth having: parts
+that are independent, and an upload that survives a restart. A resumable
+uploader that cannot resume across a core bounce is a poor trade.
+
+**C is, honestly, the technically right long-term answer** — it is what object
+stores do, and it makes every problem in this document go away. It is also a
+storage-format change in the core, with a migration path for every file already
+stored, to serve one door's upload ergonomics. That is disproportionate today.
+
+So: keep the parts in the bridge. **Revisit the append operation when one of
+these becomes true**, at which point the arithmetic changes rather than the
+argument:
+
+1. **A second door needs resumable upload.** WebDAV or MCP wanting the same
+   thing turns bridge-side staging from a local choice into duplication, and the
+   core becomes the right home.
+2. **The bridge genuinely scales out.** Sticky sessions are a workaround; if
+   more than one bridge is a standing arrangement rather than a contingency,
+   option A stops being a lateral move.
+3. **The storage format is being changed anyway.** If C's container format is
+   ever on the table for another reason — per-block repair, deduplication,
+   partial reads — resumable append comes almost free alongside it, and should
+   be designed in rather than retrofitted.
