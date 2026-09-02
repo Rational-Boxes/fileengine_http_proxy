@@ -61,6 +61,7 @@ add_executable(http_bridge
     src/ldap_authenticator.cpp
     src/audit_publisher.cpp
     src/session_store.cpp
+    src/token_denylist.cpp
     src/utils.cpp
     ${PROTO_SRCS}
 )
@@ -141,6 +142,19 @@ target_link_libraries(security_tests
     GTest::gtest
 )
 add_test(NAME security_tests COMMAND security_tests)
+
+# --- revoked-token denylist (jti) suite ---
+# Built WITHOUT hiredis on purpose: the tests inject the store, so what is
+# exercised is the caching and the fail-closed policy — the parts that decide
+# whether a signed-out token is still honoured — rather than the Redis client.
+add_executable(denylist_tests tests/test_main.cpp tests/test_token_denylist.cpp src/token_denylist.cpp)
+target_include_directories(denylist_tests PRIVATE include)
+target_compile_features(denylist_tests PRIVATE cxx_std_17)
+target_link_libraries(denylist_tests
+    Threads::Threads
+    GTest::gtest
+)
+add_test(NAME denylist_tests COMMAND denylist_tests)
 
 # --- OIDC id_token (RS256 / JWKS) verification suite ---
 add_executable(oidc_tests tests/test_main.cpp tests/test_oidc_verify.cpp src/oidc_verify.cpp)
