@@ -271,6 +271,43 @@ TEST(ClientIp, HardenedReturnsRealClient) {
               "203.0.113.9");
 }
 
+// The deployment topology, which is where this went wrong in production.
+//
+// The edge nginx runs on the HOST and proxies to a PUBLISHED container port.
+// Podman rewrites the source address on the way in, so the address the bridge
+// observes as its peer is the network's GATEWAY (10.89.0.1) — never 127.0.0.1,
+// even though nginx connected to 127.0.0.1. Configuring the trusted list as
+// loopback therefore trusts nobody, the resolver correctly refuses to believe
+// X-Forwarded-For, and every audited event records the gateway as the client.
+//
+// Measured on the deployment before the config was corrected: 10.89.0.1 against
+// 2168 events across http_bridge, webdav_bridge and discussion.
+TEST(ClientIp, ContainerGatewayIsTheProxyHop) {
+    std::vector<std::string> trusted = {"10.89.0.1/32", "127.0.0.1/32"};
+    EXPECT_EQ(resolveClientIp("10.89.0.1", "203.0.113.9", trusted), "203.0.113.9");
+    EXPECT_EQ(resolveClientIp("10.89.0.1", "203.0.113.9, 10.89.0.1", trusted), "203.0.113.9");
+}
+
+// The bug itself, pinned so it cannot come back silently: loopback-only trust on
+// a published container port discards the real client and records the gateway.
+// The resolver is behaving correctly here — failing closed on an untrusted peer
+// is the whole point — so this asserts the CONFIGURATION requirement, not a code
+// defect.
+TEST(ClientIp, LoopbackOnlyTrustDiscardsTheClientBehindAPublishedPort) {
+    std::vector<std::string> loopback_only = {"127.0.0.1/32"};
+    EXPECT_EQ(resolveClientIp("10.89.0.1", "203.0.113.9", loopback_only), "10.89.0.1");
+}
+
+// Trusting the gateway must NOT trust the rest of the container subnet. Sibling
+// containers reach the bridge from 10.89.0.x, and one of them being compromised
+// must not let it assert any client IP it likes into the audit trail. This is
+// why the deployed value is the gateway as a /32 and not the /24.
+TEST(ClientIp, SiblingContainersCannotSpoofTheClient) {
+    std::vector<std::string> trusted = {"10.89.0.1/32"};
+    EXPECT_EQ(resolveClientIp("10.89.0.7", "203.0.113.9", trusted), "10.89.0.7");
+    EXPECT_EQ(resolveClientIp("10.89.0.7", "9.9.9.9, 203.0.113.9", trusted), "10.89.0.7");
+}
+
 // Spoofing: a client injects a fake left-most XFF entry. The resolver must ignore
 // it and return the address the trusted proxy actually observed.
 TEST(ClientIp, HardenedIgnoresSpoofedLeftmost) {
