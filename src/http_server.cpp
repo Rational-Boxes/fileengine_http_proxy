@@ -1222,24 +1222,6 @@ private:
     // directories) under `root`, recursing into directories. Uses the caller's
     // identity to list, so a cascade only reaches subtrees they can see. Bounded
     // to avoid pathological/cyclic trees.
-    void collectDescendants(const std::string& root, const AuthIdentity& id,
-                            std::vector<std::string>& out, int depth) {
-        static const int kMaxAclCascadeDepth = 64;
-        if (depth >= kMaxAclCascadeDepth) return;
-        fileengine_rpc::ListDirectoryRequest rq;
-        rq.set_uid(root);
-        fillAuth(rq.mutable_auth(), id);
-        auto r = grpc_->listDirectory(rq);
-        if (!r.success()) return;
-        for (const auto& e : r.entries()) {
-            if (e.deleted()) continue;
-            out.push_back(e.uid());  // apply to files and directories alike
-            if (e.type() == fileengine_rpc::DIRECTORY) {
-                collectDescendants(e.uid(), id, out, depth + 1);  // recurse to reach nested files
-            }
-        }
-    }
-
     void grantPerm(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         std::string body = readBody(req);
         std::string principal = jsonField(body, "principal");
@@ -1248,27 +1230,23 @@ private:
         auto effect = coerceEffect(jsonField(body, "effect"));
         bool recursive = jsonFieldBool(body, "recursive");
 
-        auto grantOne = [&](const std::string& target) {
-            fileengine_rpc::GrantPermissionRequest rq;
-            rq.set_resource_uid(target);
-            rq.set_principal(principal);
-            rq.set_permission(permission);
-            rq.set_effect(effect);
-            fillAuth(rq.mutable_auth(), id);
-            return grpc_->grantPermission(rq);
-        };
-        auto r = grantOne(uid);
+        // ONE call, recursive or not.
+        //
+        // This used to enumerate the subtree with listDirectory and then issue a
+        // grant per node. On a large tree that did not finish: it exceeded the
+        // edge timeout having applied part of the tree, and the walk was not
+        // atomic, so what it left behind was a half-applied cascade with no
+        // record of where it stopped. The core now does it as one statement in
+        // one transaction, and reports how many nodes it reached.
+        fileengine_rpc::GrantPermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_principal(principal);
+        rq.set_permission(permission);
+        rq.set_effect(effect);
+        rq.set_recursive(recursive);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->grantPermission(rq);
         if (!r.success()) return mapError(resp, r.error());
-        if (recursive) {
-            // Apply the same grant to every descendant file and directory. Not
-            // atomic — a mid-walk failure leaves a partial cascade, safe to re-run.
-            std::vector<std::string> nodes;
-            collectDescendants(uid, id, nodes, 0);
-            for (const auto& n : nodes) {
-                auto rr = grantOne(n);
-                if (!rr.success()) return mapError(resp, rr.error());
-            }
-        }
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
@@ -1280,27 +1258,16 @@ private:
         auto effect = coerceEffect(jsonField(body, "effect"));
         bool recursive = jsonFieldBool(body, "recursive");
 
-        auto revokeOne = [&](const std::string& target) {
-            fileengine_rpc::RevokePermissionRequest rq;
-            rq.set_resource_uid(target);
-            rq.set_principal(principal);
-            rq.set_permission(permission);
-            rq.set_effect(effect);
-            fillAuth(rq.mutable_auth(), id);
-            return grpc_->revokePermission(rq);
-        };
-        auto r = revokeOne(uid);
+        // ONE call — see grantPerm.
+        fileengine_rpc::RevokePermissionRequest rq;
+        rq.set_resource_uid(uid);
+        rq.set_principal(principal);
+        rq.set_permission(permission);
+        rq.set_effect(effect);
+        rq.set_recursive(recursive);
+        fillAuth(rq.mutable_auth(), id);
+        auto r = grpc_->revokePermission(rq);
         if (!r.success()) return mapError(resp, r.error());
-        if (recursive) {
-            // Remove the same rule from every descendant file and directory. Not
-            // atomic — a mid-walk failure leaves a partial cascade, safe to re-run.
-            std::vector<std::string> nodes;
-            collectDescendants(uid, id, nodes, 0);
-            for (const auto& n : nodes) {
-                auto rr = revokeOne(n);
-                if (!rr.success()) return mapError(resp, rr.error());
-            }
-        }
         sendStatus(resp, HTTPResponse::HTTP_NO_CONTENT);
     }
 
