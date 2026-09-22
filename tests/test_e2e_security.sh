@@ -74,32 +74,14 @@ code=$(code_for "$BASE/v1/whoami")
 # webdav_bridge/test_webdav.sh takes — where TOTP would need the enrolled secret,
 # which the harness has no way to know. FE_TOKEN short-circuits the whole thing
 # for a caller that already holds a session.
-jget() { python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
-
-login() {
-    local resp tok mfatok code
-    resp=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
-    tok=$(echo "$resp" | jget token)
-    if [ -n "$tok" ]; then echo "$tok"; return 0; fi
-    mfatok=$(echo "$resp" | jget mfa_token)
-    [ -n "$mfatok" ] || { echo "$resp" >&2; return 1; }
-    curl -s -X DELETE "$MAILHOG_URL/api/v1/messages" >/dev/null
-    curl -s -X POST "$BASE/v1/auth/2fa" -H 'Content-Type: application/json' \
-         -d "{\"mfa_token\":\"$mfatok\",\"action\":\"send\",\"method\":\"email\"}" >/dev/null
-    sleep 1
-    code=$(curl -s "$MAILHOG_URL/api/v2/messages" | python3 -c "
-import sys,json,re,quopri
-items=json.load(sys.stdin).get('items',[])
-b=quopri.decodestring(items[0]['Content']['Body']).decode('utf-8','ignore') if items else ''
-print((re.findall(r'\b(\d{6})\b', b) or [''])[0])")
-    [ -n "$code" ] || { echo "no email 2FA code in MailHog at $MAILHOG_URL" >&2; return 1; }
-    curl -s -X POST "$BASE/v1/auth/2fa" -H 'Content-Type: application/json' \
-         -d "{\"mfa_token\":\"$mfatok\",\"method\":\"email\",\"code\":\"$code\"}" | jget token
-}
+# One shared implementation of "log in, completing a 2FA challenge if the tenant
+# requires one" — see tests/lib_login.sh. FE_TOKEN short-circuits it for a caller
+# that already holds a session.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_login.sh"
 
 TOKEN="${FE_TOKEN:-}"
 if [ -z "$TOKEN" ]; then
-    TOKEN="$(login 2>/tmp/fe_sec_login.err)" || TOKEN=""
+    TOKEN="$(fe_login "$FE_USER" "$FE_PASS" 2>/tmp/fe_sec_login.err)" || TOKEN=""
 fi
 if [ -z "$TOKEN" ]; then
     bad "could not obtain token for $FE_USER" "$(cat /tmp/fe_sec_login.err 2>/dev/null)"
