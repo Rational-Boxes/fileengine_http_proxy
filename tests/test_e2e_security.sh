@@ -14,11 +14,17 @@
 # Usage: BASE=http://localhost:8090 \
 #        FE_USER=<non-admin login> FE_PASS=<password> [FE_EXPECT_USER=<uid>] \
 #        [FE_VICTIM=<a known other username>] \
+#        [FE_TOKEN=<an already-minted session bearer>] [MAILHOG_URL=...] \
 #        ./tests/test_e2e_security.sh
 set -u
 BASE="${BASE:-http://localhost:8090}"
 FE_USER="${FE_USER:-testuser}"
 FE_PASS="${FE_PASS:-password}"
+# Where the emailed 2FA code is read from when the tenant requires 2FA. The dev
+# fixture's testuser IS enrolled, which used to strand this whole suite: every
+# check below needs one real token, and /v1/auth/token answers a password login
+# with an MfaPending challenge rather than a session.
+MAILHOG_URL="${MAILHOG_URL:-http://localhost:8025}"
 CRED="${FE_USER}:${FE_PASS}"
 EXPECT_USER="${FE_EXPECT_USER:-${FE_USER}}"
 VICTIM="${FE_VICTIM:-admin}"
@@ -59,10 +65,45 @@ echo "[auth] unauthenticated requests rejected"
 code=$(code_for "$BASE/v1/whoami")
 [ "$code" = "401" ] && ok "whoami without creds -> 401" || bad "whoami no creds -> 401" "got $code"
 
-# get a real token for the (non-admin) test user
-tokresp=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
-TOKEN=$(grep -oE '"token":"[^"]+"' <<<"$tokresp" | sed 's/.*"token":"//;s/"//')
-if [ -z "$TOKEN" ]; then bad "could not obtain token for $FE_USER" "$tokresp"; fi
+# Get a real token for the (non-admin) test user.
+#
+# Handles both shapes of a password login: a tenant with 2FA off answers with the
+# session outright, while one that requires it answers with an MfaPending
+# challenge that has to be completed. Completing it with the EMAIL method keeps
+# this dependency-free — the code is read back from MailHog, the same route
+# webdav_bridge/test_webdav.sh takes — where TOTP would need the enrolled secret,
+# which the harness has no way to know. FE_TOKEN short-circuits the whole thing
+# for a caller that already holds a session.
+jget() { python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+
+login() {
+    local resp tok mfatok code
+    resp=$(curl -s -u "$CRED" -X POST "$BASE/v1/auth/token")
+    tok=$(echo "$resp" | jget token)
+    if [ -n "$tok" ]; then echo "$tok"; return 0; fi
+    mfatok=$(echo "$resp" | jget mfa_token)
+    [ -n "$mfatok" ] || { echo "$resp" >&2; return 1; }
+    curl -s -X DELETE "$MAILHOG_URL/api/v1/messages" >/dev/null
+    curl -s -X POST "$BASE/v1/auth/2fa" -H 'Content-Type: application/json' \
+         -d "{\"mfa_token\":\"$mfatok\",\"action\":\"send\",\"method\":\"email\"}" >/dev/null
+    sleep 1
+    code=$(curl -s "$MAILHOG_URL/api/v2/messages" | python3 -c "
+import sys,json,re,quopri
+items=json.load(sys.stdin).get('items',[])
+b=quopri.decodestring(items[0]['Content']['Body']).decode('utf-8','ignore') if items else ''
+print((re.findall(r'\b(\d{6})\b', b) or [''])[0])")
+    [ -n "$code" ] || { echo "no email 2FA code in MailHog at $MAILHOG_URL" >&2; return 1; }
+    curl -s -X POST "$BASE/v1/auth/2fa" -H 'Content-Type: application/json' \
+         -d "{\"mfa_token\":\"$mfatok\",\"method\":\"email\",\"code\":\"$code\"}" | jget token
+}
+
+TOKEN="${FE_TOKEN:-}"
+if [ -z "$TOKEN" ]; then
+    TOKEN="$(login 2>/tmp/fe_sec_login.err)" || TOKEN=""
+fi
+if [ -z "$TOKEN" ]; then
+    bad "could not obtain token for $FE_USER" "$(cat /tmp/fe_sec_login.err 2>/dev/null)"
+fi
 
 # ---- C1: a non-admin must NOT be able to self-assign system_admin --------
 # Under the trust model the bridge is the admin-gate; the core trusts callers.
