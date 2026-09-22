@@ -43,12 +43,18 @@ bad()  { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s\n    
 skip() { SKIP=$((SKIP+1)); printf '  \033[33m⊘ SKIP\033[0m %s\n' "$1"; }
 
 # Bearer for an identity, from a token if supplied or a password login.
+#
+# The password path goes through the shared 2FA-aware login (tests/lib_login.sh):
+# a plain /v1/auth/token answers an enrolled user with a challenge rather than a
+# session, and this suite then aborted with "could not authenticate" — so the
+# whole of erasure went untested against any fixture with 2FA on, which is the
+# realistic one. A preset token still wins, for a caller that has its own.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_login.sh"
+
 mint() {  # mint <user> <pass> <preset-token>
     if [ -n "$3" ]; then printf '%s' "$3"; return 0; fi
     [ -n "$1" ] || return 1
-    curl -s -u "$1:$2" -X POST "$BASE/v1/auth/token?tenant=$TENANT" \
-         -H 'Content-Type: application/json' -d '{}' --max-time 20 \
-      | grep -oE '"token":"[^"]+"' | sed 's/.*"token":"//;s/"//'
+    fe_login "$1" "$2" "$TENANT"
 }
 api() {  # api <token> <method> <path> [body]
     local t="$1" m="$2" p="$3" b="${4:-}"

@@ -53,7 +53,13 @@ jget(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>
 # test self-contained we assume a clean slate (2FA off) at start.
 login="$(curl -s -u "$USER:$PASS" -X POST "$BRIDGE/v1/auth/token")"
 if [ "$(printf '%s' "$login" | jget mfa_required)" = "True" ]; then
-    echo "NOTE: 2FA already enabled for $USER; test needs a clean slate. Disable it first."; exit 0
+    # "SKIP:" on purpose: this exits 0 without testing anything, and the suite
+    # runner classifies a silent 0 as a PASS. Nine checks reporting as green
+    # because the fixture user was already enrolled is worse than a visible skip.
+    echo "SKIP: 2FA is already enabled for $USER, and this suite needs a clean slate"
+    echo "      (it enrols, challenges, then disables again). Point USER/PASS at an"
+    echo "      UNENROLLED account, or disable 2FA for this one first."
+    exit 0
 fi
 sess="$(printf '%s' "$login" | jget token)"
 [ -n "$sess" ] || { echo "SKIP: could not obtain an initial session for $USER"; exit 0; }

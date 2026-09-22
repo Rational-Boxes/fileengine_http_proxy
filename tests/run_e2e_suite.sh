@@ -53,7 +53,7 @@ SUITE=(
     test_e2e_2fa.sh
 )
 
-RAN=0; SKIPPED=0; FAILED=()
+PASSED=0; SKIPPED=0; FAILED=()
 for name in "${SUITE[@]}"; do
     script="$HERE/$name"
     [ -f "$script" ] || { echo "-- $name: not present, skipping"; continue; }
@@ -63,22 +63,40 @@ for name in "${SUITE[@]}"; do
     echo "########################################################################"
     # A script that SKIPs prints "SKIP:" and exits 0; distinguish that from a
     # genuine pass so the summary is honest about what actually ran.
-    out="$(bash "$script" 2>&1)"; rc=$?
+    # test_e2e_2fa.sh takes USER/PASS rather than the shared FE_* names, and it
+    # needs an UNENROLLED account: it enrols, challenges, then disables again, so
+    # pointing it at the (enrolled) primary fixture user only makes it skip. The
+    # non-admin second fixture fits, in the tenant it actually belongs to — its
+    # FOREIGN tenant is what FE_TENANT2 names, which is not the same thing.
+    # Without this mapping the suite has been skipping for "set PASS" in every
+    # standard invocation.
+    case "$name" in
+      test_e2e_2fa.sh)
+        out="$(USER="${TA_USER}" PASS="${TA_PASS}" TENANT="${TA_TENANT}" \
+               bash "$script" 2>&1)"; rc=$? ;;
+      *)
+        out="$(bash "$script" 2>&1)"; rc=$? ;;
+    esac
     printf '%s\n' "$out"
     if [ $rc -ne 0 ]; then
         FAILED+=("$name")
     elif printf '%s' "$out" | grep -q '^SKIP:'; then
         SKIPPED=$((SKIPPED+1))
     else
-        RAN=$((RAN+1))
+        PASSED=$((PASSED+1))
     fi
 done
 
+# A failing suite RAN. The old summary counted only the ones that passed, so a
+# suite that tried and failed reported as "ran=0 … failed=3" — which reads as
+# nothing having executed, and sends you looking for a harness problem instead of
+# at the three failures.
+RAN=$((PASSED + ${#FAILED[@]}))
 echo
 echo "========================================================================"
-echo " e2e suite: ran=$RAN  skipped=$SKIPPED  failed=${#FAILED[@]}"
+echo " e2e suite: ran=$RAN (passed=$PASSED failed=${#FAILED[@]})  skipped=$SKIPPED"
 if [ "${#FAILED[@]}" -gt 0 ]; then
     printf '   failed: %s\n' "${FAILED[*]}"
-    exit 1
 fi
 echo "========================================================================"
+[ "${#FAILED[@]}" -eq 0 ]
