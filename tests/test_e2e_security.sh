@@ -120,7 +120,15 @@ if [ -n "$TOKEN" ]; then
     code=$(code_for -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
                     -d '{"role":"pwn"}' -X POST "$BASE/v1/roles")
     if [ "$code" = "403" ] || [ "$code" = "404" ]; then ok "createRole as non-admin -> $code (denied)"
-    else xfail "createRole as non-admin returned $code, expected 403 (C1)"; fi
+    else
+        xfail "createRole as non-admin returned $code, expected 403 (C1)"
+        # The gate is missing, so the role was really created — remove it. Left
+        # behind, every run of this suite adds another "pwn" to the tenant's role
+        # catalog, which is where the stray entries in dev catalogs come from, and
+        # a test that quietly grows production-shaped state is a poor neighbour
+        # even when it is proving a finding.
+        curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -X DELETE "$BASE/v1/roles/pwn"
+    fi
 fi
 
 # ---- JWT integrity over the wire (regression guards) ---------------------

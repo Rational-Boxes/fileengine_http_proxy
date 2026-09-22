@@ -53,7 +53,7 @@ SUITE=(
     test_e2e_2fa.sh
 )
 
-RAN=0; SKIPPED=0; FAILED=()
+PASSED=0; SKIPPED=0; FAILED=()
 for name in "${SUITE[@]}"; do
     script="$HERE/$name"
     [ -f "$script" ] || { echo "-- $name: not present, skipping"; continue; }
@@ -70,15 +70,20 @@ for name in "${SUITE[@]}"; do
     elif printf '%s' "$out" | grep -q '^SKIP:'; then
         SKIPPED=$((SKIPPED+1))
     else
-        RAN=$((RAN+1))
+        PASSED=$((PASSED+1))
     fi
 done
 
+# A failing suite RAN. The old summary counted only the ones that passed, so a
+# suite that tried and failed reported as "ran=0 … failed=3" — which reads as
+# nothing having executed, and sends you looking for a harness problem instead of
+# at the three failures.
+RAN=$((PASSED + ${#FAILED[@]}))
 echo
 echo "========================================================================"
-echo " e2e suite: ran=$RAN  skipped=$SKIPPED  failed=${#FAILED[@]}"
+echo " e2e suite: ran=$RAN (passed=$PASSED failed=${#FAILED[@]})  skipped=$SKIPPED"
 if [ "${#FAILED[@]}" -gt 0 ]; then
     printf '   failed: %s\n' "${FAILED[*]}"
-    exit 1
 fi
 echo "========================================================================"
+[ "${#FAILED[@]}" -eq 0 ]
