@@ -16,6 +16,7 @@
 #define LDAP_DEPRECATED 1
 
 #include "ldap_authenticator.h"
+#include "tenant_role_policy.h"
 #include "utils.h"  // For logging functions
 #include <iostream>
 #include <algorithm>
@@ -38,7 +39,14 @@ LDAPAuthenticator::LDAPAuthenticator(
       ldap_domain_(ldap_domain),
       bind_dn_(bind_dn),
       bind_password_(bind_password),
-      tenant_base_(tenant_base.empty() ? ldap_domain : tenant_base),
+      // NEVER the directory root. An empty tenant_base used to fall back to
+      // ldap_domain, which turned every tenant-scoped search into a
+      // whole-directory one — including the role search below. Deriving
+      // ou=tenants here keeps an unconfigured deployment inside tenant scope
+      // instead of quietly outside it.
+      tenant_base_(tenant_base.empty()
+                       ? fileengine::tenant_roles::defaultTenantBase(ldap_domain)
+                       : tenant_base),
       user_base_(user_base.empty() ? ldap_domain : user_base),
       replica_endpoint_(replica_endpoint),
       breaker_(failover_cooldown_s) {
@@ -676,7 +684,38 @@ std::string LDAPAuthenticator::extractTenantFromUserDN(const std::string& user_d
     return "";
 }
 
+// Tenant-context roles, filtered. THE ONLY ENTRY POINT.
 std::vector<std::string> LDAPAuthenticator::extractRolesFromGroups(LDAP* ld, const std::string& user_dn) {
+    std::vector<std::string> roles = collectTenantGroupRoles(ld, user_dn);
+
+    // DEPLOYMENT_MANAGEMENT_INTERFACE.md §6.2 asks for two independent things:
+    // the search must not reach outside tenant scope (done in the collector, at
+    // the base list), and a name in the deployment namespace must be refused
+    // "regardless of which base returned them". Both, because the first depends
+    // on directory LAYOUT and layout is configuration — a system_* group moved
+    // into a tenant OU by mistake, or a tenant OU created above one, puts it
+    // back inside a base this code is entitled to search.
+    //
+    // Matching the PREFIX rather than a list of known names mirrors
+    // admin_master_control/src/admin_master_control/roles.py: a role that
+    // reaches the directory before it reaches any code must still be refused,
+    // not welcomed for as long as the list lags.
+    std::vector<std::string> kept;
+    kept.reserve(roles.size());
+    for (const std::string& r : roles) {
+        if (fileengine::tenant_roles::isDeploymentRole(r)) {
+            webdav::warnLog("LDAPAuthenticator::extractRolesFromGroups: REFUSED deployment "
+                            "role '" + r + "' found in tenant scope for " + user_dn +
+                            " — deployment roles are resolved by the system administration "
+                            "tier, never by a tenant door");
+            continue;
+        }
+        kept.push_back(r);
+    }
+    return kept;
+}
+
+std::vector<std::string> LDAPAuthenticator::collectTenantGroupRoles(LDAP* ld, const std::string& user_dn) {
     std::vector<std::string> roles;
 
     // Search for groupOfNames entities the user belongs to
@@ -686,32 +725,43 @@ std::vector<std::string> LDAPAuthenticator::extractRolesFromGroups(LDAP* ld, con
     webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: Tenant base: '" + tenant_base_ + "'");
     webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: LDAP domain: '" + ldap_domain_ + "'");
 
-    // Based on your information, the groups are under ou=default,ou=tenants,dc=rationalboxes,dc=com
-    // So let's make sure we search there specifically
+    // TENANT CONTEXT SEARCHES TENANT OUs AND NOTHING ELSE.
+    //
+    // This used to be a widening list: the tenant base, then the DIRECTORY ROOT,
+    // then ou=groups, ou=Group, ou=Roles, ou=role, ou=tenants and ou=users
+    // beneath it — and the loop did not stop at the first base that answered, it
+    // UNIONED them. So every groupOfNames anywhere in the directory naming this
+    // user became a role of theirs in tenant context.
+    //
+    // (DEPLOYMENT_MANAGEMENT_INTERFACE.md §6.2 describes this as breaking at the
+    // first successful base, which would make the outcome depend on search
+    // ordering. Reading the loop, it does not break — so the root was not
+    // sometimes reached, it was always reached. The document is being corrected
+    // alongside this change.)
+    //
+    // That is the same shape as the defect fixed in 1.9.17, and it is what makes
+    // a group OUTSIDE tenant scope dangerous: the deployment-tier roles
+    // (system_*) are defined outside ou=tenants precisely so they are not a
+    // tenant's business, and this search walked straight over them.
+    //
+    // So: one base, the tenant subtree. SUBTREE scope already covers every
+    // ou=<tenant> beneath it, which is what the widening list was reaching for
+    // by accident. Global groups outside ou=tenants belong to the deployment
+    // tier and are resolved by admin_master_control, never here.
     std::vector<std::string> possible_bases;
-
-    // Add the specific location where groups are known to exist
-    possible_bases.push_back("ou=default,ou=tenants," + ldap_domain_);
-
-    // Add tenant-specific base if configured
-    if (!tenant_base_.empty()) {
-        possible_bases.push_back(tenant_base_);
-        // Also try tenant base without specific tenant (for default tenant)
-        if (tenant_base_.find("ou=default") == std::string::npos) {
-            possible_bases.push_back("ou=default," + tenant_base_);
-        }
+    const std::string scoped = fileengine::tenant_roles::roleSearchBase(tenant_base_, ldap_domain_);
+    if (!scoped.empty()) {
+        possible_bases.push_back(scoped);
+    } else {
+        // Refusing is right. A tenant_base equal to the directory root is the
+        // misconfiguration this whole change exists to stop, and searching it
+        // "just this once" would reintroduce the union above.
+        webdav::warnLog("LDAPAuthenticator::extractRolesFromGroups: REFUSING to resolve "
+                        "roles — tenant base is unset or equals the directory root ('" +
+                        tenant_base_ + "'). Set FILEENGINE_LDAP_TENANT_BASE to "
+                        "ou=tenants," + ldap_domain_);
+        return roles;
     }
-
-    // Add domain base
-    possible_bases.push_back(ldap_domain_);
-
-    // Add common organizational unit patterns
-    possible_bases.push_back("ou=groups," + ldap_domain_);
-    possible_bases.push_back("ou=Group," + ldap_domain_);
-    possible_bases.push_back("ou=Roles," + ldap_domain_);
-    possible_bases.push_back("ou=role," + ldap_domain_);
-    possible_bases.push_back("ou=tenants," + ldap_domain_);
-    possible_bases.push_back("ou=users," + ldap_domain_);
 
     LDAPMessage* result = nullptr;
     int ldap_result = LDAP_NO_SUCH_OBJECT; // Initialize to error state
@@ -844,7 +894,11 @@ std::vector<std::string> LDAPAuthenticator::extractRolesFromGroups(LDAP* ld, con
         webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: Trying alternative search with filter: '" + alt_search_filter + "'");
 
         // Specifically try the known location again with the broader filter
-        std::string known_location = "ou=default,ou=tenants," + ldap_domain_;
+        // The tenant subtree, not a hard-coded "default". This line named
+        // ou=default regardless of who was logging in, so a user in another
+        // tenant with no roles of their own fell back into default's groups.
+        // Same base as the search above, only with the broader filter.
+        std::string known_location = tenant_base_;
         webdav::debugLog("LDAPAuthenticator::extractRolesFromGroups: Trying known location: " + known_location);
 
         ldap_result = ldap_search_s(
