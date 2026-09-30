@@ -100,6 +100,9 @@ public:
 
     // Administrative operations
     fileengine_rpc::StorageUsageResponse getStorageUsage(const fileengine_rpc::StorageUsageRequest& request);
+
+    // The tenant lifecycle state, for the login check (§3.4c). Read-only.
+    fileengine_rpc::TenantStateResponse getTenantState(const fileengine_rpc::TenantStateRequest& request);
     fileengine_rpc::TriggerSyncResponse triggerSync(const fileengine_rpc::TriggerSyncRequest& request);
 
     // Streaming operations (memory-efficient for large files).

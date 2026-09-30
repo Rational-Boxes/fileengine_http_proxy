@@ -66,6 +66,22 @@ service FileService {
 
     // Administrative operations
     rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsageResponse);
+
+    // Tenant lifecycle state, from the global `tenants` registry.
+    // PROPOSAL_system_administration_application.md §3.4c.
+    //
+    // THIS IS THE DOORS' LOGIN CHECK. Only `live` admits a user; every other
+    // state refuses, including `provisioning` (a half-built tenant must not be
+    // reachable) and `decommissioned` (the row outlives the data so the name
+    // cannot be silently reused, and must not become a way back in).
+    //
+    // A read rather than a per-door database connection, deliberately: the state
+    // has ONE authoritative home and one read path. A door with its own libpq
+    // route into the core's global schema would be a second reader of
+    // core-owned state, and an LDAP copy would be a second WRITER — a tenant
+    // suspended in one place and live in the other, reachable through whichever
+    // door read the stale copy, failing silently.
+    rpc GetTenantState(TenantStateRequest) returns (TenantStateResponse);
     rpc PurgeOldVersions(PurgeOldVersionsRequest) returns (PurgeOldVersionsResponse);
 
     // Erasure ("true delete") — PROPOSAL_accountability_record.md §5.4.
@@ -127,6 +143,30 @@ enum FileType {
     REGULAR_FILE = 0;
     DIRECTORY = 1;
     SYMLINK = 2;
+}
+
+// The same permissions as BIT VALUES, for permission_mask.
+//
+// `Permission` above is an ordinal (READ = 0), which is what a single-permission
+// field needs and is useless for OR-ing: READ|WRITE would be 1. The core stores
+// a bitmask, so a mask field has to speak in bits, and two fields in one message
+// numbering the same concept differently is a trap — a caller who assumes
+// permission_mask takes Permission values gets silent nonsense rather than an
+// error. These are those bits, named, so nobody has to hardcode 0x400.
+enum PermissionBit {
+    PB_NONE                  = 0;
+    PB_RESTORE_TO_VERSION    = 0x008;
+    PB_RETRIEVE_BACK_VERSION = 0x010;
+    PB_VIEW_VERSIONS         = 0x020;
+    PB_UNDELETE              = 0x040;
+    PB_LIST_DELETED          = 0x080;
+    PB_DELETE                = 0x100;
+    PB_WRITE                 = 0x200;
+    PB_READ                  = 0x400;
+    PB_MANAGE_ACL            = 0x800;
+    PB_ACL_INHERIT           = 0x1000;
+    PB_CULL_VERSIONS         = 0x2000;
+    PB_ERASE                 = 0x4000;
 }
 
 enum Permission {
@@ -210,10 +250,30 @@ message ListRecentFilesRequest {
     int64 since_epoch = 4;
 }
 
+// Deliberately not DirectoryEntry. A listing entry answers "what is in this
+// folder"; this answers "what changed", so it carries the version that changed
+// and how many there have been — which is what lets a caller say "created" or
+// "updated" without a second lookup, and what the event projection it replaces
+// used to carry.
+message RecentFileEntry {
+    string uid = 1;
+    string name = 2;
+    // No path. `files` stores parent_uid, not a path, so producing one means an
+    // ancestor walk PER ROW — the precise cost this RPC exists to remove. A
+    // caller that needs paths can resolve the handful it actually displays.
+    reserved 3;
+    string version = 4;           // the version_timestamp that made it recent
+    int32 version_count = 5;      // 1 = this file is new; >1 = it was updated
+    int64 size = 6;
+    int64 modified_at = 7;        // UNIX epoch seconds, derived from `version`
+    string modified_by = 8;       // who wrote that version
+    string owner = 9;
+}
+
 message ListRecentFilesResponse {
     bool success = 1;
     string error = 2;
-    repeated DirectoryEntry entries = 3;
+    repeated RecentFileEntry entries = 3;
     // Rows the query examined before ACL filtering. The gap between this and
     // entries.size() is how much of the tenant's recent activity the caller
     // cannot see — useful for tuning, and the reason the scan is bounded.
@@ -285,12 +345,41 @@ message GetFileRequest {
     string uid = 1;                     // File UUID
     string version_timestamp = 2;       // Optional version timestamp (if empty, get latest)
     AuthenticationContext auth = 3;     // Authentication information
+
+    // Byte range over the PLAINTEXT, half-open [offset, offset+length).
+    // storage_pipeline.md SR-10 - SR-14.
+    //
+    // Additive and optional: proto3 defaults make an old client's request
+    // offset=0, length=0, which is "the whole file" — exactly today's
+    // behaviour, so no consumer has to change to keep working (SR-21).
+    //
+    // The range is over plaintext, never over stored bytes: a caller must never
+    // need to know whether the deployment compresses or encrypts.
+    int64 offset = 4;                   // >= 0
+    int64 length = 5;                   // 0 = to end of file
 }
 
 message GetFileResponse {
     bool success = 1;
     string error = 2;
     bytes data = 3;                     // File content
+
+    // Range metadata, set on the FIRST frame of a stream only; zero/absent on
+    // later frames. storage_pipeline.md SR-12 / SR-13.
+    //
+    // total_size removes a round-trip the doors make today: a bridge must Stat
+    // before it can answer an HTTP Range, and a media player asks for
+    // "bytes=0-" first precisely to discover the length.
+    int64 total_size = 4;               // plaintext length of the whole version
+    int64 range_start = 5;              // first plaintext byte in this stream
+    int64 range_length = 6;             // plaintext bytes that will follow
+    bool ranged = 7;                    // true when a range was applied
+
+    // "seek" when the cost was proportional to length, "scan" when it was
+    // proportional to offset+length. Part of the contract, not diagnostics: a
+    // range API that silently costs O(offset) is worse than none, because
+    // callers design against the promise rather than the behaviour.
+    string range_method = 8;
 }
 
 // File information
@@ -502,8 +591,9 @@ message GrantPermissionRequest {
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // ALLOW (default) or DENY
 
-    // OR of Permission bit VALUES, applied in one call. Supersedes `permission`
-    // when non-zero.
+    // OR of PermissionBit values, applied in one call. Supersedes `permission`
+    // when non-zero. NOTE these are bits, not the `Permission` ordinals above —
+    // see PermissionBit for why the two differ.
     //
     // The core's own grant_permission has always taken a bitmask — the creator
     // grant sets eleven bits at once — but that shape was not reachable here, so
@@ -560,7 +650,7 @@ message RevokePermissionRequest {
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // Which row to revoke from: ALLOW (default) or DENY
 
-    int32 permission_mask = 6;          // OR of Permission bit values; supersedes `permission`
+    int32 permission_mask = 6;          // OR of PermissionBit values; supersedes `permission`
     // Apply to resource_uid and every descendant. A row left with an empty mask
     // is deleted, not kept at zero: this system is read-by-default, so an ALLOW
     // row with no bits and no row at all must be indistinguishable.
@@ -691,6 +781,34 @@ message ListClaimsResponse {
 }
 
 // Administrative operations
+message TenantStateRequest {
+    string tenant = 1;
+    AuthenticationContext auth = 2;
+}
+
+message TenantStateResponse {
+    bool success = 1;
+    string error = 2;
+
+    // The state as recorded. Empty when the tenant is not in the registry.
+    string state = 3;
+    // When it entered that state, who put it there, and why. For the refusal
+    // message and for the administrative console; never for authorization.
+    string state_since = 4;
+    string state_by = 5;
+    string state_note = 6;
+
+    // The core's OWN verdict, so a door is not the only thing that knows the
+    // rule. A door still applies its own policy — shared, header-only — and the
+    // two agreeing is the point: if they ever disagree, the door refuses,
+    // because `admits` here is advisory and the door's check is the gate.
+    bool admits = 7;
+    // False when the tenant has no registry row at all. Distinct from
+    // `admits=false`, because "no such tenant" and "suspended" need different
+    // operator responses and a door that conflates them tells the wrong story.
+    bool found = 8;
+}
+
 message StorageUsageRequest {
     AuthenticationContext auth = 1;     // Authentication information
     string tenant = 2;                  // Optional tenant-specific usage
