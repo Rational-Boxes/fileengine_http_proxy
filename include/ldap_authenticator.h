@@ -120,7 +120,15 @@ private:
     std::string extractTenantFromUserDN(const std::string& user_dn);
     
     // Helper function to extract roles from user's group memberships
+    // Tenant-context roles for a user. Searches TENANT OUs only, and strips any
+    // name in the deployment namespace before returning — see the definition.
     std::vector<std::string> extractRolesFromGroups(LDAP* ld, const std::string& user_dn);
+
+    // The raw collection. Not for callers: it is what extractRolesFromGroups
+    // filters. Kept separate so the filter is a choke point no future return
+    // path can bypass, rather than a guard repeated at each acceptance site —
+    // there were already two identical ones, and a third would have been missed.
+    std::vector<std::string> collectTenantGroupRoles(LDAP* ld, const std::string& user_dn);
 };
 
 } // namespace webdav

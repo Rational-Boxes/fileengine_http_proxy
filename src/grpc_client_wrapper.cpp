@@ -303,6 +303,11 @@ fileengine_rpc::StorageUsageResponse GRPCClientWrapper::getStorageUsage(const fi
         [&](grpc::ClientContext& c, fileengine_rpc::StorageUsageResponse& r) { return stub_->GetStorageUsage(&c, request, &r); });
 }
 
+fileengine_rpc::TenantStateResponse GRPCClientWrapper::getTenantState(const fileengine_rpc::TenantStateRequest& request) {
+    return invoke<fileengine_rpc::TenantStateResponse>("GetTenantState",
+        [&](grpc::ClientContext& c, fileengine_rpc::TenantStateResponse& r) { return stub_->GetTenantState(&c, request, &r); });
+}
+
 fileengine_rpc::TriggerSyncResponse GRPCClientWrapper::triggerSync(const fileengine_rpc::TriggerSyncRequest& request) {
     return invoke<fileengine_rpc::TriggerSyncResponse>("TriggerSync",
         [&](grpc::ClientContext& c, fileengine_rpc::TriggerSyncResponse& r) { return stub_->TriggerSync(&c, request, &r); });

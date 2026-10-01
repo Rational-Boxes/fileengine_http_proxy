@@ -18,6 +18,7 @@
 #include "http_server.h"
 #include "utils.h"
 #include "jwt.h"
+#include "tenant_state_policy.h"
 #include "http_client.h"
 #include "client_ip.h"
 #include "cors.h"
@@ -328,6 +329,12 @@ private:
         std::string user;
         std::string tenant;
         std::vector<std::string> roles;
+        // Set when authentication SUCCEEDED but the tenant does not admit. The
+        // distinction matters for the status code: the credentials were fine, so
+        // a 401 would make a browser or CLI re-prompt for a password that was
+        // never the problem (§3.4c property 4).
+        std::string tenantRefusalCode;
+        std::string tenantRefusalReason;
         std::vector<std::string> amr;   // auth methods from the verified token (RFC 8176)
         std::string source_addr;        // resolved client IP, forwarded to the core for audit
     };
@@ -451,6 +458,18 @@ private:
 
         AuthIdentity id;
         if (!authenticate(req, resp, id)) return;  // authenticate() emitted 401/403
+
+        // §3.4c again, for a session that already exists. A token is verified
+        // locally and carries no state, so without this a suspension would not
+        // take effect until the token expired — up to its whole TTL of a tenant
+        // that is supposed to be closed. Cached briefly, so this is not an RPC
+        // per request.
+        {
+            std::string code, reason;
+            if (!tenantAdmits(id.tenant, code, reason)) {
+                return tenantRefused(resp, code, reason);
+            }
+        }
 
         auto segs = pathSegments(path);            // [v1, <resource>, <uid>, <sub>?]
 
@@ -1699,6 +1718,12 @@ private:
             return true;
         }
         if (!authenticateBasic(req, out)) {
+            if (!out.tenantRefusalCode.empty()) {
+                // The password was right; the tenant does not admit. 403 with a
+                // reason, not 401 — §3.4c property 4.
+                tenantRefused(resp, out.tenantRefusalCode, out.tenantRefusalReason);
+                return false;
+            }
             unauthorized(req, resp);
             return false;
         }
@@ -1755,7 +1780,108 @@ private:
         // already went through resolveTenant; this one did not.
         out.tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
         if (out.tenant.empty()) out.tenant = "default";
+
+        // §3.4c: only a `live` tenant admits. Checked HERE as well as at the
+        // token mint, because a Basic request never goes through the mint — a
+        // check in one place would leave curl, the CLI and every integration
+        // path open to a suspended tenant.
+        {
+            std::string code, reason;
+            if (!tenantAdmits(out.tenant, code, reason)) {
+                out.tenantRefusalCode = code;
+                out.tenantRefusalReason = reason;
+                return false;
+            }
+        }
         return true;
+    }
+
+    // ── the tenant-state gate (§3.4c) ──────────────────────────────────────
+    //
+    // ONE implementation, called from every authentication path in this door:
+    // the token mint, the Basic path, and the Bearer path. Three call sites and
+    // one rule, because §3.4c's warning is about N subtly different checks —
+    // and within a door the same hazard applies as between them.
+    //
+    // CACHED, briefly. §3.4c property 3: "A lookup per request is unnecessary; a
+    // long cache means a suspension takes effect whenever it feels like it." The
+    // same shape convert_search_ai uses for permissions: TTL-bounded, and short
+    // enough that a suspension bites in seconds rather than at token expiry.
+    // Event-driven invalidation (`tenant.state_changed`) is the next step and
+    // would make it immediate; the TTL is the floor, not the design.
+    //
+    // FAILS CLOSED on every error path. A state that cannot be determined
+    // refuses, because "allow on error" is exactly how a suspended tenant gets
+    // admitted.
+    bool tenantAdmits(const std::string& tenant, std::string& code, std::string& reason) {
+        using namespace fileengine::tenant_state;
+        if (tenant.empty()) {
+            code = "tenant_state_unknown";
+            reason = refusal_reason("", false);
+            return false;
+        }
+
+        struct Entry { std::time_t until; bool admits; std::string code, reason; };
+        static std::mutex mu;
+        static std::map<std::string, Entry> cache;
+        const std::time_t now = std::time(nullptr);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = cache.find(tenant);
+            if (it != cache.end() && now < it->second.until) {
+                code = it->second.code;
+                reason = it->second.reason;
+                return it->second.admits;
+            }
+        }
+
+        std::string state;
+        bool ok = false;
+        try {
+            fileengine_rpc::TenantStateRequest rq;
+            rq.set_tenant(tenant);
+            auto rs = grpc_->getTenantState(rq);
+            if (rs.success()) {
+                if (!rs.found()) {
+                    // Distinct from suspended: no registry row at all.
+                    state = "";
+                    ok = false;
+                } else {
+                    state = rs.state();
+                    ok = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            webdav::warnLog(std::string("tenantAdmits: state lookup threw for '") +
+                            tenant + "': " + e.what());
+            ok = false;
+        }
+
+        const bool admits = admits_or_refuses_unknown(state, ok);
+        code = refusal_code(state, ok);
+        reason = refusal_reason(state, ok);
+        if (!admits) {
+            webdav::warnLog("tenant-state gate REFUSED tenant '" + tenant + "': " +
+                            (reason.empty() ? std::string("refused") : reason));
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            // A REFUSAL is cached for a shorter time than an admission. Getting a
+            // tenant back into service should not wait on a cache, while a
+            // suspension already bit the moment it was read.
+            cache[tenant] = Entry{now + (admits ? 60 : 10), admits, code, reason};
+        }
+        return admits;
+    }
+
+    // The refusal itself. 403 rather than 401: the credentials were fine, and a
+    // 401 would make a browser or CLI re-prompt for a password that was never
+    // the problem.
+    void tenantRefused(HTTPServerResponse& resp, const std::string& code,
+                       const std::string& reason) {
+        sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                 std::string("{\"error\":\"") + jsonEscape(reason) +
+                 "\",\"code\":\"" + jsonEscape(code) + "\"}");
     }
 
     void unauthorized(HTTPServerRequest& req, HTTPServerResponse& resp) {
@@ -2368,13 +2494,42 @@ private:
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
         const std::string ip = clientIp(req);
         AuthIdentity id;
+        if (!id.tenantRefusalCode.empty()) {
+            // Unreachable today (authenticateBasic sets this only on failure) and
+            // kept as a guard: if the order of these checks is ever changed, a
+            // refused tenant must not fall through to a mint.
+            return tenantRefused(resp, id.tenantRefusalCode, id.tenantRefusalReason);
+        }
         if (!authenticateBasic(req, id)) {
+            // A REFUSED TENANT IS NOT A FAILED LOGIN, and separating the two here
+            // is not cosmetic. Measured: with both folded together this answered
+            // 401 "authentication required" for a suspended tenant, so a user
+            // with perfectly good credentials was told to try again — the exact
+            // outcome §3.4c property 4 exists to prevent. It also recorded a
+            // login_failure, which would feed the brute-force rules with events
+            // that are nothing of the kind.
+            if (!id.tenantRefusalCode.empty()) {
+                audit_->emitAuth("login_denied", "denied", id.user, id.tenant, ip);
+                return tenantRefused(resp, id.tenantRefusalCode, id.tenantRefusalReason);
+            }
             // login_failure — the attempted username (from authenticateBasic) is the
             // brute-force signal; tenant is still resolvable from the request.
             const std::string attempted = id.user.empty() ? "<unknown>" : id.user;
             const std::string tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
             audit_->emitAuth("login_failure", "denied", attempted, tenant, ip);
             return unauthorized(req, resp);
+        }
+
+        // §3.4c: refuse BEFORE minting. Issuing a session for a suspended tenant
+        // and relying on the resource gate to stop it would hand out a usable
+        // credential for a tenant that is closed.
+        {
+            std::string code, reason;
+            if (!tenantAdmits(id.tenant, code, reason)) {
+                audit_->emitAuth("login_denied", "denied", id.user, id.tenant,
+                                 clientIp(req));
+                return tenantRefused(resp, code, reason);
+            }
         }
         // Stamp a tenant the user actually belongs to. LDAP bind succeeds regardless
         // of tenant, and tenant resolution (X-Tenant / host / "default") can land on
