@@ -50,6 +50,7 @@ SUITE=(
     test_e2e_tenant_boundary.sh
     test_e2e_security.sh
     test_e2e.sh
+    test_e2e_playback.sh
     test_e2e_2fa.sh
 )
 
