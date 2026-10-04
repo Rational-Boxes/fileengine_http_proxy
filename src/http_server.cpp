@@ -27,6 +27,7 @@
 #include "integration_status.h"
 #include "service_claims.h"
 #include "sso_handoff.h"
+#include "ticket_claims.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -337,6 +338,7 @@ private:
         std::string tenantRefusalReason;
         std::vector<std::string> amr;   // auth methods from the verified token (RFC 8176)
         std::string source_addr;        // resolved client IP, forwarded to the core for audit
+        std::string session_jti;        // the session's jti — bound into tickets it mints
     };
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
@@ -546,6 +548,8 @@ private:
                     // disk rather than buffering the whole file in a Blob.
                     if (sub == "download-ticket" && method == "POST")
                         return downloadTicket(resp, id, uid);
+                    if (sub == "playback-ticket" && method == "POST")
+                        return playbackTicket(resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
                     if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
@@ -1684,8 +1688,8 @@ private:
             // NOTHING. Same shape as the mfa_pending guard above, and for the
             // same reason: a credential minted for one narrow purpose must not
             // be accepted for a broader one.
-            if (claims->optValue<std::string>("typ", std::string()) == "download") {
-                webdav::debugLog("authenticate: rejected a download ticket used as a bearer");
+            if (isTicketType(claims->optValue<std::string>("typ", std::string()))) {
+                webdav::debugLog("authenticate: rejected a ticket used as a bearer");
                 unauthorized(req, resp);
                 return false;
             }
@@ -1972,30 +1976,36 @@ private:
     // escalation — it is a time-boxed, narrowed re-presentation of authority
     // the caller already had. The core still enforces READ on the actual
     // download, exactly as it would for the bearer path.
-    std::string mintDownloadTicket(const AuthIdentity& id, const std::string& uid) {
+    // The claims are built by ticket_claims.h, which says what makes a ticket
+    // safe to put in a URL; this signs one for the caller. `sid` binds it to the
+    // session that minted it, so signing out revokes the tickets it handed out.
+    std::string mintTicket(const AuthIdentity& id, const std::string& uid,
+                           const std::string& typ, long ttl) {
         long now = static_cast<long>(std::time(nullptr));
-        Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
-        claims->set("iss", cfg_.jwt_issuer);
-        claims->set("sub", id.user);
-        claims->set("tenant", id.tenant);
-        claims->set("iat", static_cast<Poco::Int64>(now));
-        claims->set("exp", static_cast<Poco::Int64>(now + cfg_.download_ticket_ttl));
-        claims->set("typ", std::string("download"));
-        claims->set("dl", uid);
-        Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
-        Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
-        for (const auto& r : id.roles) arr->add(r);
-        rolesObj->set(id.tenant, arr);
-        claims->set("roles", rolesObj);
+        auto claims = buildTicketClaims(cfg_.jwt_issuer, id.user, id.tenant, id.roles, uid,
+                                        typ, id.session_jti, now, ttl);
         return jwt::sign(claims, cfg_.jwt_secret);
     }
 
     void downloadTicket(HTTPServerResponse& resp, const AuthIdentity& id,
                         const std::string& uid) {
-        const std::string t = mintDownloadTicket(id, uid);
+        const std::string t = mintTicket(id, uid, "download", cfg_.download_ticket_ttl);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"ticket\":\"" + t + "\",\"expires_in\":" +
                  std::to_string(cfg_.download_ticket_ttl) + "}");
+    }
+
+    // A playback ticket: the same credential for a <video>/<audio> element,
+    // which issues its own Range request every time it buffers or seeks — so it
+    // must outlive the download ticket's seconds. Capped at 30 minutes whatever
+    // is configured (ticket_claims.h); a player whose ticket lapses mid-viewing
+    // asks for another. Same scope, same refusal as a bearer.
+    void playbackTicket(HTTPServerResponse& resp, const AuthIdentity& id,
+                        const std::string& uid) {
+        const long ttl = clampPlaybackTtl(cfg_.playback_ticket_ttl);
+        const std::string t = mintTicket(id, uid, "playback", ttl);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"ticket\":\"" + t + "\",\"expires_in\":" + std::to_string(ttl) + "}");
     }
 
     // Resolve a `?ticket=` into an identity, but ONLY for the uid it names.
@@ -2015,15 +2025,37 @@ private:
             webdav::debugLog("download ticket rejected: " + err);
             return false;
         }
-        if (claims->optValue<std::string>("typ", std::string()) != "download") return false;
-        // The scoping check. Without it the ticket is a general bearer that
-        // merely happens to travel in a query string.
-        if (claims->optValue<std::string>("dl", std::string()) != uid) {
-            webdav::debugLog("download ticket presented for the wrong uid");
+        // Type and scope (ticket_claims.h). Without the uid check the ticket is a
+        // general bearer that merely happens to travel in a query string.
+        switch (checkTicketClaims(claims, uid)) {
+            case TicketCheck::Ok: break;
+            case TicketCheck::WrongUid:
+                webdav::debugLog("ticket presented for the wrong uid");
+                return false;
+            default:
+                return false;
+        }
+        // Signed out → the session's tickets die with it. Seconds-long download
+        // tickets barely needed this; a 30-minute playback ticket does. A ticket
+        // that names a session we cannot get a verdict on is refused.
+        const std::string sid = claims->optValue<std::string>("sid", std::string());
+        if (!sid.empty() && !denylist_->permits(sid)) {
+            webdav::debugLog("ticket refused: its session was signed out (jti " + sid + ")");
             return false;
         }
         identityFromClaims(claims, claims->optValue<std::string>("tenant", std::string()), out);
         out.source_addr = clientIp(req);
+        // §3.4c: this path returns content BEFORE the session gate runs, so it
+        // must ask about the tenant itself — otherwise a ticket minted just before
+        // a suspension keeps streaming for its whole lifetime.
+        {
+            std::string code, reason;
+            if (!tenantAdmits(out.tenant, code, reason)) {
+                webdav::debugLog("ticket refused: tenant " + out.tenant + " does not admit (" +
+                                 reason + ")");
+                return false;
+            }
+        }
         return true;
     }
 
@@ -2350,6 +2382,7 @@ private:
                             const std::string& activeTenant, AuthIdentity& out) {
         out.user = claims->optValue<std::string>("sub", std::string());
         out.tenant = activeTenant;
+        out.session_jti = claims->optValue<std::string>("jti", std::string());
         out.roles.clear();
         Poco::JSON::Object::Ptr rolesObj = claims->getObject("roles");
         if (rolesObj && !activeTenant.empty() && rolesObj->has(activeTenant)) {

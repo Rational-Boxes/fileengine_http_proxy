@@ -99,6 +99,10 @@ int main() {
     cfg.token_ttl = std::stoi(webdav::getEnvOrDefault("TOKEN_TTL_SECONDS", "900"));
     cfg.download_ticket_ttl =
         std::stoi(webdav::getEnvOrDefault("DOWNLOAD_TICKET_TTL_SECONDS", "30"));
+    // Playback tickets (<video> Range requests): capped at 30 minutes in
+    // ticket_claims.h whatever this says — a larger value is clamped, not honoured.
+    cfg.playback_ticket_ttl =
+        std::stoi(webdav::getEnvOrDefault("PLAYBACK_TICKET_TTL_SECONDS", "1800"));
     // Shared HS256 secret for signing/verifying bearer JWTs. Every service that
     // verifies these tokens must share this exact value.
     cfg.jwt_secret = webdav::getEnvOrDefault("FILEENGINE_JWT_SECRET", "");
