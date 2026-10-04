@@ -27,6 +27,8 @@
 #include "integration_status.h"
 #include "service_claims.h"
 #include "sso_handoff.h"
+#include "ticket_claims.h"
+#include "range_response.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -337,6 +339,8 @@ private:
         std::string tenantRefusalReason;
         std::vector<std::string> amr;   // auth methods from the verified token (RFC 8176)
         std::string source_addr;        // resolved client IP, forwarded to the core for audit
+        std::string session_jti;        // the session's jti — bound into tickets it mints
+        std::string playback_mime;      // set only from a PLAYBACK ticket: the type to serve
     };
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
@@ -546,6 +550,8 @@ private:
                     // disk rather than buffering the whole file in a Blob.
                     if (sub == "download-ticket" && method == "POST")
                         return downloadTicket(resp, id, uid);
+                    if (sub == "playback-ticket" && method == "POST")
+                        return playbackTicket(resp, id, uid);
                     if (sub == "undelete" && method == "POST")  return undelete(resp, id, uid);
                     if (sub == "versions" && method == "GET")   return listVersions(resp, id, uid);
                     if (sub == "renditions" && method == "GET") return listRenditions(resp, id, uid);
@@ -768,53 +774,101 @@ private:
 
     // GET content via server-streaming download — writes chunks straight to the
     // socket (chunked transfer). Honors a single Range request (206 + windowing).
+    // A file's content, whole or ranged.
+    //
+    // The range is handed to the CORE (offset/length), which reads only that
+    // window and reports the version's total on its first frame; the response is
+    // planned from that total (range_response.h): 206 with an exact
+    // `Content-Range: bytes start-end/total` and Content-Length, or 416. This
+    // used to stream every file from byte zero and discard everything before the
+    // window, answering `bytes N-/*` — which is why seeking a video was
+    // unreliable and every seek re-read the file from the start.
+    //
+    // Served as application/octet-stream with nosniff, except under a PLAYBACK
+    // ticket, which carries an allowlisted media type decided at mint time — so
+    // this origin never serves something a browser would execute.
     void getContent(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         long rs = -1, re = -1;
         bool hasRange = parseRange(req.get("Range", ""), rs, re);
+        if (hasRange && re >= 0 && re < rs) hasRange = false;   // malformed: serve whole
 
         fileengine_rpc::GetFileRequest rq;
         rq.set_uid(uid);
         fillAuth(rq.mutable_auth(), id);
+        if (hasRange) {
+            rq.set_offset(rs);
+            if (re >= 0) rq.set_length(re - rs + 1);
+        }
 
+        const std::string ctype = id.playback_mime.empty() ? std::string("application/octet-stream")
+                                                           : id.playback_mime;
         std::ostream* os = nullptr;
-        long offset = 0;
         bool headerSent = false;
-        auto sendHeader = [&]() {
-            resp.setStatus(hasRange ? HTTPResponse::HTTP_PARTIAL_CONTENT : HTTPResponse::HTTP_OK);
-            resp.setContentType("application/octet-stream");
-            resp.set("Accept-Ranges", "bytes");
-            if (hasRange) {
-                resp.set("Content-Range", "bytes " + std::to_string(rs) + "-" +
-                                              (re >= 0 ? std::to_string(re) : std::string()) + "/*");
+        long skip = 0;        // bytes to drop ourselves, only if the core did not window
+        long remaining = -1;  // bytes still owed to the client; -1 = unknown
+
+        auto onMeta = [&](const fileengine_rpc::GetFileResponse& f) -> bool {
+            RangePlan plan = planRange(hasRange, rs, re, static_cast<long>(f.total_size()));
+            if (hasRange && f.total_size() <= 0 && f.ranged()) {
+                // An older core that windows but reports no total: say exactly
+                // what follows, and that the total is unknown.
+                plan.status = 206;
+                plan.start = rs;
+                plan.length = f.range_length() > 0 ? static_cast<long>(f.range_length()) : -1;
+                plan.content_range = "bytes " + std::to_string(rs) + "-" +
+                    (plan.length > 0 ? std::to_string(rs + plan.length - 1) : std::string()) + "/*";
             }
+            resp.set("X-Content-Type-Options", "nosniff");
+            if (plan.status == 416) {
+                resp.setStatus(HTTPResponse::HTTP_REQUESTED_RANGE_NOT_SATISFIABLE);
+                resp.set("Content-Range", plan.content_range);
+                resp.setContentLength(0);
+                resp.send();
+                headerSent = true;
+                return false;
+            }
+            // A core that ignored offset/length streams from zero: drop the
+            // prefix here, as the bridge always used to.
+            if (plan.status == 206 && !f.ranged()) skip = rs;
+            remaining = plan.length;
+            resp.setStatus(plan.status == 206 ? HTTPResponse::HTTP_PARTIAL_CONTENT
+                                              : HTTPResponse::HTTP_OK);
+            resp.setContentType(ctype);
+            resp.set("Accept-Ranges", "bytes");
+            if (!plan.content_range.empty()) resp.set("Content-Range", plan.content_range);
+            if (plan.length >= 0) resp.setContentLength(plan.length);
             os = &resp.send();
             headerSent = true;
+            return true;
         };
 
-        auto result = grpc_->streamFileDownload(rq, [&](const std::string& chunk) -> bool {
-            long cstart = offset;
-            long cend = offset + static_cast<long>(chunk.size()) - 1;
-            offset += static_cast<long>(chunk.size());
-            if (!hasRange) {
-                if (!headerSent) sendHeader();
-                os->write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-                return true;
+        auto onChunk = [&](const std::string& chunk) -> bool {
+            const char* p = chunk.data();
+            long n = static_cast<long>(chunk.size());
+            if (skip > 0) {
+                const long d = std::min(skip, n);
+                p += d; n -= d; skip -= d;
+                if (n == 0) return true;
             }
-            long ws = std::max(cstart, rs);
-            long we = (re >= 0) ? std::min(cend, re) : cend;
-            if (ws <= we) {
-                if (!headerSent) sendHeader();
-                os->write(chunk.data() + (ws - cstart), static_cast<std::streamsize>(we - ws + 1));
+            if (remaining >= 0) n = std::min(n, remaining);
+            if (n > 0) os->write(p, static_cast<std::streamsize>(n));
+            if (remaining >= 0) {
+                remaining -= n;
+                if (remaining <= 0) return false;   // the window is complete
             }
-            return !(re >= 0 && offset > re);  // stop once past the requested end
-        });
+            return true;
+        };
+
+        auto result = grpc_->streamFileDownload(rq, onChunk, onMeta);
 
         if (!result.success) {
             if (!headerSent) return mapError(resp, result.error);
             return;  // already streaming; can't change status mid-body
         }
-        if (!headerSent) {  // empty content
-            resp.setStatus(hasRange ? HTTPResponse::HTTP_PARTIAL_CONTENT : HTTPResponse::HTTP_OK);
+        if (!headerSent) {  // empty content: no frame ever arrived
+            resp.set("X-Content-Type-Options", "nosniff");
+            resp.setStatus(HTTPResponse::HTTP_OK);
+            resp.setContentType(ctype);
             resp.setContentLength(0);
             resp.send();
         }
@@ -1684,8 +1738,8 @@ private:
             // NOTHING. Same shape as the mfa_pending guard above, and for the
             // same reason: a credential minted for one narrow purpose must not
             // be accepted for a broader one.
-            if (claims->optValue<std::string>("typ", std::string()) == "download") {
-                webdav::debugLog("authenticate: rejected a download ticket used as a bearer");
+            if (isTicketType(claims->optValue<std::string>("typ", std::string()))) {
+                webdav::debugLog("authenticate: rejected a ticket used as a bearer");
                 unauthorized(req, resp);
                 return false;
             }
@@ -1972,30 +2026,51 @@ private:
     // escalation — it is a time-boxed, narrowed re-presentation of authority
     // the caller already had. The core still enforces READ on the actual
     // download, exactly as it would for the bearer path.
-    std::string mintDownloadTicket(const AuthIdentity& id, const std::string& uid) {
+    // The claims are built by ticket_claims.h, which says what makes a ticket
+    // safe to put in a URL; this signs one for the caller. `sid` binds it to the
+    // session that minted it, so signing out revokes the tickets it handed out.
+    std::string mintTicket(const AuthIdentity& id, const std::string& uid,
+                           const std::string& typ, long ttl,
+                           const std::string& mediaType = std::string()) {
         long now = static_cast<long>(std::time(nullptr));
-        Poco::JSON::Object::Ptr claims = new Poco::JSON::Object();
-        claims->set("iss", cfg_.jwt_issuer);
-        claims->set("sub", id.user);
-        claims->set("tenant", id.tenant);
-        claims->set("iat", static_cast<Poco::Int64>(now));
-        claims->set("exp", static_cast<Poco::Int64>(now + cfg_.download_ticket_ttl));
-        claims->set("typ", std::string("download"));
-        claims->set("dl", uid);
-        Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
-        Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
-        for (const auto& r : id.roles) arr->add(r);
-        rolesObj->set(id.tenant, arr);
-        claims->set("roles", rolesObj);
+        auto claims = buildTicketClaims(cfg_.jwt_issuer, id.user, id.tenant, id.roles, uid,
+                                        typ, id.session_jti, now, ttl);
+        if (!mediaType.empty()) claims->set("mt", mediaType);
         return jwt::sign(claims, cfg_.jwt_secret);
     }
 
     void downloadTicket(HTTPServerResponse& resp, const AuthIdentity& id,
                         const std::string& uid) {
-        const std::string t = mintDownloadTicket(id, uid);
+        const std::string t = mintTicket(id, uid, "download", cfg_.download_ticket_ttl);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"ticket\":\"" + t + "\",\"expires_in\":" +
                  std::to_string(cfg_.download_ticket_ttl) + "}");
+    }
+
+    // A playback ticket: the same credential for a <video>/<audio> element,
+    // which issues its own Range request every time it buffers or seeks — so it
+    // must outlive the download ticket's seconds. Capped at 30 minutes whatever
+    // is configured (ticket_claims.h); a player whose ticket lapses mid-viewing
+    // asks for another. Same scope, same refusal as a bearer.
+    void playbackTicket(HTTPServerResponse& resp, const AuthIdentity& id,
+                        const std::string& uid) {
+        // Only for audio/video, by an allowlist of extensions (range_response.h):
+        // the ticket's media type is what the content route will serve, and the
+        // tenant origin must never be made to serve something executable. The
+        // stat runs as the caller, so this also refuses a file they cannot see.
+        fileengine_rpc::StatRequest sq;
+        sq.set_uid(uid);
+        fillAuth(sq.mutable_auth(), id);
+        auto st = grpc_->stat(sq);
+        if (!st.success()) return mapError(resp, st.error());
+        const std::string mt = playbackMimeFor(st.info().name());
+        if (mt.empty())
+            return sendJson(resp, HTTPResponse::HTTP_UNSUPPORTED_MEDIA_TYPE,
+                            R"({"error":"not a playable audio or video file"})");
+        const long ttl = clampPlaybackTtl(cfg_.playback_ticket_ttl);
+        const std::string t = mintTicket(id, uid, "playback", ttl, mt);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"ticket\":\"" + t + "\",\"expires_in\":" + std::to_string(ttl) + "}");
     }
 
     // Resolve a `?ticket=` into an identity, but ONLY for the uid it names.
@@ -2015,15 +2090,46 @@ private:
             webdav::debugLog("download ticket rejected: " + err);
             return false;
         }
-        if (claims->optValue<std::string>("typ", std::string()) != "download") return false;
-        // The scoping check. Without it the ticket is a general bearer that
-        // merely happens to travel in a query string.
-        if (claims->optValue<std::string>("dl", std::string()) != uid) {
-            webdav::debugLog("download ticket presented for the wrong uid");
+        // Type and scope (ticket_claims.h). Without the uid check the ticket is a
+        // general bearer that merely happens to travel in a query string.
+        switch (checkTicketClaims(claims, uid)) {
+            case TicketCheck::Ok: break;
+            case TicketCheck::WrongUid:
+                webdav::debugLog("ticket presented for the wrong uid");
+                return false;
+            default:
+                return false;
+        }
+        // Signed out → the session's tickets die with it. Seconds-long download
+        // tickets barely needed this; a 30-minute playback ticket does. A ticket
+        // that names a session we cannot get a verdict on is refused.
+        const std::string sid = claims->optValue<std::string>("sid", std::string());
+        if (!sid.empty() && !denylist_->permits(sid)) {
+            webdav::debugLog("ticket refused: its session was signed out (jti " + sid + ")");
             return false;
         }
         identityFromClaims(claims, claims->optValue<std::string>("tenant", std::string()), out);
         out.source_addr = clientIp(req);
+        if (claims->optValue<std::string>("typ", std::string()) == "playback") {
+            // Re-checked against the allowlist even though we signed it: the
+            // claim decides a Content-Type on this origin, so it is held to the
+            // same list that minted it.
+            const std::string mt = claims->optValue<std::string>("mt", std::string());
+            if (mt == "video/webm" || mt == "video/mp4" || mt == "audio/mp4" ||
+                mt == "audio/mpeg" || mt == "audio/ogg")
+                out.playback_mime = mt;
+        }
+        // §3.4c: this path returns content BEFORE the session gate runs, so it
+        // must ask about the tenant itself — otherwise a ticket minted just before
+        // a suspension keeps streaming for its whole lifetime.
+        {
+            std::string code, reason;
+            if (!tenantAdmits(out.tenant, code, reason)) {
+                webdav::debugLog("ticket refused: tenant " + out.tenant + " does not admit (" +
+                                 reason + ")");
+                return false;
+            }
+        }
         return true;
     }
 
@@ -2350,6 +2456,7 @@ private:
                             const std::string& activeTenant, AuthIdentity& out) {
         out.user = claims->optValue<std::string>("sub", std::string());
         out.tenant = activeTenant;
+        out.session_jti = claims->optValue<std::string>("jti", std::string());
         out.roles.clear();
         Poco::JSON::Object::Ptr rolesObj = claims->getObject("roles");
         if (rolesObj && !activeTenant.empty() && rolesObj->has(activeTenant)) {

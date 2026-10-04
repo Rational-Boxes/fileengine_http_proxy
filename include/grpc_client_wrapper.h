@@ -111,6 +111,15 @@ public:
     // returns false to abort early (e.g. client disconnect / range satisfied).
     DownloadResult streamFileDownload(const fileengine_rpc::GetFileRequest& request,
                                       const std::function<bool(const std::string&)>& onChunk);
+    // The same, plus `onMeta` — called ONCE with the first response frame,
+    // before any data is handed to `onChunk`. It carries total_size and the
+    // range the core actually served (ranged / range_start / range_length /
+    // range_method), which is what a correct 206 needs. Returning false from it
+    // cancels the stream before any byte is written (a 416, say).
+    DownloadResult streamFileDownload(
+        const fileengine_rpc::GetFileRequest& request,
+        const std::function<bool(const std::string&)>& onChunk,
+        const std::function<bool(const fileengine_rpc::GetFileResponse&)>& onMeta);
     // Client-streaming upload: nextChunk(out) fills the next body chunk and
     // returns false when the body is exhausted. uid/auth are sent on the first
     // message (server reads them only from there).
