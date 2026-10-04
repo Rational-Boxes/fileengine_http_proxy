@@ -317,17 +317,32 @@ fileengine_rpc::TriggerSyncResponse GRPCClientWrapper::triggerSync(const fileeng
 GRPCClientWrapper::DownloadResult GRPCClientWrapper::streamFileDownload(
     const fileengine_rpc::GetFileRequest& request,
     const std::function<bool(const std::string&)>& onChunk) {
+    return streamFileDownload(request, onChunk, nullptr);
+}
+
+GRPCClientWrapper::DownloadResult GRPCClientWrapper::streamFileDownload(
+    const fileengine_rpc::GetFileRequest& request,
+    const std::function<bool(const std::string&)>& onChunk,
+    const std::function<bool(const fileengine_rpc::GetFileResponse&)>& onMeta) {
     grpc::ClientContext ctx;
     attach_service_token(ctx);
     auto reader = stub_->StreamFileDownload(&ctx, request);
     fileengine_rpc::GetFileResponse resp;
     std::string err;
     bool failed = false;
+    bool first = true;
     while (reader->Read(&resp)) {
         if (!resp.success()) {  // an error chunk (success=false carries the error)
             failed = true;
             err = resp.error();
             break;
+        }
+        if (first) {
+            first = false;
+            if (onMeta && !onMeta(resp)) {
+                ctx.TryCancel();  // the caller answered without the body (e.g. 416)
+                break;
+            }
         }
         if (!resp.data().empty() && !onChunk(resp.data())) {
             ctx.TryCancel();  // caller asked to stop (disconnect / range satisfied)
