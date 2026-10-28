@@ -103,6 +103,11 @@ struct Config {
     bool mfa_enabled = false;
     std::string ldap_manager_url;            // e.g. http://127.0.0.1:8093 (internal 2FA API)
     std::string mfa_internal_secret;         // X-Internal-Auth for /internal/2fa/*
+    // X-Internal-Auth for ldap_manager's /internal/service-cred/* — the generated
+    // key:secret credentials, which POST /v1/auth/token accepts when the key is
+    // scoped "api". SERVICE_CRED_INTERNAL_SECRET, else MFA_INTERNAL_SECRET (the
+    // same fallback ldap_manager and webdav_bridge use, so ops manage one secret).
+    std::string service_cred_internal_secret;
     int mfa_challenge_ttl = 300;             // mfa_pending token lifetime (s)
 
     // Durable audit emission (usage_logging_and_auditing §5). Shares the core's
