@@ -193,6 +193,8 @@ int main() {
     }
     cfg.ldap_manager_url = webdav::getEnvOrDefault("LDAP_MANAGER_URL", "");
     cfg.mfa_internal_secret = webdav::getEnvOrDefault("MFA_INTERNAL_SECRET", "");
+    cfg.service_cred_internal_secret =
+        webdav::getEnvOrDefault("SERVICE_CRED_INTERNAL_SECRET", cfg.mfa_internal_secret);
     cfg.mfa_challenge_ttl = std::stoi(webdav::getEnvOrDefault("MFA_CHALLENGE_TTL_SECONDS", "300"));
     if (cfg.mfa_enabled && (cfg.ldap_manager_url.empty() || cfg.mfa_internal_secret.empty())) {
         webdav::errorLog("FATAL: MFA_ENABLED but LDAP_MANAGER_URL / MFA_INTERNAL_SECRET is unset "

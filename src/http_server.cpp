@@ -28,6 +28,7 @@
 #include "service_claims.h"
 #include "sso_handoff.h"
 #include "ticket_claims.h"
+#include "service_key_policy.h"
 #include "range_response.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
@@ -341,6 +342,11 @@ private:
         std::string source_addr;        // resolved client IP, forwarded to the core for audit
         std::string session_jti;        // the session's jti — bound into tickets it mints
         std::string playback_mime;      // set only from a PLAYBACK ticket: the type to serve
+        // Set only for a session minted from a generated key:secret credential
+        // (issueServiceKeyToken): the key it came from and that key's secret
+        // generation. Refresh re-checks both with ldap_manager.
+        std::string service_key_id;
+        std::string service_key_gen;
     };
 
     // All /v1 routes are authenticated, then dispatched by resource + method.
@@ -1961,11 +1967,20 @@ private:
     // 8176-style): ["pwd"] for a password-only login, and once a second factor is
     // verified the descriptive method name is appended —
     // ["pwd","totp"|"email"|"recovery"] (or ["oauth"] for a federated login).
+    //
+    // `serviceKeyId`/`serviceKeyGen` mark a session minted from a generated
+    // key:secret. A key is bound to ONE tenant, so its session carries roles for
+    // that tenant only — with the full map, X-Tenant (and every downstream door
+    // reading the map) would let a single-tenant key act in all the user's tenants.
     std::string mintJwt(const std::string& user, const std::string& activeTenant,
                         const std::vector<std::string>& amr = {"pwd"},
                         std::string* outJti = nullptr,
-                        const std::string& aip = "") {
+                        const std::string& aip = "",
+                        const std::string& serviceKeyId = "",
+                        const std::string& serviceKeyGen = "") {
         auto byTenant = ldap_->getRolesByTenant(user);
+        if (!serviceKeyId.empty())
+            byTenant = fileengine::service_key::rolesForKeySession(byTenant, activeTenant);
 
         // A session minted at the shared LOGIN origin has no tenant from its
         // host — "login" is reserved, so resolveTenant yields nothing and the
@@ -1996,6 +2011,10 @@ private:
         // `aip` binds a token minted via integration exchange to the integration's
         // caller IP (defense-in-depth alongside the assertion's IP allow-list).
         if (!aip.empty()) claims->set("aip", aip);
+        if (!serviceKeyId.empty()) {
+            claims->set("skid", serviceKeyId);
+            claims->set("skgen", serviceKeyGen);
+        }
 
         Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
         for (const auto& kv : byTenant) {
@@ -2150,6 +2169,15 @@ private:
     // own sub/tenant. The SPA the user is deep-linked into redeems it for a session.
     void ssoHandoff(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
         const std::string ip = clientIp(req);
+        // A hand-off code carries no key binding, and its redeem mints an ordinary
+        // all-tenant session — so from a key session it would shed the one-tenant
+        // limit and the refresh-time liveness check. Keys are for programs; the
+        // hand-off is for moving a person between origins.
+        if (!id.service_key_id.empty()) {
+            audit_->emitAuth("sso_handoff", "denied", id.user, id.tenant, ip);
+            return sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                            R"({"error":"not available to a service-credential session"})");
+        }
         const long now = static_cast<long>(std::time(nullptr));
         auto claims = buildHandoffClaims(cfg_.jwt_issuer, id.user, id.tenant,
                                          randomCodeVerifier(), now, cfg_.sso_handoff_ttl,
@@ -2414,14 +2442,9 @@ private:
         }
     }
 
-    // A session that carries any of these amr values has satisfied a second factor
-    // (or federated the check to an IdP) and may operate in any requiring tenant.
-    // A password-only session (amr = ["pwd"]) has not.
+    // Which amr values count as a second factor: service_key_policy.h.
     static bool sessionHas2fa(const std::vector<std::string>& amr) {
-        for (const auto& m : amr)
-            if (m == "otp" || m == "totp" || m == "email" || m == "recovery" || m == "oauth")
-                return true;
-        return false;
+        return fileengine::session_amr::satisfiesSecondFactor(amr);
     }
 
     // Whether the tenant requires 2FA (per-tenant policy; user-independent), cached
@@ -2471,6 +2494,8 @@ private:
             for (size_t i = 0; i < amrArr->size(); ++i)
                 out.amr.push_back(amrArr->getElement<std::string>(i));
         }
+        out.service_key_id = claims->optValue<std::string>("skid", std::string());
+        out.service_key_gen = claims->optValue<std::string>("skgen", std::string());
     }
 
     // Client IP for the audit trail: first X-Forwarded-For hop (the bridge sits
@@ -2600,6 +2625,14 @@ private:
 
     void issueToken(HTTPServerRequest& req, HTTPServerResponse& resp) {
         const std::string ip = clientIp(req);
+        {
+            // A generated credential's key_id is never a directory uid (the fesk_
+            // prefix), so it takes its own path rather than an LDAP bind.
+            std::string keyId, secret;
+            if (basicCredentials(req, keyId, secret) &&
+                fileengine::service_key::isServiceKeyId(keyId))
+                return issueServiceKeyToken(req, resp, keyId, secret);
+        }
         AuthIdentity id;
         if (!id.tenantRefusalCode.empty()) {
             // Unreachable today (authenticateBasic sets this only on failure) and
@@ -2690,6 +2723,176 @@ private:
         std::string jti;
         std::string token = mintJwt(id.user, id.tenant, {"pwd"}, &jti);
         recordSession(id.tenant, id.user, jti, ip);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
+    }
+
+    // ---- generated key:secret credentials (scope "api") -----------------------
+    //
+    // Generated credentials -> authenticate -> session bearer. The key is presented
+    // ONCE, here, as Basic key_id:secret; what comes back is the ordinary session
+    // token (same lifetime, same refresh, same sign-out), so every resource route
+    // and every downstream door already understands it. The key itself is never
+    // accepted per request on resource routes.
+    //
+    // How the session differs from a password one, and why:
+    //   * roles for the credential's tenant only (mintJwt) — a key is tenant-bound;
+    //   * amr ["svc"] and no 2FA challenge — the strong credential IS the factor;
+    //   * skid/skgen claims, so refresh asks ldap_manager whether the key is still
+    //     live AND unrotated: revoking or rotating a key ends its sessions at their
+    //     next refresh rather than never;
+    //   * no recordSession — a program's session must not open the WebDAV
+    //     origin gate, which exists to mean "a person is signed in to the Web UI".
+
+    static bool basicCredentials(HTTPServerRequest& req, std::string& user, std::string& pass) {
+        std::string h = req.get("Authorization", "");
+        if (h.size() < 6 || h.compare(0, 6, "Basic ") != 0) return false;
+        std::istringstream iss(webdav::trim(h.substr(6)));
+        Poco::Base64Decoder dec(iss);
+        std::string creds((std::istreambuf_iterator<char>(dec)), std::istreambuf_iterator<char>());
+        auto colon = creds.find(':');
+        if (colon == std::string::npos) return false;
+        user = creds.substr(0, colon);
+        pass = creds.substr(colon + 1);
+        return true;
+    }
+
+    // POST ldap_manager /internal/service-cred/{verify|status}, read through
+    // service_key::classifyVerifyAnswer. The mode is an explicit argument, NEVER
+    // inferred from an empty secret: a status check needs no secret, so "empty
+    // secret means status" would sign in anyone who presented a key id and no
+    // password.
+    enum class KeyCheck { Verify, Status };
+    fileengine::service_key::KeyVerdict
+    serviceCredCall(KeyCheck mode, const std::string& keyId, const std::string& secret,
+                    const std::string& tenant, const std::string& ip,
+                    std::string& uid, std::string& generation) {
+        using fileengine::service_key::KeyVerdict;
+        if (cfg_.ldap_manager_url.empty() || cfg_.service_cred_internal_secret.empty()) {
+            webdav::errorLog("service credentials: LDAP_MANAGER_URL / SERVICE_CRED_INTERNAL_SECRET "
+                             "unset — cannot verify a key");
+            return KeyVerdict::Unavailable;
+        }
+        HttpClient client(5);
+        Poco::JSON::Object::Ptr body = new Poco::JSON::Object();
+        body->set("key_id", keyId);
+        if (mode == KeyCheck::Verify) body->set("secret", secret);
+        body->set("tenant", tenant);
+        body->set("scope", "api");
+        if (!ip.empty()) body->set("source_ip", ip);
+        std::ostringstream bs; body->stringify(bs);
+        const std::string path = mode == KeyCheck::Status ? "/internal/service-cred/status"
+                                                          : "/internal/service-cred/verify";
+        HttpResult r = client.postJson(cfg_.ldap_manager_url + path, bs.str(),
+                                       {{"X-Internal-Auth", cfg_.service_cred_internal_secret},
+                                        {"X-Forwarded-For", ip}});
+        if (!r.ok && r.status == 0) {
+            webdav::warnLog("service credentials: ldap_manager unreachable (" + r.error + ")");
+            return KeyVerdict::Unavailable;
+        }
+        if (r.status == 200) {
+            try {
+                Poco::JSON::Parser p;
+                auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
+                uid = o->optValue<std::string>("uid", std::string());
+                generation = o->optValue<std::string>("generation", std::string());
+            } catch (...) {
+                uid.clear();
+                generation.clear();
+            }
+        }
+        const KeyVerdict v = fileengine::service_key::classifyVerifyAnswer(r.status, uid, generation);
+        if (v == KeyVerdict::Unavailable)
+            webdav::errorLog("service credentials: ldap_manager " + path + " answered " +
+                             std::to_string(r.status) + " — check SERVICE_CRED_INTERNAL_SECRET");
+        return v;
+    }
+
+    void issueServiceKeyToken(HTTPServerRequest& req, HTTPServerResponse& resp,
+                              const std::string& keyId, const std::string& secret) {
+        const std::string ip = clientIp(req);
+        // The tenant is the one addressed (X-Tenant > host), and the key must be
+        // bound to exactly that tenant — no "fall back to another of the user's
+        // tenants" as the password path does: the key is the tenant decision.
+        std::string tenant = webdav::resolveTenant(req.get("X-Tenant", ""), req.getHost());
+        if (tenant.empty()) tenant = "default";
+        {
+            std::string code, reason;
+            if (!tenantAdmits(tenant, code, reason)) {
+                audit_->emitAuth("login_denied", "denied", keyId, tenant, ip);
+                return tenantRefused(resp, code, reason);
+            }
+        }
+        std::string uid, generation;
+        if (secret.empty()) {   // belt and braces: Verify would refuse it too
+            audit_->emitAuth("login_failure", "denied", keyId, tenant, ip);
+            return unauthorized(req, resp);
+        }
+        using fileengine::service_key::KeyVerdict;
+        const KeyVerdict v =
+            serviceCredCall(KeyCheck::Verify, keyId, secret, tenant, ip, uid, generation);
+        if (v == KeyVerdict::Unavailable) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"service credentials unavailable"})");
+        }
+        if (v != KeyVerdict::Valid) {
+            // The key_id is public (it is the Basic username), so it is the
+            // attempted identity for the brute-force rules, as a uid would be.
+            audit_->emitAuth("login_failure", "denied", keyId, tenant, ip);
+            return unauthorized(req, resp);
+        }
+        // The account must still be a member of the key's tenant: membership is
+        // LDAP's, and a key outliving it is exactly what must not mint a session.
+        bool member = false;
+        for (const auto& t : ldap_->getTenantsForUser(uid)) if (t == tenant) { member = true; break; }
+        if (!member) {
+            audit_->emitAuth("login_failure", "denied", uid, tenant, ip);
+            return forbidTenant(resp, tenant);
+        }
+        // Fail-closed write-ahead (§6), as for every other login.
+        if (!audit_->emitAuth("login_success", "ok", uid, tenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
+        std::string jti;
+        std::string token = mintJwt(uid, tenant, {"svc"}, &jti, "", keyId, generation);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                 std::to_string(cfg_.token_ttl) + "}");
+    }
+
+    // Refresh of a key-minted session: the key must still be live, unrotated, for
+    // the same user, and the user still a member of its tenant. Any "no" ends the
+    // chain (401), so the client presents the key again — and learns the truth.
+    void refreshServiceKeyToken(HTTPServerRequest& req, HTTPServerResponse& resp,
+                                const AuthIdentity& id) {
+        const std::string ip = clientIp(req);
+        // The session's own tenant claim, never X-Tenant: the roles map holds only
+        // that tenant anyway, but the liveness question must be asked about the
+        // tenant the key was minted for.
+        std::string uid, generation;
+        using fileengine::service_key::KeyVerdict;
+        const KeyVerdict v = serviceCredCall(KeyCheck::Status, id.service_key_id, "", id.tenant,
+                                             ip, uid, generation);
+        if (v == KeyVerdict::Unavailable) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"service credentials unavailable"})");
+        }
+        const std::vector<std::string> tenants =
+            v == KeyVerdict::Valid ? ldap_->getTenantsForUser(uid) : std::vector<std::string>{};
+        if (!fileengine::service_key::mayRefresh(v, uid, generation, id.user, id.service_key_gen,
+                                                 tenants, id.tenant)) {
+            audit_->emitAuth("token_refresh", "denied", id.user, id.tenant, ip);
+            return unauthorized(req, resp);
+        }
+        if (!audit_->emitAuth("token_refresh", "ok", id.user, id.tenant, ip)) {
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"audit log unavailable"})");
+        }
+        std::string jti;
+        std::string token = mintJwt(id.user, id.tenant, {"svc"}, &jti, "",
+                                    id.service_key_id, id.service_key_gen);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -2796,6 +2999,7 @@ private:
     // stops the very next refresh; an un-refreshed token expires within token_ttl.
     void refreshToken(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id) {
         const std::string ip = clientIp(req);
+        if (!id.service_key_id.empty()) return refreshServiceKeyToken(req, resp, id);
         // The user must still exist and belong to at least one tenant. In this
         // directory model, deactivation = removal from the tenant's groups, so an
         // empty tenant set means the account is gone/disabled.

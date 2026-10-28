@@ -14,7 +14,7 @@
 #   BASE=http://localhost:8090 \
 #   FE_USER='testuser@rationalboxes.com'   FE_PASS='***' \
 #   FE_USER2='throwaway@rationalboxes.com' FE_PASS2='***' FE_TENANT2='filenginetest' \
-#   ./tests/run_e2e_suite.sh
+#   [FE_2FA_TENANT='filenginetest'] ./tests/run_e2e_suite.sh
 #
 # Tenant-boundary identities (derived from the above if not set explicitly):
 #   TA_USER/TA_PASS/TA_TENANT — a user who is a member of exactly ONE tenant
@@ -52,6 +52,7 @@ SUITE=(
     test_e2e.sh
     test_e2e_playback.sh
     test_e2e_2fa.sh
+    test_e2e_api_key.sh
 )
 
 PASSED=0; SKIPPED=0; FAILED=()
@@ -75,6 +76,12 @@ for name in "${SUITE[@]}"; do
       test_e2e_2fa.sh)
         out="$(USER="${TA_USER}" PASS="${TA_PASS}" TENANT="${TA_TENANT}" \
                bash "$script" 2>&1)"; rc=$? ;;
+      # Generated key:secret -> session bearer. Uses the multi-tenant fixture so
+      # it can prove the key stays in its own tenant (FE_TENANT2 is the other);
+      # FE_2FA_TENANT, when set, names one of that user's 2FA-requiring tenants.
+      test_e2e_api_key.sh)
+        out="$(FE_TENANT="${FE_TENANT:-default}" FE_OTHER_TENANT="${FE_TENANT2:-}" \
+               FE_2FA_TENANT="${FE_2FA_TENANT:-}" bash "$script" 2>&1)"; rc=$? ;;
       *)
         out="$(bash "$script" 2>&1)"; rc=$? ;;
     esac

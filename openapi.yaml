@@ -65,7 +65,15 @@ paths:
     post:
       tags: [auth]
       summary: Issue a bearer token
-      description: Authenticates via HTTP Basic (LDAP) and returns a short-lived bearer token.
+      description: >
+        Authenticates via HTTP Basic and returns a short-lived bearer token. The
+        Basic credential is either an LDAP username and password, or a generated
+        service credential (`fesk_…` key id as the username, its secret as the
+        password) scoped `api`. A service credential is bound to one tenant, so
+        its session holds roles for that tenant only, carries `amr: ["svc"]`,
+        is never sent through a 2FA challenge, and renews at
+        `POST /v1/auth/refresh` only while the credential is neither revoked,
+        expired nor regenerated.
       security: [ { basicAuth: [] } ]
       responses:
         "200":
