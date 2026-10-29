@@ -1969,7 +1969,8 @@ private:
     // ["pwd","totp"|"email"|"recovery"] (or ["oauth"] for a federated login).
     //
     // `serviceKeyId`/`serviceKeyGen` mark a session minted from a generated
-    // key:secret. A key is bound to ONE tenant, so its session carries roles for
+    // key:secret; `serviceKeyName` is the label its owner gave the key (`skname`),
+    // which csai lists that application's headless runs under. A key is bound to ONE tenant, so its session carries roles for
     // that tenant only — with the full map, X-Tenant (and every downstream door
     // reading the map) would let a single-tenant key act in all the user's tenants.
     std::string mintJwt(const std::string& user, const std::string& activeTenant,
@@ -1977,7 +1978,8 @@ private:
                         std::string* outJti = nullptr,
                         const std::string& aip = "",
                         const std::string& serviceKeyId = "",
-                        const std::string& serviceKeyGen = "") {
+                        const std::string& serviceKeyGen = "",
+                        const std::string& serviceKeyName = "") {
         auto byTenant = ldap_->getRolesByTenant(user);
         if (!serviceKeyId.empty())
             byTenant = fileengine::service_key::rolesForKeySession(byTenant, activeTenant);
@@ -2014,6 +2016,9 @@ private:
         if (!serviceKeyId.empty()) {
             claims->set("skid", serviceKeyId);
             claims->set("skgen", serviceKeyGen);
+            // Bounded: the label is free text the user typed, and it rides in
+            // every request's Authorization header for the life of the session.
+            if (!serviceKeyName.empty()) claims->set("skname", serviceKeyName.substr(0, 120));
         }
 
         Poco::JSON::Object::Ptr rolesObj = new Poco::JSON::Object();
@@ -2767,7 +2772,8 @@ private:
     fileengine::service_key::KeyVerdict
     serviceCredCall(KeyCheck mode, const std::string& keyId, const std::string& secret,
                     const std::string& tenant, const std::string& ip,
-                    std::string& uid, std::string& generation) {
+                    std::string& uid, std::string& generation,
+                    std::string* label = nullptr) {
         using fileengine::service_key::KeyVerdict;
         if (cfg_.ldap_manager_url.empty() || cfg_.service_cred_internal_secret.empty()) {
             webdav::errorLog("service credentials: LDAP_MANAGER_URL / SERVICE_CRED_INTERNAL_SECRET "
@@ -2797,6 +2803,7 @@ private:
                 auto o = p.parse(r.body).extract<Poco::JSON::Object::Ptr>();
                 uid = o->optValue<std::string>("uid", std::string());
                 generation = o->optValue<std::string>("generation", std::string());
+                if (label) *label = o->optValue<std::string>("label", std::string());
             } catch (...) {
                 uid.clear();
                 generation.clear();
@@ -2824,14 +2831,14 @@ private:
                 return tenantRefused(resp, code, reason);
             }
         }
-        std::string uid, generation;
+        std::string uid, generation, label;
         if (secret.empty()) {   // belt and braces: Verify would refuse it too
             audit_->emitAuth("login_failure", "denied", keyId, tenant, ip);
             return unauthorized(req, resp);
         }
         using fileengine::service_key::KeyVerdict;
         const KeyVerdict v =
-            serviceCredCall(KeyCheck::Verify, keyId, secret, tenant, ip, uid, generation);
+            serviceCredCall(KeyCheck::Verify, keyId, secret, tenant, ip, uid, generation, &label);
         if (v == KeyVerdict::Unavailable) {
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"service credentials unavailable"})");
@@ -2856,7 +2863,7 @@ private:
                             R"({"error":"audit log unavailable"})");
         }
         std::string jti;
-        std::string token = mintJwt(uid, tenant, {"svc"}, &jti, "", keyId, generation);
+        std::string token = mintJwt(uid, tenant, {"svc"}, &jti, "", keyId, generation, label);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");
@@ -2871,10 +2878,10 @@ private:
         // The session's own tenant claim, never X-Tenant: the roles map holds only
         // that tenant anyway, but the liveness question must be asked about the
         // tenant the key was minted for.
-        std::string uid, generation;
+        std::string uid, generation, label;
         using fileengine::service_key::KeyVerdict;
         const KeyVerdict v = serviceCredCall(KeyCheck::Status, id.service_key_id, "", id.tenant,
-                                             ip, uid, generation);
+                                             ip, uid, generation, &label);
         if (v == KeyVerdict::Unavailable) {
             return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
                             R"({"error":"service credentials unavailable"})");
@@ -2891,8 +2898,10 @@ private:
                             R"({"error":"audit log unavailable"})");
         }
         std::string jti;
+        // The label is re-read at every refresh, so renaming a key on the
+        // credentials card reaches its live sessions within one token lifetime.
         std::string token = mintJwt(id.user, id.tenant, {"svc"}, &jti, "",
-                                    id.service_key_id, id.service_key_gen);
+                                    id.service_key_id, id.service_key_gen, label);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"token\":\"" + token + "\",\"token_type\":\"Bearer\",\"expires_in\":" +
                  std::to_string(cfg_.token_ttl) + "}");

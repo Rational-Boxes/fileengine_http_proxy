@@ -74,6 +74,7 @@ T1=$(mint "$KEY" "$SEC" | jget token)
 check "token issued" yes "$([ -n "$T1" ] && echo yes || echo no)"
 check "amr is [svc]" "['svc']" "$(claim "$T1" "c.get('amr')")"
 check "skid is the key" "$KEY" "$(claim "$T1" "c.get('skid')")"
+check "skname is the key's label" "e2e-api-key" "$(claim "$T1" "c.get('skname')")"
 check "roles hold the key's tenant only" "['$FE_TENANT']" "$(claim "$T1" "sorted(c.get('roles',{}))")"
 check "whoami with the bearer" 200 "$(code -H "Authorization: Bearer $T1" "$BASE/v1/whoami")"
 check "wrong secret -> 401" 401 "$(printf 'user = "%s:%s"\n' "$KEY" "${SEC}x" |
@@ -95,6 +96,7 @@ echo "3. Refresh renews while the key is live"
 T2=$(curl -s -H "Authorization: Bearer $T1" -X POST "$BASE/v1/auth/refresh" | jget token)
 check "refresh issued a token" yes "$([ -n "$T2" ] && echo yes || echo no)"
 check "refreshed token keeps the key binding" "$KEY" "$(claim "$T2" "c.get('skid')")"
+check "refreshed token carries the label" "e2e-api-key" "$(claim "$T2" "c.get('skname')")"
 check "refreshed token keeps amr [svc]" "['svc']" "$(claim "$T2" "c.get('amr')")"
 
 echo "4. Regenerating the key ends renewal of the old session"
