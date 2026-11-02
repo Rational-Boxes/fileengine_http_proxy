@@ -624,21 +624,34 @@ private:
         return kAliases;
     }
 
-    static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
-                                const std::vector<std::string>& roles) {
-        std::vector<std::string> derived;
+    // The roles a request actually carries to the core: the session's roles
+    // verbatim (including "system_admin" iff the user is in that group) plus the
+    // role each aliased group derives. Sorted and de-duplicated — roles are a set.
+    //
+    // This is also what /whoami and /introspect report. They used to echo the
+    // session's raw list, and the raw list depends on how the session was made:
+    // a password login maps groups to roles once (extractRolesFromGroups), an
+    // OAuth login does not. So the same administrator was reported WITH
+    // tenant_admin after a password sign-in and WITHOUT it after OAuth, while
+    // the core received tenant_admin either way. Reporting what the core gets
+    // makes the identity the same whichever door the session came through.
+    static std::vector<std::string> effectiveRoles(const std::vector<std::string>& roles) {
+        std::vector<std::string> out;
         for (const auto& r : roles) {
             if (r.empty()) continue;
-            a->add_roles(r);  // verbatim — includes "system_admin" iff the user is in that group
+            out.push_back(r);
             for (const auto& [group, role] : roleAliases()) {
-                if (r == group &&
-                    std::find(roles.begin(), roles.end(), role) == roles.end() &&
-                    std::find(derived.begin(), derived.end(), role) == derived.end()) {
-                    derived.push_back(role);
-                }
+                if (r == group) out.push_back(role);
             }
         }
-        for (const auto& role : derived) a->add_roles(role);
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+    static void addRolesAliased(fileengine_rpc::AuthenticationContext* a,
+                                const std::vector<std::string>& roles) {
+        for (const auto& role : effectiveRoles(roles)) a->add_roles(role);
     }
 
     void fillAuth(fileengine_rpc::AuthenticationContext* a, const AuthIdentity& id) {
@@ -3096,7 +3109,7 @@ private:
     void whoami(HTTPServerResponse& resp, const AuthIdentity& id) {
         std::string body = "{\"user\":\"" + jsonEscape(id.user) +
                            "\",\"tenant\":\"" + jsonEscape(id.tenant) +
-                           "\",\"roles\":" + jsonArray(id.roles) + "}";
+                           "\",\"roles\":" + jsonArray(effectiveRoles(id.roles)) + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 
@@ -3108,7 +3121,7 @@ private:
     void introspect(HTTPServerResponse& resp, const AuthIdentity& id) {
         std::string body = "{\"active\":true,\"user\":\"" + jsonEscape(id.user) +
                            "\",\"tenant\":\"" + jsonEscape(id.tenant) +
-                           "\",\"roles\":" + jsonArray(id.roles) + "}";
+                           "\",\"roles\":" + jsonArray(effectiveRoles(id.roles)) + "}";
         sendJson(resp, HTTPResponse::HTTP_OK, body);
     }
 

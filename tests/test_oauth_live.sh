@@ -13,8 +13,8 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$HERE/build/http_bridge"
-PORT="${PORT:-8099}"
-IDP_PORT="${IDP_PORT:-8096}"
+PORT="${PORT:-18099}"   # 8099 is folder_actions in the dev stack
+IDP_PORT="${IDP_PORT:-18096}"   # 8096 is the core MCP door
 BASE="http://localhost:$PORT"
 IDP="http://127.0.0.1:$IDP_PORT"
 RETURN_OK="http://localhost:3000/oauth/callback"
