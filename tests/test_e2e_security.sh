@@ -87,29 +87,50 @@ if [ -z "$TOKEN" ]; then
     bad "could not obtain token for $FE_USER" "$(cat /tmp/fe_sec_login.err 2>/dev/null)"
 fi
 
-# ---- C1: a non-admin must NOT be able to self-assign system_admin --------
-# Under the trust model the bridge is the admin-gate; the core trusts callers.
-echo "[C1] role self-escalation must be forbidden for non-admins"
+# ---- C1: nobody below system_admin may write a privileged core role -------
+# Under the trust model the bridge is the admin-gate; the core trusts callers
+# AND honours its user_roles table, so a row written there is a real grant.
+# Two layers: a non-admin may not touch the role API at all, and an ADMIN (a
+# tenant admin — what this suite's standard fixture is) may not write the
+# reserved roles, whose membership lives in the directory. The second layer was
+# missing after H2 and was recorded here as an expected failure; every run then
+# left the fixture user holding system_admin in the core, which silently turned
+# every later suite into a break-glass run. It is a hard failure now, and a
+# grant that does get through is removed before the failure is reported.
+echo "[C1] privileged roles cannot be self-assigned below system_admin"
 if [ -n "$TOKEN" ]; then
-    code=$(code_for -H "Authorization: Bearer $TOKEN" -X PUT \
-                    "$BASE/v1/roles/system_admin/users/${EXPECT_USER}")
-    if [ "$code" = "403" ] || [ "$code" = "404" ]; then
-        ok "PUT self into system_admin -> $code (denied)"
+    me=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami")
+    if grep -q '"system_admin"' <<<"$me"; then
+        echo "  - caller is a real system_admin; the reserved-role refusal does not apply (skipped)"
     else
-        xfail "self-assign system_admin returned $code, expected 403 (finding C1: bridge role endpoints need an admin gate)"
+        for role in system_admin tenant_admin erasure_admin administrators erasure_admins 'system%5Fadmin' 'System_Admin'; do
+            code=$(code_for -H "Authorization: Bearer $TOKEN" -X PUT \
+                            "$BASE/v1/roles/${role}/users/${EXPECT_USER}")
+            if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+                ok "PUT self into ${role} -> $code (denied)"
+            else
+                curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -X DELETE \
+                     "$BASE/v1/roles/${role}/users/${EXPECT_USER}"
+                bad "self-assign ${role} must be refused" "got $code (grant removed again)"
+            fi
+        done
+        code=$(code_for -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+                        -d '{"role":"system_admin"}' -X POST "$BASE/v1/roles")
+        [ "$code" = "403" ] || [ "$code" = "404" ] || [ "$code" = "409" ] \
+            && ok "createRole system_admin -> $code (denied)" \
+            || bad "createRole system_admin must be refused" "got $code"
     fi
-    # createRole should likewise be admin-only
-    code=$(code_for -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-                    -d '{"role":"pwn"}' -X POST "$BASE/v1/roles")
-    if [ "$code" = "403" ] || [ "$code" = "404" ]; then ok "createRole as non-admin -> $code (denied)"
+    # Ordinary role creation stays admin-only.
+    if grep -qE '"(administrators|tenant_admin|system_admin)"' <<<"$me"; then
+        echo "  - caller is an admin; createRole of an ordinary role is allowed (not asserted)"
     else
-        xfail "createRole as non-admin returned $code, expected 403 (C1)"
-        # The gate is missing, so the role was really created — remove it. Left
-        # behind, every run of this suite adds another "pwn" to the tenant's role
-        # catalog, which is where the stray entries in dev catalogs come from, and
-        # a test that quietly grows production-shaped state is a poor neighbour
-        # even when it is proving a finding.
-        curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -X DELETE "$BASE/v1/roles/pwn"
+        code=$(code_for -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+                        -d '{"role":"pwn"}' -X POST "$BASE/v1/roles")
+        if [ "$code" = "403" ] || [ "$code" = "404" ]; then ok "createRole as non-admin -> $code (denied)"
+        else
+            curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -X DELETE "$BASE/v1/roles/pwn"
+            bad "createRole as non-admin must be refused" "got $code (role removed again)"
+        fi
     fi
 fi
 

@@ -1368,7 +1368,42 @@ private:
     // and does NOT gate role RPCs, so this bridge is the enforcement point: without
     // it any authenticated user could self-assign system_admin and bypass every
     // ACL. A tenant admin carries the "administrators" role (aliased to
-    // "system_admin" for the active tenant). (Security review C1.)
+    // "tenant_admin" since H2 — NOT system_admin). Passing this gate is not
+    // enough to write a privileged role: see refuseReservedRole. (Security
+    // review C1.)
+    // The core's privileged roles, in both spellings the platform uses: the core
+    // role and the directory group the bridges alias to it. Membership in these
+    // comes from LDAP groups (ldap_manager), never from the core's user_roles
+    // table — but the core HONOURS user_roles (resolve_effective_roles merges
+    // it), so writing one there is a grant. These endpoints let a tenant admin
+    // write any role, and that was the C1 residue that survived H2: a tenant
+    // admin could PUT themselves into system_admin and the core then treated
+    // them as break-glass in the tenant, past the erasure gate and every ACL.
+    // Only a real system_admin (from the LDAP group of that name) may touch
+    // these through the role API at all.
+    static bool isReservedRole(const std::string& raw) {
+        std::string r;
+        try { Poco::URI::decode(raw, r); } catch (...) { r = raw; }
+        std::transform(r.begin(), r.end(), r.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        r = webdav::trim(r);
+        static const std::vector<std::string> kReserved = {
+            "system_admin", "tenant_admin", "erasure_admin",
+            "administrators", "erasure_admins",
+        };
+        return std::find(kReserved.begin(), kReserved.end(), r) != kReserved.end();
+    }
+
+    bool refuseReservedRole(const AuthIdentity& id, const std::string& role,
+                            HTTPServerResponse& resp) {
+        if (!isReservedRole(role)) return false;
+        if (std::find(id.roles.begin(), id.roles.end(), "system_admin") != id.roles.end())
+            return false;
+        sendJson(resp, HTTPResponse::HTTP_FORBIDDEN,
+                 R"({"error":"reserved role: membership is managed in the directory"})");
+        return true;
+    }
+
     bool requireTenantAdmin(const AuthIdentity& id, HTTPServerResponse& resp) {
         for (const auto& r : id.roles)
             if (r == "administrators" || r == "tenant_admin" || r == "system_admin") return true;
@@ -1397,6 +1432,7 @@ private:
         if (!requireTenantAdmin(id, resp)) return;
         std::string role = jsonField(readBody(req), "role");
         if (role.empty()) return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"missing 'role'"})");
+        if (refuseReservedRole(id, role, resp)) return;
         fileengine_rpc::CreateRoleRequest rq;
         rq.set_role(role);
         fillAuth(rq.mutable_auth(), id);
@@ -1407,6 +1443,7 @@ private:
 
     void deleteRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role) {
         if (!requireTenantAdmin(id, resp)) return;
+        if (refuseReservedRole(id, role, resp)) return;
         fileengine_rpc::DeleteRoleRequest rq;
         rq.set_role(role);
         fillAuth(rq.mutable_auth(), id);
@@ -1426,6 +1463,7 @@ private:
 
     void assignUserToRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
         if (!requireTenantAdmin(id, resp)) return;
+        if (refuseReservedRole(id, role, resp)) return;
         fileengine_rpc::AssignUserToRoleRequest rq;
         rq.set_user(user);
         rq.set_role(role);
@@ -1437,6 +1475,7 @@ private:
 
     void removeUserFromRole(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& role, const std::string& user) {
         if (!requireTenantAdmin(id, resp)) return;
+        if (refuseReservedRole(id, role, resp)) return;
         fileengine_rpc::RemoveUserFromRoleRequest rq;
         rq.set_user(user);
         rq.set_role(role);
