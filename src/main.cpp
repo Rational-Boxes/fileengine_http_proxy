@@ -103,6 +103,13 @@ int main() {
     // ticket_claims.h whatever this says — a larger value is clamped, not honoured.
     cfg.playback_ticket_ttl =
         std::stoi(webdav::getEnvOrDefault("PLAYBACK_TICKET_TTL_SECONDS", "1800"));
+    // Folder-as-ZIP: streamed, so these cap concurrency/size, not disk use.
+    cfg.archive_max_concurrent =
+        std::stoi(webdav::getEnvOrDefault("HTTP_ARCHIVE_MAX_CONCURRENT", "4"));
+    cfg.archive_max_members =
+        std::stol(webdav::getEnvOrDefault("HTTP_ARCHIVE_MAX_MEMBERS", "20000"));
+    cfg.archive_max_bytes =
+        std::stoll(webdav::getEnvOrDefault("HTTP_ARCHIVE_MAX_BYTES", "0"));
     // Shared HS256 secret for signing/verifying bearer JWTs. Every service that
     // verifies these tokens must share this exact value.
     cfg.jwt_secret = webdav::getEnvOrDefault("FILEENGINE_JWT_SECRET", "");

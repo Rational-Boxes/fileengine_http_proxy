@@ -128,6 +128,15 @@ target_include_directories(failover_tests PRIVATE include)
 target_compile_features(failover_tests PRIVATE cxx_std_17)
 add_test(NAME failover_tests COMMAND failover_tests)
 
+# --- forward-only ZIP writer (zip_stream.h): pure, no Poco/gRPC ---
+# tests/check_zip_stream.sh additionally runs independent readers (Python
+# zipfile, Info-ZIP) over the archives these tests produce.
+add_executable(zip_tests tests/test_main.cpp tests/test_zip_stream.cpp)
+target_include_directories(zip_tests PRIVATE include)
+target_compile_features(zip_tests PRIVATE cxx_std_17)
+target_link_libraries(zip_tests Threads::Threads GTest::gtest)
+add_test(NAME zip_tests COMMAND zip_tests)
+
 # --- security regression suite over the header-only HS256 JWT (jwt.h) ---
 # Header-only: links only Poco (JSON/Foundation) + OpenSSL (HMAC) + GTest.
 add_executable(security_tests tests/test_main.cpp tests/test_security.cpp tests/test_service_claims.cpp tests/test_sso_handoff.cpp tests/test_tenant_role_policy.cpp tests/test_tenant_state_policy.cpp tests/test_ticket_claims.cpp tests/test_range_response.cpp tests/test_service_key_policy.cpp)

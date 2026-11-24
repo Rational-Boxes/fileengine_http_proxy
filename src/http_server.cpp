@@ -30,10 +30,12 @@
 #include "ticket_claims.h"
 #include "service_key_policy.h"
 #include "range_response.h"
+#include "zip_stream.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/HTTPServerRequest.h>
+#include <Poco/Net/HTTPServerRequestImpl.h>
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/HTTPServerParams.h>
 #include <Poco/Net/HTMLForm.h>
@@ -52,6 +54,7 @@
 #include <chrono>
 #include <ctime>
 #include <mutex>
+#include <set>
 #include <cstdio>
 #include <fstream>
 #include <istream>
@@ -464,6 +467,15 @@ private:
                 // No valid ticket: fall through to the normal gate, which emits
                 // the ordinary 401 rather than anything ticket-specific.
             }
+            // The same, for a folder streamed as a ZIP. The ticket is scoped to
+            // the path segment AS SENT ("root" stays "root"), so a ticket can
+            // never be scoped to the empty uid.
+            if (method == "GET" && s2.size() == 4 && s2[1] == "dirs" && s2[3] == "archive"
+                && req.get("Authorization", "").empty()) {
+                AuthIdentity tid;
+                if (identityFromDownloadTicket(req, s2[2], tid, TicketRoute::Archive))
+                    return archiveDir(req, resp, tid, s2[2]);
+            }
         }
 
         AuthIdentity id;
@@ -544,6 +556,11 @@ private:
                     if (method == "DELETE") return removeDir(resp, id, uid);
                 } else if (segs.size() == 4 && sub == "files" && method == "POST") {
                     return touchFile(req, resp, id, uid);
+                } else if (segs.size() == 4 && sub == "archive" && method == "GET") {
+                    // Bearer form, for API clients; the SPA uses the ticket form.
+                    return archiveDir(req, resp, id, segs[2]);
+                } else if (segs.size() == 4 && sub == "archive-ticket" && method == "POST") {
+                    return archiveTicket(resp, id, segs[2]);
                 }
             } else if (resource == "files") {
                 if (segs.size() == 3) {
@@ -2123,6 +2140,260 @@ private:
                  std::to_string(cfg_.download_ticket_ttl) + "}");
     }
 
+    // ---- folder as a ZIP ----------------------------------------------------
+    // GET /v1/dirs/{uid}/archive streams the folder's whole tree, as the caller,
+    // as one ZIP — written straight to the socket while it is read from the
+    // core, so the bridge never holds more than one chunk of it and nothing
+    // touches disk (zip_stream.h says why the format allows that). nginx has
+    // proxy_buffering off on /api/, which is what keeps the edge from spooling
+    // the response into its own temp files instead.
+    //
+    // Two passes, deliberately:
+    //   1. a WALK (ListDirectory only — one RPC per folder) that builds the
+    //      member list and enforces the caps, so an oversized folder is refused
+    //      with a 413 before a single byte is committed;
+    //   2. the STREAM: per file, a Stat (which is the caller's READ check and
+    //      pins the exact version) and then StreamFileDownload of that version.
+    //      A file that has become unreadable or vanished since the walk is
+    //      skipped — its local header is only written once its first frame has
+    //      arrived, so there is nothing to undo — and named in a report entry.
+    //
+    // A failure after a file's bytes have STARTED cannot be skipped (a partial
+    // member would be silently truncated content), so it aborts the whole
+    // transfer: the socket is shut down without the terminating chunk, and the
+    // browser reports a failed download rather than saving a broken archive.
+    static std::atomic<int>& archivesInFlight() {
+        static std::atomic<int> n{0};
+        return n;
+    }
+
+    void archiveTicket(HTTPServerResponse& resp, const AuthIdentity& id,
+                       const std::string& rawUid) {
+        // Stat first, as the caller, so a ticket is only minted for a folder the
+        // caller can see — and not for a file, which this route cannot stream.
+        fileengine_rpc::StatRequest sq;
+        sq.set_uid(rawUid == "root" ? "" : rawUid);
+        fillAuth(sq.mutable_auth(), id);
+        auto st = grpc_->stat(sq);
+        if (!st.success() && rawUid != "root") return mapError(resp, st.error());
+        if (st.success() && st.info().type() != fileengine_rpc::DIRECTORY)
+            return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"not a folder"})");
+        const std::string t = mintTicket(id, rawUid, "archive", cfg_.download_ticket_ttl);
+        sendJson(resp, HTTPResponse::HTTP_OK,
+                 "{\"ticket\":\"" + t + "\",\"expires_in\":" +
+                 std::to_string(cfg_.download_ticket_ttl) + "}");
+    }
+
+    struct ArchiveMember {
+        std::string uid;
+        std::string path;   // sanitised, '/'-separated, relative to the folder
+        bool dir = false;
+        int64_t mtime = 0;
+    };
+
+    void archiveDir(HTTPServerRequest& req, HTTPServerResponse& resp,
+                    const AuthIdentity& id, const std::string& rawUid) {
+        const std::string rootUid = rawUid == "root" ? "" : rawUid;
+
+        // Concurrency first: refusing is cheap, walking is not.
+        struct Slot {
+            bool held = false;
+            ~Slot() { if (held) archivesInFlight().fetch_sub(1); }
+        } slot;
+        const int cap = std::max(1, cfg_.archive_max_concurrent);
+        if (archivesInFlight().fetch_add(1) >= cap) {
+            archivesInFlight().fetch_sub(1);
+            resp.set("Retry-After", "30");
+            return sendJson(resp, HTTPResponse::HTTP_SERVICE_UNAVAILABLE,
+                            R"({"error":"too many folder downloads in progress; try again shortly"})");
+        }
+        slot.held = true;
+
+        // The folder itself: must be one, and must be visible to the caller.
+        std::string folderName;
+        {
+            fileengine_rpc::StatRequest sq;
+            sq.set_uid(rootUid);
+            fillAuth(sq.mutable_auth(), id);
+            auto st = grpc_->stat(sq);
+            if (st.success()) {
+                if (st.info().type() != fileengine_rpc::DIRECTORY)
+                    return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                    R"({"error":"not a folder"})");
+                folderName = st.info().name();
+            } else if (!rootUid.empty()) {
+                return mapError(resp, st.error());
+            }
+        }
+
+        // ---- pass 1: the walk ----
+        std::vector<ArchiveMember> members;
+        std::vector<std::string> skipped;   // "path: reason", for the report entry
+        long long listedBytes = 0;
+        {
+            struct Pending { std::string uid; std::string prefix; };
+            std::vector<Pending> stack{{rootUid, ""}};
+            std::set<std::string> seen;     // a corrupt parent link must not loop
+            while (!stack.empty()) {
+                Pending cur = std::move(stack.back());
+                stack.pop_back();
+                if (!seen.insert(cur.uid).second) continue;
+
+                fileengine_rpc::ListDirectoryRequest lq;
+                lq.set_uid(cur.uid);
+                fillAuth(lq.mutable_auth(), id);
+                auto lr = grpc_->listDirectory(lq);
+                if (!lr.success()) {
+                    if (cur.prefix.empty()) return mapError(resp, lr.error());
+                    skipped.push_back(cur.prefix + "/: folder could not be listed");
+                    continue;
+                }
+
+                // Sorted, so the same tree always produces the same archive and
+                // the "(2)" suffixes land on the same siblings every time.
+                std::vector<const fileengine_rpc::DirectoryEntry*> kids;
+                for (const auto& e : lr.entries()) kids.push_back(&e);
+                std::sort(kids.begin(), kids.end(), [](auto* a, auto* b) {
+                    if (a->name() != b->name()) return a->name() < b->name();
+                    return a->uid() < b->uid();
+                });
+                if (kids.empty() && !cur.prefix.empty()) {
+                    // Keep empty folders: the structure is part of what was asked for.
+                    members.push_back({cur.uid, cur.prefix, true, 0});
+                }
+
+                zip::SiblingNames names;
+                std::vector<Pending> subdirs;
+                for (const auto* e : kids) {
+                    if (e->type() == fileengine_rpc::SYMLINK) continue;
+                    const std::string name = names.claim(zip::sanitizeSegment(e->name()));
+                    const std::string path = cur.prefix.empty() ? name : cur.prefix + "/" + name;
+                    if (e->type() == fileengine_rpc::DIRECTORY) {
+                        subdirs.push_back({e->uid(), path});
+                    } else {
+                        members.push_back({e->uid(), path, false, e->modified_at()});
+                        listedBytes += e->size();
+                    }
+                    if (cfg_.archive_max_members > 0 &&
+                        static_cast<long>(members.size() + subdirs.size()) > cfg_.archive_max_members)
+                        return sendJson(resp, HTTPResponse::HTTP_REQUEST_ENTITY_TOO_LARGE,
+                            "{\"error\":\"folder has more than " +
+                            std::to_string(cfg_.archive_max_members) +
+                            " items to archive\",\"max_members\":" +
+                            std::to_string(cfg_.archive_max_members) + "}");
+                    if (cfg_.archive_max_bytes > 0 && listedBytes > cfg_.archive_max_bytes)
+                        return sendJson(resp, HTTPResponse::HTTP_REQUEST_ENTITY_TOO_LARGE,
+                            "{\"error\":\"folder is larger than the folder-download limit\","
+                            "\"max_bytes\":" + std::to_string(cfg_.archive_max_bytes) + "}");
+                }
+                // Reverse onto the stack so subfolders are visited in name order.
+                for (auto it = subdirs.rbegin(); it != subdirs.rend(); ++it)
+                    stack.push_back(std::move(*it));
+            }
+        }
+        // Depth-first with sorted siblings is close to path order already; make
+        // it exact so the archive lists the way a file manager would.
+        std::stable_sort(members.begin(), members.end(),
+                         [](const ArchiveMember& a, const ArchiveMember& b) {
+                             return a.path < b.path; });
+
+        // ---- pass 2: the stream ----
+        resp.setStatus(HTTPResponse::HTTP_OK);
+        resp.setContentType("application/zip");
+        resp.setChunkedTransferEncoding(true);
+        resp.set("X-Content-Type-Options", "nosniff");
+        resp.set("Cache-Control", "no-store");
+        resp.set("Content-Disposition", zip::attachmentDisposition(
+            (folderName.empty() ? std::string("files") : zip::sanitizeSegment(folderName)) + ".zip"));
+        std::ostream& os = resp.send();
+
+        zip::Writer w([&os](const char* p, size_t n) {
+            os.write(p, static_cast<std::streamsize>(n));
+            return os.good();   // false = the client went away
+        });
+
+        auto abortTransfer = [&](const std::string& why) {
+            webdav::debugLog("archive " + rawUid + " aborted: " + why);
+            // Without this, returning would let Poco write the terminating chunk
+            // and the client would save a truncated ZIP as if it were complete.
+            try {
+                auto& sock = static_cast<Poco::Net::HTTPServerRequestImpl&>(req).socket();
+                sock.setLinger(true, 0);
+                sock.shutdown();
+            } catch (...) {}
+        };
+
+        long filesWritten = 0;
+        for (const auto& m : members) {
+            if (m.dir) {
+                if (!w.addDirectory(m.path)) return abortTransfer("client disconnected");
+                continue;
+            }
+            // Re-check and pin at the moment of reading: the walk may be minutes old.
+            fileengine_rpc::StatRequest sq;
+            sq.set_uid(m.uid);
+            fillAuth(sq.mutable_auth(), id);
+            auto st = grpc_->stat(sq);
+            if (!st.success()) {
+                skipped.push_back(m.path + ": no longer readable (" + st.error() + ")");
+                continue;
+            }
+            fileengine_rpc::GetFileRequest rq;
+            rq.set_uid(m.uid);
+            rq.set_version_timestamp(st.info().version());
+            fillAuth(rq.mutable_auth(), id);
+
+            const int64_t mtime = st.info().modified_at() > 0 ? st.info().modified_at() : m.mtime;
+            bool begun = false;
+            bool sinkFailed = false;
+            auto begin = [&]() -> bool {
+                if (begun) return true;
+                begun = true;
+                if (!w.beginFile(m.path, mtime)) { sinkFailed = true; return false; }
+                return true;
+            };
+            auto onMeta = [&](const fileengine_rpc::GetFileResponse&) { return begin(); };
+            auto onChunk = [&](const std::string& c) {
+                if (!begin()) return false;
+                if (!w.data(c.data(), c.size())) { sinkFailed = true; return false; }
+                return true;
+            };
+            auto r = grpc_->streamFileDownload(rq, onChunk, onMeta);
+            if (sinkFailed || w.failed()) return abortTransfer("client disconnected");
+            if (!r.success) {
+                if (!begun) {
+                    skipped.push_back(m.path + ": could not be read (" + r.error + ")");
+                    continue;
+                }
+                return abortTransfer("core stream failed mid-file for " + m.uid + ": " + r.error);
+            }
+            // An empty file sends no frame at all; it is still a member.
+            if (!begin()) return abortTransfer("client disconnected");
+            if (!w.endFile()) return abortTransfer("client disconnected");
+            ++filesWritten;
+        }
+
+        if (!skipped.empty()) {
+            // Say what is missing INSIDE the archive, where the person unpacking
+            // it will look. (The names are the caller's own files.)
+            std::string report =
+                "Some items could not be included in this download:\r\n\r\n";
+            for (const auto& s : skipped) report += "  " + s + "\r\n";
+            zip::SiblingNames top;
+            for (const auto& m : members)
+                if (m.path.find('/') == std::string::npos) top.claim(m.path);
+            const std::string rname = top.claim("_download_report.txt");
+            if (!w.beginFile(rname, static_cast<int64_t>(std::time(nullptr))) ||
+                !w.data(report.data(), report.size()) || !w.endFile())
+                return abortTransfer("client disconnected");
+        }
+        if (!w.finish()) return abortTransfer("client disconnected");
+        os.flush();
+        webdav::debugLog("archive " + rawUid + ": " + std::to_string(filesWritten) +
+                         " files, " + std::to_string(skipped.size()) + " skipped, " +
+                         std::to_string(w.bytesWritten()) + " bytes");
+    }
+
     // A playback ticket: the same credential for a <video>/<audio> element,
     // which issues its own Range request every time it buffers or seeks — so it
     // must outlive the download ticket's seconds. Capped at 30 minutes whatever
@@ -2151,7 +2422,8 @@ private:
 
     // Resolve a `?ticket=` into an identity, but ONLY for the uid it names.
     bool identityFromDownloadTicket(HTTPServerRequest& req, const std::string& uid,
-                                    AuthIdentity& out) {
+                                    AuthIdentity& out,
+                                    TicketRoute route = TicketRoute::Content) {
         Poco::URI::QueryParameters qp;
         try { qp = Poco::URI(req.getURI()).getQueryParameters(); }
         catch (...) { return false; }
@@ -2175,6 +2447,10 @@ private:
                 return false;
             default:
                 return false;
+        }
+        if (!ticketTypeAllowedOn(claims->optValue<std::string>("typ", std::string()), route)) {
+            webdav::debugLog("ticket presented on a route its type does not open");
+            return false;
         }
         // Signed out → the session's tickets die with it. Seconds-long download
         // tickets barely needed this; a 30-minute playback ticket does. A ticket

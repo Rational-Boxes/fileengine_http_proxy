@@ -208,6 +208,54 @@ paths:
         "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/UidRef" } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/dirs/{uid}/archive:
+    parameters:
+      - { $ref: "#/components/parameters/Uid" }
+      - name: ticket
+        in: query
+        required: false
+        schema: { type: string }
+        description: >
+          An archive ticket from POST /v1/dirs/{uid}/archive-ticket, for a browser
+          navigation (which cannot send Authorization). Honoured only on this route
+          and only for this folder.
+    get:
+      tags: [filesystem]
+      summary: Download a folder tree as one ZIP (streamed)
+      description: >
+        Streams the folder and everything under it, as the caller, as a store-only
+        ZIP (zip64 only where needed). Written straight to the connection as each
+        file is read, so nothing is assembled on the server; the response is
+        chunked and carries no Content-Length. Each file is its current version at
+        the moment it is read. Files the caller cannot read, or that vanish
+        mid-download, are left out and listed in `_download_report.txt` inside the
+        archive. A failure after a file's bytes have started aborts the connection
+        (no terminating chunk), so a client sees a failed transfer, never a
+        truncated archive. Limits: HTTP_ARCHIVE_MAX_CONCURRENT (default 4, then
+        503 + Retry-After), HTTP_ARCHIVE_MAX_MEMBERS (default 20000) and
+        HTTP_ARCHIVE_MAX_BYTES (default 0 = none), both 413.
+      responses:
+        "200": { description: The archive, content: { application/zip: { schema: { type: string, format: binary } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { description: No valid credential or ticket }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { description: Too many folder downloads in progress; retry after the Retry-After seconds }
+  /v1/dirs/{uid}/archive-ticket:
+    parameters: [ { $ref: "#/components/parameters/Uid" } ]
+    post:
+      tags: [filesystem]
+      summary: Mint a short-lived ticket for GET /v1/dirs/{uid}/archive
+      description: >
+        Scoped to this one folder, valid for DOWNLOAD_TICKET_TTL_SECONDS (default
+        30) to START a download, bound to the session that minted it, and refused
+        as a bearer token. 400 for a uid that is not a folder.
+      responses:
+        "200": { description: Ticket, content: { application/json: { schema: { type: object, properties: { ticket: { type: string }, expires_in: { type: integer } } } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/nodes/{uid}:
     parameters: [ { $ref: "#/components/parameters/Uid" } ]

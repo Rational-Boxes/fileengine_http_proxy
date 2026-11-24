@@ -70,6 +70,14 @@ struct Config {
     // large" a tenth of the way to the edge's actual ceiling. 0 = no bridge
     // limit, leaving the edge (client_max_body_size) as the ceiling.
     long max_upload_bytes = 5368709120L;  // 5 GiB
+    // Folder-as-ZIP downloads (GET /v1/dirs/{uid}/archive). The archive is
+    // streamed, never assembled, so these bound TIME and egress, not disk: every
+    // archive in flight pins one of the `thread_pool` workers for its whole
+    // transfer, and without a cap of its own a handful of large folders would
+    // starve every other request. 0 = no limit (concurrent: refused below 1).
+    int archive_max_concurrent = 4;          // HTTP_ARCHIVE_MAX_CONCURRENT
+    long archive_max_members = 20000;        // HTTP_ARCHIVE_MAX_MEMBERS (files + folders)
+    long long archive_max_bytes = 0;         // HTTP_ARCHIVE_MAX_BYTES (listed sizes; 0 = none)
     std::string cors_origin;                   // legacy single origin (HTTP_CORS_ORIGIN)
     std::vector<std::string> cors_origins;     // allow-list (HTTP_CORS_ORIGINS CSV + the legacy one); exact match, never "*"
     std::string grpc_address = "localhost:50051";
