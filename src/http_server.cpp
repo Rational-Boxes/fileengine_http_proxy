@@ -2189,6 +2189,7 @@ private:
         std::string path;   // sanitised, '/'-separated, relative to the folder
         bool dir = false;
         int64_t mtime = 0;
+        int64_t size = 0;   // as listed: a HINT (zip64 or not), never trusted as a length
     };
 
     void archiveDir(HTTPServerRequest& req, HTTPServerResponse& resp,
@@ -2259,7 +2260,7 @@ private:
                 });
                 if (kids.empty() && !cur.prefix.empty()) {
                     // Keep empty folders: the structure is part of what was asked for.
-                    members.push_back({cur.uid, cur.prefix, true, 0});
+                    members.push_back({cur.uid, cur.prefix, true, 0, 0});
                 }
 
                 zip::SiblingNames names;
@@ -2271,7 +2272,7 @@ private:
                     if (e->type() == fileengine_rpc::DIRECTORY) {
                         subdirs.push_back({e->uid(), path});
                     } else {
-                        members.push_back({e->uid(), path, false, e->modified_at()});
+                        members.push_back({e->uid(), path, false, e->modified_at(), e->size()});
                         listedBytes += e->size();
                     }
                     if (cfg_.archive_max_members > 0 &&
@@ -2344,12 +2345,15 @@ private:
             fillAuth(rq.mutable_auth(), id);
 
             const int64_t mtime = st.info().modified_at() > 0 ? st.info().modified_at() : m.mtime;
+            // Either figure may be stale; the larger decides zip64 (zip_stream.h).
+            const uint64_t sizeHint = static_cast<uint64_t>(
+                std::max<int64_t>({0, m.size, static_cast<int64_t>(st.info().size())}));
             bool begun = false;
             bool sinkFailed = false;
             auto begin = [&]() -> bool {
                 if (begun) return true;
                 begun = true;
-                if (!w.beginFile(m.path, mtime)) { sinkFailed = true; return false; }
+                if (!w.beginFile(m.path, mtime, sizeHint)) { sinkFailed = true; return false; }
                 return true;
             };
             auto onMeta = [&](const fileengine_rpc::GetFileResponse&) { return begin(); };
@@ -2359,6 +2363,9 @@ private:
                 return true;
             };
             auto r = grpc_->streamFileDownload(rq, onChunk, onMeta);
+            if (w.overflowed())
+                return abortTransfer(m.uid + " outgrew its 32-bit entry: its recorded size (" +
+                                     std::to_string(sizeHint) + ") is wrong by gigabytes");
             if (sinkFailed || w.failed()) return abortTransfer("client disconnected");
             if (!r.success) {
                 if (!begun) {

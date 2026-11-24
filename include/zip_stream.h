@@ -34,11 +34,30 @@
 // makes the opposite trade, deliberately — a share recipient gets a progress bar
 // — and is the reference this one was checked against.
 //
-// zip64 only where it is needed (Go's archive/zip makes the same choice): an
-// entry gets a 64-bit descriptor and a zip64 central extra only when its size or
-// offset does not fit 32 bits, and the archive gets the zip64 end records only
-// when its entry count or directory position does. A small folder is therefore a
-// plain ZIP that every extractor, including old ones, opens.
+// zip64 only where it is needed, decided ONCE per entry, when it begins. An entry
+// is zip64 when it starts beyond 4 GiB or its expected size (the caller's hint)
+// is large; a zip64 entry then carries the zip64 extra in its local header, a
+// 64-bit data descriptor and the zip64 extra in its central header — all three,
+// always together. APPNOTE 4.3.9.2 ties the descriptor's width to the presence
+// of zip64 information, and readers disagree on WHICH header they consult:
+// Info-ZIP takes it from the central entry, so a small file past the 4 GiB mark
+// with a 16-byte descriptor read as "overlapped components (possible zip bomb)".
+// (Measured 2026-11-23 against a 4.5 GiB archive; Python, 7-Zip, Go and Java's
+// ZipFile all accepted it, which is why only one reader caught it.)
+//
+// The hint is only a hint — sizes in the version table are known to be wrong for
+// some rows — so it is used with a wide margin (kZip64HintBytes), and an entry
+// that was begun as non-zip64 and then grows past 4 GiB is REFUSED rather than
+// written with fields that cannot hold its size: overflowed() reports it, and
+// the caller must abort the transfer. The archive gets the zip64 end records
+// only when its entry count or directory position needs them, so a small folder
+// is a plain ZIP that every extractor, including old ones, opens.
+//
+// Known incompatibility: Java's ZipInputStream (a STREAMING reader; also what
+// some tools built on it use) rejects any STORED entry with a data descriptor —
+// "only DEFLATED entries can have EXT descriptor". That is inherent to a stored
+// archive written without knowing CRCs in advance; java.util.zip.ZipFile, which
+// reads the central directory, is fine.
 //
 // Store-only (method 0). Most of what this system holds — PDF, Office, images,
 // video — is already compressed, and storing keeps the bridge thread's cost at
@@ -47,6 +66,8 @@
 // Pure: no Poco, no gRPC. Output goes to a Sink, so tests can capture it and the
 // bridge can hand it to the socket.
 #pragma once
+#include <zlib.h>
+
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -60,27 +81,19 @@
 namespace httpbridge {
 namespace zip {
 
-// ---- CRC-32 (ISO-HDLC, the one ZIP uses; reflected poly 0xEDB88320) -------
-inline const std::array<uint32_t, 256>& crcTable() {
-    static const std::array<uint32_t, 256> t = [] {
-        std::array<uint32_t, 256> a{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            a[i] = c;
-        }
-        return a;
-    }();
-    return t;
-}
-
+// ---- CRC-32 (ISO-HDLC, the one ZIP uses) -----------------------------------
+// zlib's, not a byte-at-a-time table: measured 16 GiB/s against 458 MiB/s on the
+// same machine (zlib-ng), and at the table's speed the checksum alone would have
+// cost one bridge core per archive at network speed.
 // Running CRC: crc32Update(0, ...) starts one; feed the result back in.
 inline uint32_t crc32Update(uint32_t crc, const char* p, size_t n) {
-    const auto& t = crcTable();
-    crc = ~crc;
-    for (size_t i = 0; i < n; ++i)
-        crc = t[(crc ^ static_cast<uint8_t>(p[i])) & 0xFF] ^ (crc >> 8);
-    return ~crc;
+    while (n > 0) {   // zlib takes a uInt length
+        const uInt step = static_cast<uInt>(n > 0x40000000u ? 0x40000000u : n);
+        crc = static_cast<uint32_t>(::crc32(crc, reinterpret_cast<const Bytef*>(p), step));
+        p += step;
+        n -= step;
+    }
+    return crc;
 }
 
 // ---- DOS date/time ---------------------------------------------------------
@@ -172,18 +185,22 @@ public:
         e.dir = true;
         e.dos = dosTimeFromUnix(mtime);
         e.offset = written_;
+        e.z64 = written_ >= k32Max;
         if (!writeLocal(e)) return false;
         entries_.push_back(std::move(e));
         return true;
     }
 
     // Begin a file entry; follow with data() calls and exactly one endFile().
-    bool beginFile(const std::string& path, int64_t mtime = 0) {
+    // `sizeHint` is the size the caller expects (0 = small/unknown); it decides
+    // whether the entry is written as zip64 — see the header comment.
+    bool beginFile(const std::string& path, int64_t mtime = 0, uint64_t sizeHint = 0) {
         if (open_ || failed_) return false;
         Entry e;
         e.name = path;
         e.dos = dosTimeFromUnix(mtime);
         e.offset = written_;
+        e.z64 = written_ >= k32Max || sizeHint >= kZip64HintBytes;
         if (!writeLocal(e)) return false;
         entries_.push_back(std::move(e));
         open_ = true;
@@ -194,6 +211,14 @@ public:
         if (!open_ || failed_) return false;
         if (n == 0) return true;
         Entry& e = entries_.back();
+        if (!e.z64 && e.size + n >= k32Max) {
+            // Begun as a 32-bit entry (the hint said small) and now too big for
+            // one. Its local header is already on the wire, so there is no
+            // honest way to continue.
+            overflowed_ = true;
+            failed_ = true;
+            return false;
+        }
         e.crc = crc32Update(e.crc, p, n);
         e.size += n;
         return emit(p, n);
@@ -206,7 +231,7 @@ public:
         std::string d;
         put32(d, kSigDescriptor);
         put32(d, e.crc);
-        if (e.size >= k32Max) {  // zip64 descriptor: 64-bit sizes
+        if (e.z64) {  // zip64 descriptor: 64-bit sizes, because the local header said so
             put64(d, e.size);
             put64(d, e.size);
         } else {
@@ -223,7 +248,7 @@ public:
         const uint64_t cdOffset = written_;
         std::string cd;
         for (const auto& e : entries_) {
-            const bool z64 = e.size >= k32Max || e.offset >= k32Max;
+            const bool z64 = e.z64;
             put32(cd, kSigCentral);
             put16(cd, kMadeByUnix);
             put16(cd, z64 ? kVersionZip64 : kVersionDefault);
@@ -297,6 +322,15 @@ public:
     uint64_t bytesWritten() const { return written_; }
     size_t entryCount() const { return entries_.size(); }
     bool failed() const { return failed_; }
+    // True when an entry outgrew the 32-bit header it was begun with (the
+    // size hint was wrong by gigabytes). The transfer must be aborted.
+    bool overflowed() const { return overflowed_; }
+
+    // Entries expected to be at least this large are written as zip64. Far
+    // below 4 GiB on purpose: the hint comes from the version table, which is
+    // known to be wrong for some rows, and a wrong "small" costs an aborted
+    // download where a wrong "large" costs nothing.
+    static constexpr uint64_t kZip64HintBytes = 1ull << 30;   // 1 GiB
 
 private:
     struct Entry {
@@ -306,6 +340,7 @@ private:
         uint32_t crc = 0;
         uint64_t size = 0;
         uint64_t offset = 0;
+        bool z64 = false;   // decided at begin; local, descriptor and central agree
     };
 
     static constexpr uint32_t k32Max = 0xFFFFFFFFu;
@@ -329,17 +364,26 @@ private:
     bool writeLocal(const Entry& e) {
         std::string h;
         put32(h, kSigLocal);
-        put16(h, kVersionDefault);
+        put16(h, e.z64 ? kVersionZip64 : kVersionDefault);
         put16(h, flagsFor(e));
         put16(h, 0);                // method: store
         put16(h, e.dos.time);
         put16(h, e.dos.date);
-        put32(h, 0);                // crc   -> data descriptor
-        put32(h, 0);                // csize -> data descriptor
-        put32(h, 0);                // usize -> data descriptor
+        put32(h, 0);                // crc -> data descriptor
+        // Sizes -> data descriptor. A zip64 entry says "see the zip64 extra"
+        // (0xFFFFFFFF), as Python's streaming writer does; the extra's values
+        // are zero because, under bit 3, they are not known yet.
+        put32(h, e.z64 ? k32Max : 0);
+        put32(h, e.z64 ? k32Max : 0);
         put16(h, static_cast<uint16_t>(e.name.size()));
-        put16(h, 0);                // extra length
+        put16(h, e.z64 ? 20 : 0);   // extra length
         h += e.name;
+        if (e.z64) {
+            put16(h, 0x0001);
+            put16(h, 16);
+            put64(h, 0);
+            put64(h, 0);
+        }
         return emit(h.data(), h.size());
     }
 
@@ -367,6 +411,7 @@ private:
     bool open_ = false;
     bool failed_ = false;
     bool finished_ = false;
+    bool overflowed_ = false;
 };
 
 // ---- the download's filename ------------------------------------------------

@@ -23,9 +23,14 @@
 // over them.
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "zip_stream.h"
 
@@ -226,4 +231,96 @@ TEST(ZipDisposition, CarriesTheUtf8NameAndASafeFallback) {
     EXPECT_NE(d.find("filename=\"Plne _neu_.zip\""), std::string::npos) << d;
     EXPECT_NE(d.find("filename*=UTF-8''Pl%C3%A4ne%20%22neu%22.zip"), std::string::npos) << d;
     EXPECT_NE(attachmentDisposition("Ü.zip").find("filename=\"download.zip\""), std::string::npos);
+}
+
+TEST(ZipWriter, ALargeSizeHintMakesTheEntryZip64InEveryHeader) {
+    // Local zip64 extra, 64-bit descriptor and central zip64 extra together:
+    // readers disagree on which header decides the descriptor's width.
+    std::string out;
+    Writer w = captureTo(out);
+    ASSERT_TRUE(w.beginFile("model.ifc", 0, Writer::kZip64HintBytes));
+    ASSERT_TRUE(w.data("abc", 3));
+    ASSERT_TRUE(w.endFile());
+    ASSERT_TRUE(w.beginFile("small.txt"));
+    ASSERT_TRUE(w.data("z", 1));
+    ASSERT_TRUE(w.endFile());
+    ASSERT_TRUE(w.finish());
+
+    // model.ifc: local header at 0.
+    EXPECT_EQ(rd16(out, 4), 45);                  // version needed: zip64
+    EXPECT_EQ(rd32(out, 18), 0xFFFFFFFFu);        // sizes -> zip64 extra
+    EXPECT_EQ(rd16(out, 28), 20);                 // local zip64 extra present
+    const size_t dataAt = 30 + 9 + 20;
+    EXPECT_EQ(rd16(out, 30 + 9), 0x0001);
+    EXPECT_EQ(out.substr(dataAt, 3), "abc");
+    EXPECT_EQ(rd32(out, dataAt + 3), 0x08074B50u);
+    EXPECT_EQ(rd32(out, dataAt + 3 + 8), 3u);     // 64-bit size, low half...
+    EXPECT_EQ(rd32(out, dataAt + 3 + 12), 0u);    // ...high half
+    const size_t next = dataAt + 3 + 24;          // a 24-byte descriptor
+    ASSERT_EQ(rd32(out, next), 0x04034B50u);      // small.txt starts right after
+    EXPECT_EQ(rd16(out, next + 28), 0);           // small.txt: no zip64 at all
+
+    const size_t eocd = out.size() - 22;
+    const size_t cd = rd32(out, eocd + 16);
+    EXPECT_EQ(rd16(out, cd + 30), 28);            // model.ifc central zip64 extra
+    const size_t cd2 = cd + 46 + 9 + 28;
+    EXPECT_EQ(rd16(out, cd2 + 30), 0);            // small.txt central: none
+    dump("hinted.zip", out);
+}
+
+TEST(ZipWriter, AnEntryThatOutgrowsA32BitHeaderIsRefused) {
+    // Begun small (no hint), then past 4 GiB: the header on the wire cannot hold
+    // it, so the writer must refuse and say why (the bridge aborts on this).
+    uint64_t seen = 0;
+    Writer w([&seen](const char*, size_t n) { seen += n; return true; });
+    ASSERT_TRUE(w.beginFile("liar.bin"));
+    std::vector<char> chunk(1 << 20, 'x');
+    bool ok = true;
+    uint64_t fed = 0;
+    while (ok && fed < (5ull << 30)) { ok = w.data(chunk.data(), chunk.size()); fed += chunk.size(); }
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(w.overflowed());
+    EXPECT_TRUE(w.failed());
+    EXPECT_LT(seen, 0xFFFFFFFFull);               // it stopped BEFORE overflowing
+    EXPECT_FALSE(w.endFile());
+}
+
+// The real thing, opt-in (ZIP_STREAM_LARGE=1 + ZIP_STREAM_DUMP_DIR): a 4.5 GiB
+// member followed by entries that start past 4 GiB, written as a sparse file so
+// it costs almost no disk. tests/check_zip_stream.sh --large runs the readers.
+TEST(ZipWriter, LargeArchiveForIndependentReaders) {
+    const char* dir = std::getenv("ZIP_STREAM_DUMP_DIR");
+    const char* large = std::getenv("ZIP_STREAM_LARGE");
+    if (!dir || !*dir || !large || std::strcmp(large, "1") != 0)
+        GTEST_SKIP() << "set ZIP_STREAM_LARGE=1 and ZIP_STREAM_DUMP_DIR";
+    const std::string path = std::string(dir) + "/large.zip";
+    int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    ASSERT_GE(fd, 0);
+    off_t pos = 0;
+    Writer w([&](const char* p, size_t n) {
+        bool zero = true;
+        for (size_t i = 0; i < n && zero; ++i) zero = p[i] == 0;
+        if (!zero && ::pwrite(fd, p, n, pos) != static_cast<ssize_t>(n)) return false;
+        pos += static_cast<off_t>(n);   // zero runs become holes
+        return true;
+    });
+    const uint64_t big = (4ull << 30) + (512ull << 20) + 12345;
+    std::vector<char> zeros(1 << 20, 0);
+    ASSERT_TRUE(w.beginFile("big.bin", 1795444258, big));
+    for (uint64_t left = big; left;) {
+        const size_t n = left > zeros.size() ? zeros.size() : static_cast<size_t>(left);
+        ASSERT_TRUE(w.data(zeros.data(), n));
+        left -= n;
+    }
+    ASSERT_TRUE(w.endFile());
+    ASSERT_TRUE(w.beginFile("after.txt", 1795444258));   // starts past 4 GiB
+    ASSERT_TRUE(w.data("after the big one\n", 18));
+    ASSERT_TRUE(w.endFile());
+    ASSERT_TRUE(w.addDirectory("later"));
+    ASSERT_TRUE(w.beginFile("later/x.txt"));
+    ASSERT_TRUE(w.data("x", 1));
+    ASSERT_TRUE(w.endFile());
+    ASSERT_TRUE(w.finish());
+    ASSERT_EQ(::ftruncate(fd, pos), 0);
+    ::close(fd);
 }

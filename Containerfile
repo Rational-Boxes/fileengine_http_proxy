@@ -6,7 +6,7 @@ FROM fedora:43
 RUN dnf -y install \
         gcc-c++ cmake make pkgconf-pkg-config git \
         grpc-devel grpc-plugins protobuf-devel protobuf-compiler \
-        poco-devel openldap-devel \
+        poco-devel openldap-devel zlib-devel \
     && dnf clean all
 
 WORKDIR /src
