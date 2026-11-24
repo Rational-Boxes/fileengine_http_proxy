@@ -21,6 +21,8 @@
 # it, and two siblings differing only in case), downloads it through BOTH doors
 # (bearer, and the ticket the SPA navigates with), and has Python's zipfile
 # check every CRC and compare every member byte-for-byte with what was uploaded.
+# Then a SELECTION of the folder's items (POST, JSON for API clients and a form
+# for the SPA): only those items, each with its subtree, named after the folder.
 # Then the refusals: no credential, a ticket for another folder, an archive
 # ticket on a file's content route, a download ticket on the archive route, a
 # ticket presented as a bearer, and a file uid given to the folder route.
@@ -74,7 +76,7 @@ printf 'ü ✓\n' > "$WORK/src/utf8.txt"
 printf 'upper\n' > "$WORK/src/upper.txt"
 printf 'lower\n' > "$WORK/src/lower.txt"
 printf 'slash\n' > "$WORK/src/slash.txt"
-put_ "$TOP"  "readme.txt" "$WORK/src/readme.txt" >/dev/null
+README=$(put_ "$TOP"  "readme.txt" "$WORK/src/readme.txt")
 put_ "$SUB"  "big.bin"    "$WORK/src/big.bin"    >/dev/null
 put_ "$DEEP" "empty.txt"  "$WORK/src/empty.txt"  >/dev/null
 put_ "$DEEP" "Plan ü.txt" "$WORK/src/utf8.txt"   >/dev/null
@@ -163,6 +165,46 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" "$BASE/v1/dirs/$SLASHF/a
 [ "$code" = "400" ] && ok "a file uid on the folder route -> 400" || bad "file as folder" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/dirs/$SLASHF/archive-ticket")
 [ "$code" = "400" ] && ok "no archive ticket for a file -> 400" || bad "ticket for file" "got $code"
+
+echo "[selected items]"
+printf '%s\t%s\n' "readme.txt" "$WORK/src/readme.txt" "drawings/big.bin" "$WORK/src/big.bin" \
+    "drawings/level 2/empty.txt" "$WORK/src/empty.txt" "drawings/level 2/Plan ü.txt" "$WORK/src/utf8.txt" \
+    > "$WORK/expect_sel.tsv"
+verify_sel() { cp "$WORK/expect.tsv" "$WORK/expect.full"; cp "$WORK/expect_sel.tsv" "$WORK/expect.tsv"
+               local r; r=$(verify_zip "$1"); cp "$WORK/expect.full" "$WORK/expect.tsv"; echo "$r"; }
+code=$(curl -s -D "$WORK/hs" -o "$WORK/s1.zip" -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/dirs/$TOP/archive" \
+       -d "{\"uids\":[\"$README\",\"$SUB\"]}")
+[ "$code" = "200" ] && ok "POST {uids:[readme, drawings]} -> 200" || bad "bearer selection" "got $code $(head -c 200 "$WORK/s1.zip")"
+grep -qi "^content-disposition: attachment; filename=\"$SUF.zip\"" "$WORK/hs" \
+  && ok "a selection is named after the folder" || bad "selection disposition" "$(grep -i disposition "$WORK/hs")"
+r=$(verify_sel "$WORK/s1.zip")
+[ "$r" = "OK" ] && ok "only the selected items, subtree included, byte-identical" || bad "selection contents" "$r"
+n=$(python3 -I -c 'import sys,zipfile;print(sorted({n.split("/")[0] for n in zipfile.ZipFile(sys.argv[1]).namelist()}))' "$WORK/s1.zip")
+[ "$n" = "['drawings', 'readme.txt']" ] && ok "nothing unselected at the top (no Notes, no empty folder)" || bad "selection top level" "$n"
+
+# The SPA's path: a ticket minted WITH the selection, then a plain form POST.
+out=$(curl -s "${A[@]}" -X POST "$BASE/v1/dirs/$TOP/archive-ticket" -d "{\"uids\":[\"$README\",\"$SUB\"]}")
+TS=$(field ticket <<<"$out")
+[ -n "$TS" ] && ok "archive-ticket accepts a selection" || bad "selection ticket" "$out"
+code=$(curl -s -o "$WORK/s2.zip" -w '%{http_code}' -X POST "$BASE/v1/dirs/$TOP/archive?ticket=$TS" \
+       -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "uids=$README,$SUB")
+r=$(verify_sel "$WORK/s2.zip")
+[ "$code" = "200" ] && [ "$r" = "OK" ] && ok "ticketed form POST (no Authorization) -> the same selection" || bad "form selection" "code $code: $r"
+cmp -s "$WORK/s1.zip" "$WORK/s2.zip" && ok "same selection -> byte-identical archive" || bad "selection determinism" "differ"
+
+code=$(curl -s -o "$WORK/err" -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/dirs/$TOP/archive-ticket" -d "{\"uids\":[\"$DEEP\"]}")
+[ "$code" = "400" ] && grep -q "not an item in this folder" "$WORK/err" \
+  && ok "a grandchild is not a selection of this folder -> 400 at the ticket" || bad "stray uid at ticket" "code $code $(cat "$WORK/err")"
+code=$(curl -s -o "$WORK/err" -w '%{http_code}' -X POST "$BASE/v1/dirs/$TOP/archive?ticket=$TS" \
+       -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "uids=$README,$DEEP")
+[ "$code" = "400" ] && ok "...and at the download, before any byte is sent" || bad "stray uid at download" "code $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/dirs/$TOP/archive" -d '{"uids":[]}')
+[ "$code" = "400" ] && ok "an empty selection -> 400" || bad "empty selection" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' "${A[@]}" -X POST "$BASE/v1/dirs/$TOP/archive" -d '{"uids":["../etc"]}')
+[ "$code" = "400" ] && ok "a non-uid -> 400" || bad "non-uid" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/dirs/$SUB/archive?ticket=$TS" \
+       -H 'Content-Type: application/x-www-form-urlencoded' --data-urlencode "uids=$DEEP")
+[ "$code" = "401" ] && ok "the folder's ticket does not open another folder by POST either" || bad "ticket wrong folder POST" "got $code"
 
 echo "[empty folder]"
 code=$(curl -s -o "$WORK/e.zip" -w '%{http_code}' "${A[@]}" "$BASE/v1/dirs/$EMPTY/archive")
