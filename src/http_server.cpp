@@ -30,6 +30,7 @@
 #include "ticket_claims.h"
 #include "service_key_policy.h"
 #include "range_response.h"
+#include "archive_selection.h"
 #include "zip_stream.h"
 
 #include <Poco/Net/HTTPRequestHandler.h>
@@ -470,11 +471,13 @@ private:
             // The same, for a folder streamed as a ZIP. The ticket is scoped to
             // the path segment AS SENT ("root" stays "root"), so a ticket can
             // never be scoped to the empty uid.
-            if (method == "GET" && s2.size() == 4 && s2[1] == "dirs" && s2[3] == "archive"
-                && req.get("Authorization", "").empty()) {
+            // POST is the SPA's "selected items" form (the uid list is in the
+            // body, which a URL could not hold); the ticket stays in the query.
+            if ((method == "GET" || method == "POST") && s2.size() == 4 && s2[1] == "dirs" &&
+                s2[3] == "archive" && req.get("Authorization", "").empty()) {
                 AuthIdentity tid;
                 if (identityFromDownloadTicket(req, s2[2], tid, TicketRoute::Archive))
-                    return archiveDir(req, resp, tid, s2[2]);
+                    return archiveDir(req, resp, tid, s2[2], method == "POST");
             }
         }
 
@@ -556,11 +559,12 @@ private:
                     if (method == "DELETE") return removeDir(resp, id, uid);
                 } else if (segs.size() == 4 && sub == "files" && method == "POST") {
                     return touchFile(req, resp, id, uid);
-                } else if (segs.size() == 4 && sub == "archive" && method == "GET") {
+                } else if (segs.size() == 4 && sub == "archive" && (method == "GET" || method == "POST")) {
                     // Bearer form, for API clients; the SPA uses the ticket form.
-                    return archiveDir(req, resp, id, segs[2]);
+                    // POST carries an optional {"uids":[...]} selection.
+                    return archiveDir(req, resp, id, segs[2], method == "POST");
                 } else if (segs.size() == 4 && sub == "archive-ticket" && method == "POST") {
-                    return archiveTicket(resp, id, segs[2]);
+                    return archiveTicket(req, resp, id, segs[2]);
                 }
             } else if (resource == "files") {
                 if (segs.size() == 3) {
@@ -2230,7 +2234,44 @@ private:
         return n;
     }
 
-    void archiveTicket(HTTPServerResponse& resp, const AuthIdentity& id,
+    // An optional selection from the request body (archive_selection.h). False
+    // = a 400 has been sent. `sel` empty and true = no selection (whole folder).
+    bool readArchiveSelection(HTTPServerRequest& req, HTTPServerResponse& resp,
+                              std::set<std::string>& sel) {
+        std::string body;
+        {
+            std::istream& in = req.stream();
+            char buf[16384];
+            while (in) {
+                in.read(buf, sizeof buf);
+                body.append(buf, static_cast<size_t>(in.gcount()));
+                if (body.size() > archive::kMaxSelectionBody) {
+                    sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"selection is too large"})");
+                    return false;
+                }
+            }
+        }
+        std::string err;
+        if (archive::parseSelection(req.getContentType(), body, sel, err) == archive::SelectionParse::Invalid) {
+            sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, "{\"error\":\"" + jsonEscape(err) + "\"}");
+            return false;
+        }
+        return true;
+    }
+
+    // The first selected uid that is not a direct child of the folder in
+    // `listing`, or "" when all are. A selection is a subset of ONE folder's
+    // children — never an arbitrary set of uids — so the archive's name (the
+    // folder's) and its layout (each item at the top) both mean something.
+    static std::string firstNotInFolder(const std::set<std::string>& sel,
+                                        const fileengine_rpc::ListDirectoryResponse& listing) {
+        std::set<std::string> kids;
+        for (const auto& e : listing.entries()) kids.insert(e.uid());
+        for (const auto& u : sel) if (!kids.count(u)) return u;
+        return "";
+    }
+
+    void archiveTicket(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id,
                        const std::string& rawUid) {
         // Stat first, as the caller, so a ticket is only minted for a folder the
         // caller can see — and not for a file, which this route cannot stream.
@@ -2241,6 +2282,27 @@ private:
         if (!st.success() && rawUid != "root") return mapError(resp, st.error());
         if (st.success() && st.info().type() != fileengine_rpc::DIRECTORY)
             return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST, R"({"error":"not a folder"})");
+        // A selection is checked HERE as well as at download time: the SPA
+        // downloads through a form submitted into a hidden frame, where an
+        // error response would be invisible, so whatever can be refused is
+        // refused while the SPA can still show it.
+        std::set<std::string> sel;
+        if (!readArchiveSelection(req, resp, sel)) return;
+        if (!sel.empty()) {
+            fileengine_rpc::ListDirectoryRequest lq;
+            lq.set_uid(rawUid == "root" ? "" : rawUid);
+            fillAuth(lq.mutable_auth(), id);
+            auto lr = grpc_->listDirectory(lq);
+            if (!lr.success()) return mapError(resp, lr.error());
+            const std::string stray = firstNotInFolder(sel, lr);
+            if (!stray.empty())
+                return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                                "{\"error\":\"not an item in this folder\",\"uid\":\"" + jsonEscape(stray) + "\"}");
+        }
+        // The ticket opens the folder; the selection travels with the download
+        // request, not in the ticket. A ticket for the whole folder already
+        // reaches every item a selection of it could name, so binding the two
+        // would add nothing.
         const std::string t = mintTicket(id, rawUid, "archive", cfg_.download_ticket_ttl);
         sendJson(resp, HTTPResponse::HTTP_OK,
                  "{\"ticket\":\"" + t + "\",\"expires_in\":" +
@@ -2256,8 +2318,14 @@ private:
     };
 
     void archiveDir(HTTPServerRequest& req, HTTPServerResponse& resp,
-                    const AuthIdentity& id, const std::string& rawUid) {
+                    const AuthIdentity& id, const std::string& rawUid, bool withBody = false) {
         const std::string rootUid = rawUid == "root" ? "" : rawUid;
+
+        // Selected items (POST): only these children of the folder, each with
+        // its whole subtree, at the top of the archive. Read before taking a
+        // slot, so a malformed list costs nothing.
+        std::set<std::string> selection;
+        if (withBody && !readArchiveSelection(req, resp, selection)) return;
 
         // Concurrency first: refusing is cheap, walking is not.
         struct Slot {
@@ -2312,11 +2380,19 @@ private:
                     skipped.push_back(cur.prefix + "/: folder could not be listed");
                     continue;
                 }
+                const bool top = cur.prefix.empty();
+                if (top && !selection.empty()) {
+                    const std::string stray = firstNotInFolder(selection, lr);
+                    if (!stray.empty())
+                        return sendJson(resp, HTTPResponse::HTTP_BAD_REQUEST,
+                            "{\"error\":\"not an item in this folder\",\"uid\":\"" + jsonEscape(stray) + "\"}");
+                }
 
                 // Sorted, so the same tree always produces the same archive and
                 // the "(2)" suffixes land on the same siblings every time.
                 std::vector<const fileengine_rpc::DirectoryEntry*> kids;
-                for (const auto& e : lr.entries()) kids.push_back(&e);
+                for (const auto& e : lr.entries())
+                    if (!top || selection.empty() || selection.count(e.uid())) kids.push_back(&e);
                 std::sort(kids.begin(), kids.end(), [](auto* a, auto* b) {
                     if (a->name() != b->name()) return a->name() < b->name();
                     return a->uid() < b->uid();

@@ -236,6 +236,9 @@ paths:
         truncated archive. Limits: HTTP_ARCHIVE_MAX_CONCURRENT (default 4, then
         503 + Retry-After), HTTP_ARCHIVE_MAX_MEMBERS (default 20000) and
         HTTP_ARCHIVE_MAX_BYTES (default 0 = none), both 413.
+        Every RPC behind it (listing, stat, read) runs as the caller, so the
+        archive holds exactly what the caller can open — a READ-denied file or
+        folder, or a soft-deleted one, is absent, not reported.
       responses:
         "200": { description: The archive, content: { application/zip: { schema: { type: string, format: binary } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -244,6 +247,25 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
         "503": { description: Too many folder downloads in progress; retry after the Retry-After seconds }
+    post:
+      tags: [filesystem]
+      summary: Download SELECTED items of a folder as one ZIP (streamed)
+      description: >
+        As GET, but only the named direct children of the folder, each with its
+        whole subtree, at the top of the archive; still named after the folder.
+        Body: application/json {"uids":[...]} or, for a browser form,
+        application/x-www-form-urlencoded uids=a,b,c (the SPA posts the form with
+        ?ticket= in the URL, so the browser saves the stream). At most 10000
+        uids. A uid that is not a child the caller can see in this folder —
+        including READ-denied and soft-deleted items — is refused with 400
+        before any byte is sent.
+      responses:
+        "200": { description: The archive, content: { application/zip: { schema: { type: string, format: binary } } } }
+        "400": { description: Malformed selection, or an item not in this folder }
+        "401": { description: No valid credential or ticket }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { description: Too many folder downloads in progress }
   /v1/dirs/{uid}/archive-ticket:
     parameters: [ { $ref: "#/components/parameters/Uid" } ]
     post:
@@ -252,7 +274,13 @@ paths:
       description: >
         Scoped to this one folder, valid for DOWNLOAD_TICKET_TTL_SECONDS (default
         30) to START a download, bound to the session that minted it, and refused
-        as a bearer token. 400 for a uid that is not a folder.
+        as a bearer token. 400 for a uid that is not a folder. An optional body
+        {"uids":[...]} (the selection a POST archive will send) is checked here
+        too, so an item not in the folder is refused while the client can still
+        show the error; the ticket itself opens the whole folder.
+      requestBody:
+        required: false
+        content: { application/json: { schema: { type: object, properties: { uids: { type: array, items: { type: string } } } } } }
       responses:
         "200": { description: Ticket, content: { application/json: { schema: { type: object, properties: { ticket: { type: string }, expires_in: { type: integer } } } } } }
         "400": { $ref: "#/components/responses/BadRequest" }

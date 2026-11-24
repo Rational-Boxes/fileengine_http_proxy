@@ -54,6 +54,7 @@ SUITE=(
     test_e2e_2fa.sh
     test_e2e_api_key.sh
     test_e2e_archive.sh
+    test_e2e_archive_acl.sh
     test_e2e_stale_size.sh
 )
 
