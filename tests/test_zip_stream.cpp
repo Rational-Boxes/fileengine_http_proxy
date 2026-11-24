@@ -26,6 +26,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <zlib.h>
+
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -47,6 +50,28 @@ uint32_t rd32(const std::string& s, size_t at) {
 uint16_t rd16(const std::string& s, size_t at) {
     return static_cast<uint16_t>(static_cast<uint8_t>(s[at]) |
                                  static_cast<uint8_t>(s[at + 1]) << 8);
+}
+
+// Raw-inflates (zlib, not this writer's code) the deflate stream at `at`.
+// Returns the bytes and sets `consumed` to the compressed length.
+std::string inflateAt(const std::string& s, size_t at, size_t& consumed) {
+    z_stream z{};
+    EXPECT_EQ(inflateInit2(&z, -15), Z_OK);
+    z.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(s.data() + at));
+    z.avail_in = static_cast<uInt>(s.size() - at);
+    std::string out;
+    char buf[65536];
+    int rc;
+    do {
+        z.next_out = reinterpret_cast<Bytef*>(buf);
+        z.avail_out = sizeof buf;
+        rc = inflate(&z, Z_NO_FLUSH);
+        out.append(buf, sizeof buf - z.avail_out);
+    } while (rc == Z_OK);
+    EXPECT_EQ(rc, Z_STREAM_END);
+    consumed = static_cast<size_t>(z.total_in);
+    inflateEnd(&z);
+    return out;
 }
 
 Writer captureTo(std::string& out) {
@@ -146,7 +171,9 @@ TEST(ZipWriter, ProducesAWellFormedSmallArchive) {
     while (p < eocd) {
         ASSERT_EQ(rd32(out, p), 0x02014B50u);
         const uint16_t flags = rd16(out, p + 8);
+        const uint16_t method = rd16(out, p + 10);
         const uint32_t crc = rd32(out, p + 16);
+        const uint32_t csize = rd32(out, p + 20);
         const uint32_t usize = rd32(out, p + 24);
         const uint16_t nameLen = rd16(out, p + 28);
         const uint16_t extraLen = rd16(out, p + 30);
@@ -156,19 +183,27 @@ TEST(ZipWriter, ProducesAWellFormedSmallArchive) {
         EXPECT_EQ(extraLen, 0) << name;
         ASSERT_EQ(rd32(out, localOff), 0x04034B50u) << name;
         const size_t dataAt = localOff + 30 + rd16(out, localOff + 26) + rd16(out, localOff + 28);
+        EXPECT_EQ(rd16(out, localOff + 8), method) << name;   // local agrees
         if (name == "docs/") {
             EXPECT_FALSE(flags & 0x0008);
+            EXPECT_EQ(method, 0);                 // a directory is stored
             EXPECT_EQ(usize, 0u);
         } else {
             EXPECT_TRUE(flags & 0x0008) << name;  // sizes deferred to the descriptor
-            const std::string body = out.substr(dataAt, usize);
+            EXPECT_EQ(method, 8) << name;         // deflate (level 0), for Java
+            size_t used = 0;
+            const std::string body = inflateAt(out, dataAt, used);
+            EXPECT_EQ(used, csize) << name;
+            EXPECT_EQ(body.size(), usize) << name;
+            EXPECT_EQ(csize, usize + 5u) << name; // one stored block: 5-byte header
             EXPECT_EQ(crc, crc32Update(0, body.data(), body.size())) << name;
             // 32-bit descriptor directly after the data.
-            EXPECT_EQ(rd32(out, dataAt + usize), 0x08074B50u) << name;
-            EXPECT_EQ(rd32(out, dataAt + usize + 4), crc) << name;
-            EXPECT_EQ(rd32(out, dataAt + usize + 8), usize) << name;
+            EXPECT_EQ(rd32(out, dataAt + csize), 0x08074B50u) << name;
+            EXPECT_EQ(rd32(out, dataAt + csize + 4), crc) << name;
+            EXPECT_EQ(rd32(out, dataAt + csize + 8), csize) << name;
+            EXPECT_EQ(rd32(out, dataAt + csize + 12), usize) << name;
+            if (name == "docs/a.txt") EXPECT_EQ(body, a);
         }
-        if (name == "docs/a.txt") EXPECT_EQ(out.substr(dataAt, usize), a);
         p += 46 + nameLen + extraLen;
         ++n;
     }
@@ -202,11 +237,11 @@ TEST(ZipWriter, ManyEntriesSwitchToZip64EndRecords) {
 TEST(ZipWriter, AGoneReceiverStopsEverything) {
     int calls = 0;
     Writer w([&calls](const char*, size_t) { return ++calls < 3; });
-    EXPECT_TRUE(w.beginFile("a"));                // call 1
-    EXPECT_TRUE(w.data("x", 1));                  // call 2
-    EXPECT_FALSE(w.data("y", 1));                 // call 3 fails
+    EXPECT_TRUE(w.beginFile("a"));                // call 1: local header
+    EXPECT_TRUE(w.data("x", 1));                  // buffered into the block
+    EXPECT_FALSE(w.endFile());                    // call 2 block header, call 3 payload fails
     EXPECT_TRUE(w.failed());
-    EXPECT_FALSE(w.endFile());
+    EXPECT_FALSE(w.data("y", 1));
     EXPECT_FALSE(w.finish());
     EXPECT_EQ(calls, 3);                          // nothing further was attempted
 }
@@ -252,11 +287,13 @@ TEST(ZipWriter, ALargeSizeHintMakesTheEntryZip64InEveryHeader) {
     EXPECT_EQ(rd16(out, 28), 20);                 // local zip64 extra present
     const size_t dataAt = 30 + 9 + 20;
     EXPECT_EQ(rd16(out, 30 + 9), 0x0001);
-    EXPECT_EQ(out.substr(dataAt, 3), "abc");
-    EXPECT_EQ(rd32(out, dataAt + 3), 0x08074B50u);
-    EXPECT_EQ(rd32(out, dataAt + 3 + 8), 3u);     // 64-bit size, low half...
-    EXPECT_EQ(rd32(out, dataAt + 3 + 12), 0u);    // ...high half
-    const size_t next = dataAt + 3 + 24;          // a 24-byte descriptor
+    EXPECT_EQ(out.substr(dataAt + 5, 3), "abc");  // after the stored-block header
+    const size_t desc = dataAt + 8;
+    EXPECT_EQ(rd32(out, desc), 0x08074B50u);
+    EXPECT_EQ(rd32(out, desc + 8), 8u);           // 64-bit compressed size, low half...
+    EXPECT_EQ(rd32(out, desc + 12), 0u);          // ...high half
+    EXPECT_EQ(rd32(out, desc + 16), 3u);          // 64-bit uncompressed size
+    const size_t next = desc + 24;                // a 24-byte descriptor
     ASSERT_EQ(rd32(out, next), 0x04034B50u);      // small.txt starts right after
     EXPECT_EQ(rd16(out, next + 28), 0);           // small.txt: no zip64 at all
 
@@ -266,6 +303,32 @@ TEST(ZipWriter, ALargeSizeHintMakesTheEntryZip64InEveryHeader) {
     const size_t cd2 = cd + 46 + 9 + 28;
     EXPECT_EQ(rd16(out, cd2 + 30), 0);            // small.txt central: none
     dump("hinted.zip", out);
+}
+
+TEST(ZipWriter, AFileSpanningManyBlocksInflatesAndIgnoresChunking) {
+    // 200,000 bytes is four stored blocks (three full); fed in odd pieces and
+    // in one piece, the archive must be byte-identical — the core's chunking
+    // must not leak into the output, or two downloads of one tree would differ.
+    std::string body(200000, '\0');
+    for (size_t i = 0; i < body.size(); ++i) body[i] = static_cast<char>((i * 131) ^ (i >> 7));
+    auto build = [&](size_t piece) {
+        std::string out;
+        Writer w = captureTo(out);
+        EXPECT_TRUE(w.beginFile("f.bin", 1795444258));
+        for (size_t at = 0; at < body.size(); at += piece)
+            EXPECT_TRUE(w.data(body.data() + at, std::min(piece, body.size() - at)));
+        EXPECT_TRUE(w.endFile());
+        EXPECT_TRUE(w.finish());
+        return out;
+    };
+    const std::string one = build(body.size());
+    EXPECT_EQ(build(7777), one);
+    EXPECT_EQ(build(65535), one);
+    const size_t dataAt = 30 + 5;
+    size_t used = 0;
+    EXPECT_EQ(inflateAt(one, dataAt, used), body);
+    EXPECT_EQ(used, body.size() + 4 * 5u);
+    dump("blocks.zip", one);
 }
 
 TEST(ZipWriter, AnEntryThatOutgrowsA32BitHeaderIsRefused) {

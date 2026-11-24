@@ -53,6 +53,8 @@ SUITE=(
     test_e2e_playback.sh
     test_e2e_2fa.sh
     test_e2e_api_key.sh
+    test_e2e_archive.sh
+    test_e2e_stale_size.sh
 )
 
 PASSED=0; SKIPPED=0; FAILED=()

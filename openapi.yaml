@@ -223,8 +223,10 @@ paths:
       tags: [filesystem]
       summary: Download a folder tree as one ZIP (streamed)
       description: >
-        Streams the folder and everything under it, as the caller, as a store-only
-        ZIP (zip64 only where needed). Written straight to the connection as each
+        Streams the folder and everything under it, as the caller, as a ZIP whose
+        files are deflate at level 0 — uncompressed bytes in stored deflate blocks,
+        so Java's streaming ZipInputStream can read it too (zip64 only where
+        needed). Written straight to the connection as each
         file is read, so nothing is assembled on the server; the response is
         chunked and carries no Content-Length. Each file is its current version at
         the moment it is read. Files the caller cannot read, or that vanish
@@ -313,6 +315,12 @@ paths:
     get:
       tags: [filesystem]
       summary: Download file content (streamed; supports Range)
+      description: >
+        Content-Length (and a 206's Content-Range total) come from the version's
+        recorded size. If the content the core delivers disagrees with it — more
+        bytes than declared, fewer, or a failure mid-body — the connection is
+        reset rather than finished, so a client sees a failed transfer, never a
+        complete-looking short file.
       parameters:
         - name: Range
           in: header

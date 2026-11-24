@@ -586,7 +586,7 @@ private:
                     // must not be able to escalate it into an irreversible one.
                     if (sub == "erase" && method == "POST")     return eraseNode(req, resp, id, uid);
                 } else if (segs.size() == 5 && sub == "versions" && method == "GET") {
-                    return getVersion(resp, id, uid, segs[4]);
+                    return getVersion(req, resp, id, uid, segs[4]);
                 }
             } else if (resource == "nodes") {
                 if (segs.size() == 3) {
@@ -808,6 +808,20 @@ private:
         else mapError(resp, r.error());
     }
 
+    // Ends a response whose headers are already on the wire by RESETTING the
+    // connection, so the client sees a failed transfer instead of a complete one.
+    // Returning normally would let Poco finish the response — the terminating
+    // chunk of a chunked body, or nothing at all after a Content-Length body that
+    // was cut short or never reached — and a browser would save the short file as
+    // if it were whole. Linger 0 makes close send RST rather than FIN.
+    static void abortResponse(HTTPServerRequest& req) {
+        try {
+            auto& sock = static_cast<Poco::Net::HTTPServerRequestImpl&>(req).socket();
+            sock.setLinger(true, 0);
+            sock.shutdown();
+        } catch (...) {}
+    }
+
     // GET content via server-streaming download — writes chunks straight to the
     // socket (chunked transfer). Honors a single Range request (206 + windowing).
     // A file's content, whole or ranged.
@@ -823,6 +837,18 @@ private:
     // Served as application/octet-stream with nosniff, except under a PLAYBACK
     // ticket, which carries an allowlisted media type decided at mint time — so
     // this origin never serves something a browser would execute.
+    //
+    // The declared length comes from the version row's size (the core's
+    // total_size), and that column is known to be wrong for some rows (copies
+    // made before core 1.9.67). Measured 2026-11-23: when it was SMALLER than the
+    // real content this route sent exactly the declared bytes and stopped — a
+    // 200 with a matching Content-Length, a short file, and no error anywhere.
+    // So the body is checked against the declaration in both directions: when
+    // the core has bytes beyond it (an overrun), or ends before it (an
+    // underrun), or fails mid-body, the connection is reset (abortResponse) and
+    // the client sees a failed download. Where the core was asked for an exact
+    // window (Range with an end) that the declared size did not shorten, it
+    // cannot overrun and the stream is simply stopped at the window's end.
     void getContent(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid) {
         long rs = -1, re = -1;
         bool hasRange = parseRange(req.get("Range", ""), rs, re);
@@ -842,6 +868,9 @@ private:
         bool headerSent = false;
         long skip = 0;        // bytes to drop ourselves, only if the core did not window
         long remaining = -1;  // bytes still owed to the client; -1 = unknown
+        long plan_length = -1;      // the declared body length, for messages
+        bool checkOverrun = false;  // keep reading past the declared end, to catch a lie
+        std::string abortWhy;       // set = reset the connection instead of finishing
 
         auto onMeta = [&](const fileengine_rpc::GetFileResponse& f) -> bool {
             RangePlan plan = planRange(hasRange, rs, re, static_cast<long>(f.total_size()));
@@ -867,6 +896,16 @@ private:
             // prefix here, as the bridge always used to.
             if (plan.status == 206 && !f.ranged()) skip = rs;
             remaining = plan.length;
+            plan_length = plan.length;
+            // The core sends to the end of the file unless it was given a length
+            // it honours; then everything after `remaining` would be content the
+            // declared size left out. An old core that ignores offset/length
+            // streams the whole file, so it is not read past a range's end.
+            // A closed range the declared total CLAMPED (it asked past the
+            // recorded end) is the same lie: the core, windowing by the real
+            // content, has bytes for the part the plan cut off.
+            const bool clamped = hasRange && re >= 0 && plan.length >= 0 && rs + plan.length - 1 < re;
+            checkOverrun = remaining >= 0 && (!hasRange || (f.ranged() && (re < 0 || clamped)));
             resp.setStatus(plan.status == 206 ? HTTPResponse::HTTP_PARTIAL_CONTENT
                                               : HTTPResponse::HTTP_OK);
             resp.setContentType(ctype);
@@ -886,20 +925,40 @@ private:
                 p += d; n -= d; skip -= d;
                 if (n == 0) return true;
             }
-            if (remaining >= 0) n = std::min(n, remaining);
-            if (n > 0) os->write(p, static_cast<std::streamsize>(n));
+            const long send = remaining >= 0 ? std::min(n, remaining) : n;
+            if (send > 0) {
+                os->write(p, static_cast<std::streamsize>(send));
+                if (!os->good()) return false;      // the client went away
+            }
             if (remaining >= 0) {
-                remaining -= n;
-                if (remaining <= 0) return false;   // the window is complete
+                remaining -= send;
+                if (send < n) {                     // bytes beyond the declared end
+                    if (checkOverrun)
+                        abortWhy = "the core has more bytes than the declared " +
+                                   std::to_string(plan_length) + " (stale version size?)";
+                    return false;                   // else: the window is complete
+                }
+                if (remaining == 0 && !checkOverrun) return false;   // the window is complete
             }
             return true;
         };
 
         auto result = grpc_->streamFileDownload(rq, onChunk, onMeta);
 
+        if (headerSent && os) {
+            if (abortWhy.empty() && !result.success)
+                abortWhy = "core stream failed mid-body: " + result.error;
+            if (abortWhy.empty() && remaining > 0 && os->good())
+                abortWhy = "the core ended " + std::to_string(remaining) +
+                           " bytes short of the declared " + std::to_string(plan_length);
+            if (!abortWhy.empty()) {
+                webdav::debugLog("content " + uid + " aborted: " + abortWhy);
+                return abortResponse(req);
+            }
+        }
         if (!result.success) {
             if (!headerSent) return mapError(resp, result.error);
-            return;  // already streaming; can't change status mid-body
+            return;
         }
         if (!headerSent) {  // empty content: no frame ever arrived
             resp.set("X-Content-Type-Options", "nosniff");
@@ -1073,7 +1132,8 @@ private:
     // was simply unreadable through this route. StreamFileDownload carries the
     // version on GetFileRequest, so the same server-streaming path serves any
     // revision.
-    void getVersion(HTTPServerResponse& resp, const AuthIdentity& id, const std::string& uid, const std::string& ts) {
+    void getVersion(HTTPServerRequest& req, HTTPServerResponse& resp, const AuthIdentity& id,
+                    const std::string& uid, const std::string& ts) {
         fileengine_rpc::GetFileRequest rq;
         rq.set_uid(uid);
         rq.set_version_timestamp(ts);
@@ -1094,7 +1154,10 @@ private:
 
         if (!result.success) {
             if (!headerSent) return mapError(resp, result.error);
-            return;  // already streaming; the status cannot be changed mid-body
+            // Already streaming: returning would end the chunked body cleanly
+            // and the client would keep a truncated version as if it were whole.
+            webdav::debugLog("version " + uid + "@" + ts + " aborted: " + result.error);
+            return abortResponse(req);
         }
         if (!headerSent) {  // an empty version still needs a well-formed reply
             resp.setStatus(HTTPResponse::HTTP_OK);
@@ -2315,13 +2378,7 @@ private:
 
         auto abortTransfer = [&](const std::string& why) {
             webdav::debugLog("archive " + rawUid + " aborted: " + why);
-            // Without this, returning would let Poco write the terminating chunk
-            // and the client would save a truncated ZIP as if it were complete.
-            try {
-                auto& sock = static_cast<Poco::Net::HTTPServerRequestImpl&>(req).socket();
-                sock.setLinger(true, 0);
-                sock.shutdown();
-            } catch (...) {}
+            abortResponse(req);   // else Poco ends the chunked body and the ZIP looks complete
         };
 
         long filesWritten = 0;

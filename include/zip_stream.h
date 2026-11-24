@@ -53,21 +53,25 @@
 // only when its entry count or directory position needs them, so a small folder
 // is a plain ZIP that every extractor, including old ones, opens.
 //
-// Known incompatibility: Java's ZipInputStream (a STREAMING reader; also what
-// some tools built on it use) rejects any STORED entry with a data descriptor —
-// "only DEFLATED entries can have EXT descriptor". That is inherent to a stored
-// archive written without knowing CRCs in advance; java.util.zip.ZipFile, which
-// reads the central directory, is fine.
-//
-// Store-only (method 0). Most of what this system holds — PDF, Office, images,
-// video — is already compressed, and storing keeps the bridge thread's cost at
-// one memcpy and one CRC per byte.
+// Files are DEFLATE (method 8) at level 0: the bytes go out unchanged, framed
+// in "stored" deflate blocks (RFC 1951 3.2.4 — a 5-byte header per block of at
+// most 65,535 bytes, about 0.008% larger). Why not plain method 0 (store):
+// Java's ZipInputStream, a STREAMING reader that tools built on it inherit,
+// rejects any STORED entry with a data descriptor — "only DEFLATED entries can
+// have EXT descriptor" — and a forward-only writer cannot avoid the descriptor.
+// Every other reader takes either. Not compressing is deliberate: most of what
+// this system holds (PDF, Office, images, video) is already compressed, and the
+// bridge thread's cost stays one memcpy and one CRC per byte. The blocks are
+// framed here, not by zlib's deflate(), so the output does not depend on how the
+// core chunked the data — the same tree gives a byte-identical archive.
+// Directories (no data, no descriptor) stay method 0.
 //
 // Pure: no Poco, no gRPC. Output goes to a Sink, so tests can capture it and the
 // bridge can hand it to the socket.
 #pragma once
 #include <zlib.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -174,7 +178,7 @@ using Sink = std::function<bool(const char*, size_t)>;
 
 class Writer {
 public:
-    explicit Writer(Sink sink) : sink_(std::move(sink)) {}
+    explicit Writer(Sink sink) : sink_(std::move(sink)) { pending_.reserve(kBlockMax); }
 
     // Directory entry. `path` is relative, '/'-separated, without a trailing
     // slash (the writer adds it — that is how a ZIP marks a directory).
@@ -211,7 +215,7 @@ public:
         if (!open_ || failed_) return false;
         if (n == 0) return true;
         Entry& e = entries_.back();
-        if (!e.z64 && e.size + n >= k32Max) {
+        if (!e.z64 && deflatedBound(e.size + n) >= k32Max) {
             // Begun as a 32-bit entry (the hint said small) and now too big for
             // one. Its local header is already on the wire, so there is no
             // honest way to continue.
@@ -221,21 +225,32 @@ public:
         }
         e.crc = crc32Update(e.crc, p, n);
         e.size += n;
-        return emit(p, n);
+        // Fill the pending block; each full one goes out as a non-final block.
+        while (n > 0) {
+            const size_t take = std::min(n, kBlockMax - pending_.size());
+            pending_.append(p, take);
+            p += take;
+            n -= take;
+            if (pending_.size() == kBlockMax && !flushBlock(e, false)) return false;
+        }
+        return true;
     }
 
     bool endFile() {
         if (!open_ || failed_) return false;
+        Entry& e = entries_.back();
+        // The final block carries whatever is left — possibly nothing, which is
+        // how an empty file is encoded (5 bytes).
+        if (!flushBlock(e, true)) return false;
         open_ = false;
-        const Entry& e = entries_.back();
         std::string d;
         put32(d, kSigDescriptor);
         put32(d, e.crc);
         if (e.z64) {  // zip64 descriptor: 64-bit sizes, because the local header said so
-            put64(d, e.size);
+            put64(d, e.csize);
             put64(d, e.size);
         } else {
-            put32(d, static_cast<uint32_t>(e.size));
+            put32(d, static_cast<uint32_t>(e.csize));
             put32(d, static_cast<uint32_t>(e.size));
         }
         return emit(d.data(), d.size());
@@ -253,11 +268,11 @@ public:
             put16(cd, kMadeByUnix);
             put16(cd, z64 ? kVersionZip64 : kVersionDefault);
             put16(cd, flagsFor(e));
-            put16(cd, 0);                       // method: store
+            put16(cd, methodFor(e));
             put16(cd, e.dos.time);
             put16(cd, e.dos.date);
             put32(cd, e.crc);
-            put32(cd, z64 ? k32Max : static_cast<uint32_t>(e.size));  // compressed
+            put32(cd, z64 ? k32Max : static_cast<uint32_t>(e.csize)); // compressed
             put32(cd, z64 ? k32Max : static_cast<uint32_t>(e.size));  // uncompressed
             put16(cd, static_cast<uint16_t>(e.name.size()));
             put16(cd, z64 ? 28 : 0);            // extra length
@@ -274,8 +289,8 @@ public:
                 // All three fields, because all three headers fields say 0xFFFFFFFF.
                 put16(cd, 0x0001);
                 put16(cd, 24);
-                put64(cd, e.size);
-                put64(cd, e.size);
+                put64(cd, e.size);              // uncompressed first, per APPNOTE 4.5.3
+                put64(cd, e.csize);
                 put64(cd, e.offset);
             }
             // Flush in pieces: a large tree's directory should not become one
@@ -338,7 +353,8 @@ private:
         bool dir = false;
         DosTime dos;
         uint32_t crc = 0;
-        uint64_t size = 0;
+        uint64_t size = 0;    // bytes of the file
+        uint64_t csize = 0;   // bytes on the wire: the file plus block headers
         uint64_t offset = 0;
         bool z64 = false;   // decided at begin; local, descriptor and central agree
     };
@@ -352,7 +368,34 @@ private:
     static constexpr uint32_t kSigEocd = 0x06054B50;
     static constexpr uint16_t kFlagDescriptor = 0x0008;
     static constexpr uint16_t kFlagUtf8 = 0x0800;
-    static constexpr uint16_t kVersionDefault = 20;     // 2.0: store, directories
+    static constexpr uint16_t kVersionDefault = 20;     // 2.0: deflate, directories
+    static constexpr uint16_t kMethodStore = 0;
+    static constexpr uint16_t kMethodDeflate = 8;
+    static constexpr size_t kBlockMax = 0xFFFF;         // a stored block's LEN is 16 bits
+    static constexpr uint64_t kBlockHeader = 5;
+
+    static uint16_t methodFor(const Entry& e) { return e.dir ? kMethodStore : kMethodDeflate; }
+
+    // The largest compressed size `n` file bytes can become: one header per full
+    // block plus the final one.
+    static uint64_t deflatedBound(uint64_t n) { return n + kBlockHeader * (n / kBlockMax + 1); }
+
+    // A stored deflate block: BFINAL in bit 0, BTYPE 00, padding to the byte,
+    // then LEN and its one's complement. The header and the payload go to the
+    // sink separately, so the payload is not copied again and a sink that looks
+    // at content (the sparse-file test) sees the file's bytes as they were.
+    bool flushBlock(Entry& e, bool final) {
+        const uint16_t len = static_cast<uint16_t>(pending_.size());
+        std::string h;
+        h.push_back(static_cast<char>(final ? 1 : 0));
+        put16(h, len);
+        put16(h, static_cast<uint16_t>(~len));
+        if (!emit(h.data(), h.size())) return false;
+        if (len && !emit(pending_.data(), len)) return false;
+        e.csize += kBlockHeader + len;
+        pending_.clear();
+        return true;
+    }
     static constexpr uint16_t kVersionZip64 = 45;       // 4.5: zip64
     static constexpr uint16_t kMadeByUnix = (3 << 8) | 45;
 
@@ -366,7 +409,7 @@ private:
         put32(h, kSigLocal);
         put16(h, e.z64 ? kVersionZip64 : kVersionDefault);
         put16(h, flagsFor(e));
-        put16(h, 0);                // method: store
+        put16(h, methodFor(e));
         put16(h, e.dos.time);
         put16(h, e.dos.date);
         put32(h, 0);                // crc -> data descriptor
@@ -406,6 +449,7 @@ private:
     }
 
     Sink sink_;
+    std::string pending_;           // at most one block (64 KiB) of file data
     std::vector<Entry> entries_;
     uint64_t written_ = 0;
     bool open_ = false;
