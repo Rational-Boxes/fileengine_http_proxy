@@ -32,6 +32,17 @@ namespace httpbridge {
 constexpr long kPlaybackTicketMaxTtl = 1800;
 
 inline bool isTicketType(const std::string& typ) {
+    return typ == "download" || typ == "playback" || typ == "archive";
+}
+
+// Which ticket types a route honours. A file's content route takes download and
+// playback tickets; a folder's archive route takes ONLY an archive ticket. The
+// uid scope already keeps a folder ticket from opening a file (and vice versa),
+// but a type check means that never rests on uids being disjoint.
+enum class TicketRoute { Content, Archive };
+
+inline bool ticketTypeAllowedOn(const std::string& typ, TicketRoute route) {
+    if (route == TicketRoute::Archive) return typ == "archive";
     return typ == "download" || typ == "playback";
 }
 

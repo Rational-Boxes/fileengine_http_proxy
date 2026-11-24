@@ -11,6 +11,7 @@ BuildRequires:  cmake, gcc-c++, make, pkgconfig
 BuildRequires:  grpc-devel, grpc-plugins, protobuf-devel, protobuf-compiler
 BuildRequires:  poco-devel
 BuildRequires:  openssl-devel
+BuildRequires:  zlib-devel
 BuildRequires:  openldap-devel
 BuildRequires:  systemd-rpm-macros
 

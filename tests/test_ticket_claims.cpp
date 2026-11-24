@@ -86,3 +86,16 @@ TEST(TicketClaims, BothKindsAreTicketsAndNothingElseIs) {
     EXPECT_FALSE(isTicketType("session"));
     EXPECT_FALSE(isTicketType("Playback"));
 }
+
+// An archive ticket is a ticket (so authenticate() refuses it as a bearer), but
+// it opens ONLY the folder-archive route, and that route opens nothing else.
+TEST(TicketClaims, ArchiveTicketsOpenOnlyTheArchiveRoute) {
+    EXPECT_TRUE(isTicketType("archive"));
+    EXPECT_TRUE(ticketTypeAllowedOn("archive", TicketRoute::Archive));
+    EXPECT_FALSE(ticketTypeAllowedOn("archive", TicketRoute::Content));
+    EXPECT_FALSE(ticketTypeAllowedOn("download", TicketRoute::Archive));
+    EXPECT_FALSE(ticketTypeAllowedOn("playback", TicketRoute::Archive));
+    EXPECT_TRUE(ticketTypeAllowedOn("download", TicketRoute::Content));
+    EXPECT_TRUE(ticketTypeAllowedOn("playback", TicketRoute::Content));
+    EXPECT_FALSE(ticketTypeAllowedOn("session", TicketRoute::Archive));
+}
